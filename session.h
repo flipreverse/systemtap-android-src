@@ -189,6 +189,7 @@ public:
   privilege_t privilege;
   bool privilege_set;
   bool systemtap_v_check;
+  bool excl_include_path;
   bool tmpdir_opt_set;
   bool dump_probe_types;
   int download_dbinfo;

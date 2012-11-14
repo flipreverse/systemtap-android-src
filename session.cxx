@@ -149,6 +149,7 @@ systemtap_session::systemtap_session ():
   try_server_status = try_server_unset;
   use_remote_prefix = false;
   systemtap_v_check = false;
+  excl_include_path = false;
   download_dbinfo = 0;
   suppress_handler_errors = false;
   native_build = true; // presumed
@@ -476,10 +477,18 @@ systemtap_session::usage (int exitcode)
          (bulk_mode ? _(" [set]") : ""), buffer_size);
   if (include_path.size() == 0)
     clog << endl;
-  else
-    clog << _(", in addition to") << endl;
-  for (unsigned i=0; i<include_path.size(); i++)
-    clog << "              " << include_path[i].c_str() << endl;
+  else{
+	if (!excl_include_path) {
+	  clog << ", in addition to" << endl;
+	  for (unsigned i=0; i<include_path.size(); i++)
+		clog << "              " << include_path[i] << endl;
+	}
+	else {
+		clog << endl;
+	}
+  }
+  clog
+	<< "   -j DIR     look *only* in DIR for .stp script files - the default directories or any other one given by -I are ignored" << (excl_include_path ? " [set]" : "") << endl;    
   clog
     << _F("   -D NM=VAL  emit macro definition into generated C code\n"
     "   -B NM=VAL  pass option to kbuild make\n"
@@ -587,6 +596,7 @@ systemtap_session::usage (int exitcode)
 int
 systemtap_session::parse_cmdline (int argc, char * const argv [])
 {
+  bool excl_executed = false;
   client_options_disallowed_for_unprivileged = "";
   struct rlimit our_rlimit;
   while (true)
@@ -649,12 +659,20 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
 	  server_args.push_back (string ("-") + (char)grc + optarg);
           break;
 
+		case 'j':
+	  if (excl_executed)
+	    break;
+	  include_path.clear();
+	  excl_include_path = true;
+
         case 'I':
 	  if (client_options)
 	    client_options_disallowed_for_unprivileged += client_options_disallowed_for_unprivileged.empty () ? "-I" : ", -I";
 	  if (include_arg_start == -1)
 	    include_arg_start = include_path.size ();
           include_path.push_back (string (optarg));
+	  if (excl_include_path)
+	    excl_executed = true;
           break;
 
         case 'd':
@@ -1267,6 +1285,10 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
           break;
         }
     }
+  /* for debug purpose
+  clog << "Includepath:" << endl;
+  for (unsigned i=0; i<include_path.size(); i++)
+	    clog << "              " << include_path[i] << endl;*/
 
   return 0;
 }
