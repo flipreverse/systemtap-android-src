@@ -493,6 +493,9 @@ void cleanup_and_exit(int detach, int rc)
   sa.sa_handler = SIG_DFL;
   sigaction(SIGCHLD, &sa, NULL);
 
+  if (pidfile_name)
+     delete_pidfile(pidfile_name);
+
   pid = fork();
   if (pid < 0) {
           _perr("fork");

@@ -26,6 +26,7 @@ int target_pid;
 unsigned int buffer_size;
 unsigned int reader_timeout_ms;
 char *target_cmd;
+char *pidfile_name;
 char *outfile_name;
 int rename_mod;
 int attach_mod;
@@ -122,6 +123,7 @@ void parse_args(int argc, char **argv)
 	buffer_size = 0;
         reader_timeout_ms = 0;
 	target_cmd = NULL;
+	pidfile_name = NULL;
 	outfile_name = NULL;
 	rename_mod = 0;
 	attach_mod = 0;
@@ -135,7 +137,7 @@ void parse_args(int argc, char **argv)
         remote_uri = NULL;
         relay_basedir_fd = -1;
 
-	while ((c = getopt(argc, argv, "ALu::vb:t:dc:o:x:S:DwRr:VT:"
+	while ((c = getopt(argc, argv, "ALu::vb:t:dc:o:x:S:DwRr:VT:M:"
 #ifdef HAVE_OPENAT
                            "F:"
 #endif
@@ -169,6 +171,9 @@ void parse_args(int argc, char **argv)
 			break;
 		case 'c':
 			target_cmd = optarg;
+			break;
+		case 'M':
+			pidfile_name = optarg;
 			break;
 		case 'o':
 			outfile_name = optarg;
@@ -309,6 +314,7 @@ void usage(char *prog)
 	"                exit when it does.  The '_stp_target' variable\n"
 	"                will contain the pid for the command.\n"
 	"-x pid          Sets the '_stp_target' variable to pid.\n"
+	"-M PIDFILE		 Create a pid file while running\n"
 	"-o FILE         Send output to FILE. This supports strftime(3)\n"
 	"                formats for FILE.\n"
 	"-b buffer size  The systemtap module specifies a buffer size.\n"
@@ -579,4 +585,33 @@ void switch_syslog(const char *name)
 {
 	openlog(name, LOG_PID, LOG_DAEMON);
 	use_syslog = 1;
+}
+
+void create_pidfile(const char *pidfile_name)
+{
+	int fd = 0, printed = 0;
+	char pid_text[15];
+	pid_t pid = getpid();
+	
+	fd = open(pidfile_name,O_CREAT|O_WRONLY|O_TRUNC,0644);
+	if (fd < 0)
+	{
+		err("Could not open pidfile:%s\n",strerror(errno));
+		return;
+	}
+
+	printed = sprintf((char*)&pid_text,"%d\n",pid);
+	if (write(fd,&pid_text,printed) < 0)
+	{
+		err("Could not write pid to pidfile:%s\n",strerror(errno));
+	}
+	close(fd);
+}
+
+void delete_pidfile(const char *pidfile_name)
+{
+	if (unlink(pidfile_name) < 0)
+	{
+		err("Could not delete pidfile:%s\n",strerror(errno));
+	}
 }

@@ -199,6 +199,8 @@ void usage(char *prog);
 void parse_modpath(const char *);
 void setup_signals(void);
 int set_clexec(int fd);
+void create_pidfile(const char *pidfile_name);
+void delete_pidfile(const char *pidfile_name);
 
 /*
  * variables
@@ -219,6 +221,7 @@ extern char *modpath;
 extern char *modoptions[MAXMODOPTIONS];
 extern int target_pid;
 extern char *target_cmd;
+extern char *pidfile_name;
 extern char *outfile_name;
 extern int rename_mod;
 extern int attach_mod;

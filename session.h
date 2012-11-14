@@ -157,6 +157,7 @@ public:
   std::string module_name;
   const std::string module_filename() const;
   std::string stapconf_name;
+  std::string pid_file;
   std::string output_file;
   std::string size_option;
   std::string cmd;

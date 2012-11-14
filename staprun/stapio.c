@@ -70,10 +70,17 @@ int main(int argc, char **argv)
 	if (init_stapio())
 		exit(1);
 
+	if (pidfile_name)
+		create_pidfile(pidfile_name);
+
 	if (stp_main_loop()) {
 		err(_("ERROR: Couldn't enter main loop. Exiting.\n"));
+		if (pidfile_name)
+			delete_pidfile(pidfile_name);
 		exit(1);
 	}
 
+	if (pidfile_name)
+		delete_pidfile(pidfile_name);
 	return 0;
 }

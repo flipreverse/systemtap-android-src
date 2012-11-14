@@ -118,6 +118,7 @@ systemtap_session::systemtap_session ():
   last_pass = 5;
   module_name = "stap_" + lex_cast(getpid());
   stapconf_name = "stapconf_" + lex_cast(getpid()) + ".h";
+  pid_file = "";
   output_file = ""; // -o FILE
   tmpdir_opt_set = false;
   save_module = false;
@@ -286,6 +287,7 @@ systemtap_session::systemtap_session (const systemtap_session& other,
   last_pass = other.last_pass;
   module_name = other.module_name;
   stapconf_name = other.stapconf_name;
+  pid_file = other.pid_file;
   output_file = other.output_file; // XXX how should multiple remotes work?
   tmpdir_opt_set = false;
   save_module = other.save_module;
@@ -504,6 +506,7 @@ systemtap_session::usage (int exitcode)
     "   -a ARCH    cross-compile to given architecture, instead of %s\n"
     "   -m MODULE  set probe module name, instead of \n"
     "              %s\n"
+    "   -M PIDFILE Create a pid file while running\n"
     "   -o FILE    send script output to file, instead of stdout. This supports\n" 
     "              strftime(3) formats for FILE\n"
     "   -c CMD     start the probes, run CMD, and exit when it finishes\n"
@@ -706,6 +709,11 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
           cmdline_script = string (optarg);
           have_script = true;
           break;
+
+	case 'M':
+	  server_args.push_back(string("-") + (char)grc + optarg);
+	  pid_file = string (optarg);
+	  break;
 
         case 'o':
           // NB: client_options not a problem, since pass 1-4 does not use output_file.

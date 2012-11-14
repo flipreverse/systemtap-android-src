@@ -673,6 +673,12 @@ make_run_command (systemtap_session& s, const string& remotedir,
     staprun_cmd.push_back("-v");
   if (s.suppress_warnings)
     staprun_cmd.push_back("-w");
+  
+  if (!s.pid_file.empty())
+    {
+	staprun_cmd.push_back("-M");
+	staprun_cmd.push_back(s.pid_file);
+    }
 
   if (!s.output_file.empty())
     {
