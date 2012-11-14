@@ -20,6 +20,12 @@
 
 #define WORKAROUND_BZ467568 1  /* PR 6964; XXX: autoconf when able */
 
+#ifdef ANDROID
+#define SYSTEM_SHELL "/system/bin/sh"
+#else
+#define SYSTEM_SHELL "sh"
+#endif
+
 
 /* globals */
 int ncpus;
@@ -510,7 +516,7 @@ void cleanup_and_exit(int detach, int rc)
                             (verbose >= 2) ? "-v" : "",
                             modname);
           if (rc >= 1) {
-                  execlp("sh", "sh", "-c", cmd, NULL);
+                  execlp(SYSTEM_SHELL, SYSTEM_SHELL, "-c", cmd, NULL);
                   /* should not return */
                   perror(staprun);
                   _exit(-1);
