@@ -2,7 +2,7 @@
 
 BUILD_PREFIX="/data/data/edu.udo.cs.ess.systemtap/stap/"
 FLAGS="-static -DANDROID"
-OUTPUT_DIR="../android_binaries"
+OUTPUT_DIR="android_binaries"
 STAPIO_BIN="staprun/stapio"
 STAPRUN_BIN="staprun/staprun"
 HOST_CC=arm-none-linux-gnueabi
