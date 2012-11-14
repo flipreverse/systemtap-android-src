@@ -597,6 +597,7 @@ void create_pidfile(const char *pidfile_name)
 	if (fd < 0)
 	{
 		err("Could not open pidfile:%s\n",strerror(errno));
+		exit(1);
 		return;
 	}
 
@@ -604,6 +605,7 @@ void create_pidfile(const char *pidfile_name)
 	if (write(fd,&pid_text,printed) < 0)
 	{
 		err("Could not write pid to pidfile:%s\n",strerror(errno));
+		exit(1);
 	}
 	close(fd);
 }
