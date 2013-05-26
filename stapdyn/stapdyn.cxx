@@ -1,5 +1,5 @@
 // stapdyn main program
-// Copyright (C) 2012 Red Hat Inc.
+// Copyright (C) 2012-2013 Red Hat Inc.
 //
 // This file is part of systemtap, and is free software.  You can
 // redistribute it and/or modify it under the terms of the GNU General
@@ -43,7 +43,7 @@ static void __attribute__ ((noreturn))
 usage (int rc)
 {
   clog << "Usage: " << program_invocation_short_name
-       << " MODULE [-c CMD | -x PID]" << endl;
+       << " MODULE [-c CMD | -x PID] [globalname=value ...]" << endl;
   exit (rc);
 }
 
@@ -75,12 +75,12 @@ main(int argc, char * const argv[])
           break;
 
         case 'w':
-          stapdyn_supress_warnings = true;
+          stapdyn_suppress_warnings = true;
           break;
 
         case 'V':
           fprintf(stderr, "Systemtap Dyninst loader/runner (version %s/%s, %s)\n"
-                          "Copyright (C) 2012 Red Hat, Inc. and others\n"
+                          "Copyright (C) 2012-2013 Red Hat, Inc. and others\n"
                           "This is free software; see the source for copying conditions.\n",
                   VERSION, DYNINST_FULL_VERSION, STAP_EXTENDED_VERSION);
           return 0;
@@ -91,8 +91,15 @@ main(int argc, char * const argv[])
     }
 
   // The first non-option is our stap module, required.
-  if (optind == argc - 1)
-    module = argv[optind];
+  if (optind < argc)
+    module = argv[optind++];
+
+  // Remaining non-options, if any, specify global variables.
+  vector<string> modoptions;
+  while (optind < argc)
+    {
+      modoptions.push_back(string(argv[optind++]));
+    }
 
   if (!module || (command && pid))
     usage (1);
@@ -103,7 +110,7 @@ main(int argc, char * const argv[])
   if (!check_dyninst_sebools())
     return 1;
 
-  auto_ptr<mutator> session(new mutator(module));
+  auto_ptr<mutator> session(new mutator(module, modoptions));
   if (!session.get() || !session->load())
     {
       staperror() << "failed to create the mutator!" << endl;

@@ -1,7 +1,6 @@
 // tapset for kernel static markers
 // Copyright (C) 2005-2010 Red Hat Inc.
 // Copyright (C) 2005-2007 Intel Corporation.
-// Copyright (C) 2008 James.Bottomley@HansenPartnership.com
 //
 // This file is part of systemtap, and is free software.  You can
 // redistribute it and/or modify it under the terms of the GNU General
@@ -492,7 +491,7 @@ mark_derived_probe_group::emit_module_decls (systemtap_session& s)
   s.op->newline() << "static struct stap_marker_probe {";
   s.op->newline(1) << "const char * const name;";
   s.op->newline() << "const char * const format;";
-  s.op->newline() << "struct stap_probe * const probe;";
+  s.op->newline() << "const struct stap_probe * const probe;";
   s.op->newline(-1) << "} stap_marker_probes [" << probes.size() << "] = {";
   s.op->indent(1);
   for (unsigned i=0; i < probes.size(); i++)

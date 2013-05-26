@@ -1,9 +1,12 @@
 dnl configure.ac --- autoconf input file for systemtap
 dnl Process this file with autoconf to produce a configure script.
 
-AC_INIT([systemtap], 2.1, systemtap@sourceware.org, systemtap)
+AC_INIT([systemtap], 2.3, systemtap@sourceware.org, systemtap)
 dnl                  ^^^ see also NEWS, systemtap.spec, testsuite/configure.ac
 dnl                      doc/SystemTap_Beginners_Guide/en-US/Book_Info.xml
+
+dnl Get the target arch for libHelperSDT.so
+AC_CANONICAL_TARGET
 
 AC_PREREQ(2.63)
 dnl We don't maintain a ChangeLog, which makes us non-GNU -> foreign.
@@ -271,6 +274,7 @@ if test "x${have_fop}" == "xyes"; then
       AC_MSG_RESULT([it's dead, Jim])
       have_fop="broken"
    fi
+   rm -f dummy-tapsets.pdf
 fi
 AM_CONDITIONAL([HAVE_FOP], [test "$have_fop" == "yes"])
 
@@ -307,7 +311,15 @@ AM_CONDITIONAL([XMLTO_STRINGPARAM], [test "$have_xmlto_stringparam" == "yes"])
 
 if test "x${building_refdocs}" == "xyes"; then
 AC_MSG_CHECKING([for xmlto pdf support])
-   xmlto pdf conftest.xml >& /dev/null
+   # xmlto pdf may work *only* with --with-fop
+   # XXX: To an extent this test is redundant in that the --with-fop test
+   # already ran xmlto --with-fop pdf ....
+   if test "x$have_fop" == "xyes"; then
+      XMLTOPDF_FOP=--with-fop
+   else
+      XMLTOPDF_FOP=
+   fi
+   xmlto $XMLTOPDF_FOP pdf conftest.xml >& /dev/null
    if test $? == 0; then
       have_xmlto_pdf="yes"
       AC_MSG_RESULT([yes])
@@ -600,6 +612,31 @@ AS_IF([test "x$with_selinux" != "xno"], [
 
 AM_CONDITIONAL([HAVE_SELINUX], [test "${have_selinux}" = "yes"])
 
+dnl Handle java+byteman support
+AC_CHECK_PROG(have_javac, javac, yes, no)
+AC_CHECK_PROG(have_jar, jar, yes, no)
+if test "$have_javac" != no -a "$have_jar" != no; then
+echo java found, will try to configure Byteman support
+
+AC_ARG_WITH([java],
+  [AS_HELP_STRING([--with-java=DIRECTORY],
+     [Specify JDK directory to compile libHelperSDT.so against (default is /usr/lib/jvm/java)])],
+  [],
+  [with_java=/usr/lib/jvm/java])
+AC_CHECK_FILE([$with_java],[],[with_java=no])
+AC_SUBST(JAVADIR, "${with_java}") # always needed to compile
+
+if test "$with_java" != "no"; then
+AC_DEFINE_UNQUOTED(HAVE_JAVA, "1", [Flag indicating that libHelperSDT.so is available (can be found in PKGLIBDIR)])
+fi
+
+AM_CONDITIONAL([HAVE_JAVA], [test "$with_java" != "no"])
+
+else
+AC_MSG_WARN([will not run per-method java probing, missing byteman or java requirements])
+AM_CONDITIONAL([HAVE_JAVA],false)
+fi # java+byteman support
+
 AC_SUBST(ENABLE_NLS, "$USE_NLS")
 AC_SUBST(localedir, "$localedir")
 AC_SUBST(LOCALEDIR, "$localedir")
@@ -626,9 +663,9 @@ AC_DEFINE_UNQUOTED(STAP_PREFIX, "$stap_prefix", [configure prefix location])
 AC_SUBST(STAP_PREFIX, "$stap_prefix")
 
 AC_CONFIG_HEADERS([config.h:config.in])
-AC_CONFIG_FILES([Makefile doc/Makefile \
+AC_CONFIG_FILES([Makefile doc/Makefile man/Makefile \
 doc/beginners/Makefile doc/SystemTap_Tapset_Reference/Makefile \
-stappaths.7 \
+man/stappaths.7 \
 initscript/config.systemtap initscript/config.stap-server \
 initscript/systemtap initscript/stap-server ])
 AC_CONFIG_SUBDIRS(testsuite)
@@ -637,8 +674,11 @@ if test $enable_translator == "yes"; then
 fi
 AC_CONFIG_FILES([dtrace], [chmod +x dtrace])
 AC_CONFIG_FILES(stapdyn/Makefile)
+AC_CONFIG_FILES(java/Makefile)
+AC_CONFIG_FILES([java/stapbm], [chmod +x java/stapbm])
 AC_CONFIG_FILES(staprun/Makefile)
 AC_CONFIG_FILES([staprun/run-staprun], [chmod +x staprun/run-staprun])
+AC_CONFIG_FILES(re2c-migrate/Makefile)
 
 # Setup "shadow" directory doc/beginners that has everything setup for
 # publican in one directory (through directory links if necessary).

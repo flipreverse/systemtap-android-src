@@ -1,7 +1,6 @@
 // tapset for timers
 // Copyright (C) 2005-2011 Red Hat Inc.
 // Copyright (C) 2005-2007 Intel Corporation.
-// Copyright (C) 2008 James.Bottomley@HansenPartnership.com
 //
 // This file is part of systemtap, and is free software.  You can
 // redistribute it and/or modify it under the terms of the GNU General
@@ -103,7 +102,7 @@ timer_derived_probe_group::emit_module_decls (systemtap_session& s)
 
   s.op->newline() << "static struct stap_timer_probe {";
   s.op->newline(1) << "struct timer_list timer_list;";
-  s.op->newline() << "struct stap_probe * const probe;";
+  s.op->newline() << "const struct stap_probe * const probe;";
   s.op->newline() << "unsigned intrv, ms, rnd;";
   s.op->newline(-1) << "} stap_timer_probes [" << probes.size() << "] = {";
   s.op->indent(1);
@@ -121,8 +120,8 @@ timer_derived_probe_group::emit_module_decls (systemtap_session& s)
 
   s.op->newline() << "static void enter_timer_probe (unsigned long val) {";
   s.op->newline(1) << "struct stap_timer_probe* stp = & stap_timer_probes [val];";
-  s.op->newline() << "if ((atomic_read (&session_state) == STAP_SESSION_STARTING) ||";
-  s.op->newline() << "    (atomic_read (&session_state) == STAP_SESSION_RUNNING))";
+  s.op->newline() << "if ((atomic_read (session_state()) == STAP_SESSION_STARTING) ||";
+  s.op->newline() << "    (atomic_read (session_state()) == STAP_SESSION_RUNNING))";
   s.op->newline(1) << "mod_timer (& stp->timer_list, jiffies + ";
   emit_interval (s.op);
   s.op->line() << ");";
@@ -256,14 +255,14 @@ hrtimer_derived_probe_group::emit_module_decls (systemtap_session& s)
 
   if (!s.runtime_usermode_p())
     {
-      s.op->newline() << "hrtimer_return_t _stp_hrtimer_notify_function (struct hrtimer *timer) {";
+      s.op->newline() << "static hrtimer_return_t _stp_hrtimer_notify_function (struct hrtimer *timer) {";
 
       s.op->newline(1) << "int rc = HRTIMER_NORESTART;";
       s.op->newline() << "struct stap_hrtimer_probe *stp = container_of(timer, struct stap_hrtimer_probe, hrtimer);";
 
       // Update the timer with the next trigger time
-      s.op->newline() << "if ((atomic_read (&session_state) == STAP_SESSION_STARTING) ||";
-      s.op->newline() << "    (atomic_read (&session_state) == STAP_SESSION_RUNNING)) {";
+      s.op->newline() << "if ((atomic_read (session_state()) == STAP_SESSION_STARTING) ||";
+      s.op->newline() << "    (atomic_read (session_state()) == STAP_SESSION_RUNNING)) {";
       s.op->newline(1) << "_stp_hrtimer_update(stp);";
       s.op->newline() << "rc = HRTIMER_RESTART;";
       s.op->newline(-1) << "}";
@@ -280,13 +279,13 @@ hrtimer_derived_probe_group::emit_module_decls (systemtap_session& s)
     }
   else
     {
-      s.op->newline() << "void _stp_hrtimer_notify_function (sigval_t value)";
+      s.op->newline() << "static void _stp_hrtimer_notify_function (sigval_t value)";
       s.op->newline(1) << "{";
       s.op->newline() << "struct stap_hrtimer_probe *stp = value.sival_ptr;";
 
       // Update the timer with the next trigger time
-      s.op->newline() << "if ((atomic_read (&session_state) == STAP_SESSION_STARTING) ||";
-      s.op->newline() << "    (atomic_read (&session_state) == STAP_SESSION_RUNNING)) {";
+      s.op->newline() << "if ((atomic_read (session_state()) == STAP_SESSION_STARTING) ||";
+      s.op->newline() << "    (atomic_read (session_state()) == STAP_SESSION_RUNNING)) {";
       s.op->newline(1) << "_stp_hrtimer_update(stp);";
       s.op->newline(-1) << "}";
 
@@ -405,7 +404,7 @@ profile_derived_probe_group::emit_module_decls (systemtap_session& s)
   // open-code the same logic here.
 
   s.op->newline() << "static void enter_all_profile_probes (struct pt_regs *regs) {";
-  s.op->newline(1) << "struct stap_probe * probe = "
+  s.op->newline(1) << "const struct stap_probe * probe = "
                    << common_probe_init (probes[0]) << ";";
   common_probe_entryfn_prologue (s, "STAP_SESSION_RUNNING", "probe",
 				 "stp_probe_type_profile_timer");
@@ -429,7 +428,10 @@ profile_derived_probe_group::emit_module_decls (systemtap_session& s)
           s.op->newline() << "#ifdef STP_NEED_PROBE_NAME";
           s.op->newline() << "c->probe_name = probe->pn;";
           s.op->newline() << "#endif";
-          s.op->newline() << "c->actionremaining = MAXACTION;";
+	   if(!s.suppress_time_limits)
+	     {
+	       s.op->newline() << "c->actionremaining = MAXACTION;";
+	     }
         }
       s.op->newline() << "if (c->last_error == NULL) probe->ph (c);";
     }
@@ -514,6 +516,15 @@ timer_builder::build(systemtap_session & sess,
     {
       if (sess.runtime_usermode_p())
 	throw semantic_error (_("profile timer probes not available with the dyninst runtime"));
+
+      /* As the latest mechanism for timer hook support has been
+         removed, we need to bail explicitly if the corresponding
+         symbols are missing: */
+      if ((sess.kernel_exports.find("register_timer_hook") == sess.kernel_exports.end()
+           || sess.kernel_exports.find("unregister_timer_hook") == sess.kernel_exports.end())
+          && (sess.kernel_exports.find("register_profile_notifier") == sess.kernel_exports.end()
+              || sess.kernel_exports.find("unregister_profile_notifier") == sess.kernel_exports.end()))
+        throw semantic_error (_("profiling timer support (register_timer_hook) not found in kernel!"));
 
       sess.unwindsym_modules.insert ("kernel");
       finished_results.push_back
@@ -666,10 +677,12 @@ register_tapset_timers(systemtap_session& s)
   // it so that profile probes are allowed for all.
   if (!s.runtime_usermode_p()) {
     root->bind("profile")
+      ->bind("tick")
       ->bind(builder);
   }
   else {
     root->bind("profile")
+      ->bind("tick")
       ->bind_privilege(pr_all)
       ->bind(builder);
   }

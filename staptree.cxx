@@ -1,5 +1,5 @@
 // parse tree functions
-// Copyright (C) 2005-2011 Red Hat Inc.
+// Copyright (C) 2005-2013 Red Hat Inc.
 //
 // This file is part of systemtap, and is free software.  You can
 // redistribute it and/or modify it under the terms of the GNU General
@@ -23,6 +23,11 @@
 
 using namespace std;
 
+
+
+visitable::~visitable ()
+{
+}
 
 
 expression::expression ():
@@ -111,7 +116,7 @@ probe_point::probe_point ():
 unsigned probe::last_probeidx = 0;
 
 probe::probe ():
-  body (0), tok (0), systemtap_v_conditional (0), privileged (false)
+  body (0), base (0), tok (0), systemtap_v_conditional (0), privileged (false)
 {
   this->name = string ("probe_") + lex_cast(last_probeidx ++);
 }
@@ -120,16 +125,17 @@ probe::probe ():
 // Copy constructor, but with overriding probe-point.  To be used when
 // mapping script-level probe points to another one, early during pass
 // 2.  There should be no symbol resolution done yet.
-probe::probe(const probe& p, probe_point* l)
+probe::probe(probe* p, probe_point* l)
 {
+  this->base = p;
   this->name = string ("probe_") + lex_cast(last_probeidx ++);
-  this->tok = p.tok;
+  this->tok = p->tok;
   this->locations.push_back(l);
-  this->body = p.body; // NB: not needed to be copied yet; a later derived_probe will
-  this->privileged = p.privileged;
-  this->systemtap_v_conditional = p.systemtap_v_conditional;
-  assert (p.locals.size() == 0);
-  assert (p.unused_locals.size() == 0);
+  this->body = deep_copy_visitor::deep_copy(p->body);
+  this->privileged = p->privileged;
+  this->systemtap_v_conditional = p->systemtap_v_conditional;
+  assert (p->locals.size() == 0);
+  assert (p->unused_locals.size() == 0);
 }
 
 
@@ -333,6 +339,15 @@ void binary_expression::print (ostream& o) const
     << " (" << *right << ")";
 }
 
+void regex_query::print (ostream& o) const
+{
+  // NB: we need a custom printer, because the parser does not accept
+  // a parenthesized RHS.
+  o << "(" << *left << ") "
+    << op
+    << " " << *re;
+}
+
 
 void unary_expression::print (ostream& o) const
 {
@@ -348,7 +363,7 @@ void array_in::print (ostream& o) const
       operand->indexes[i]->print (o);
     }
   o << "] in ";
-  operand->base->print_indexable (o);
+  operand->base->print (o);
 }
 
 void post_crement::print (ostream& o) const
@@ -434,6 +449,12 @@ void entry_op::print (ostream& o) const
 }
 
 
+void perf_op::print (ostream& o) const
+{
+  o << "@perf(" << *operand << ")";
+}
+
+
 void vardecl::print (ostream& o) const
 {
   o << name;
@@ -493,7 +514,7 @@ void functiondecl::printsig (ostream& o) const
 
 void arrayindex::print (ostream& o) const
 {
-  base->print_indexable (o);
+  base->print (o);
   o << "[";
   for (unsigned i=0; i<indexes.size(); i++)
     o << (i>0 ? ", " : "") << *indexes[i];
@@ -1039,7 +1060,7 @@ void foreach_loop::print (ostream& o) const
 	o << (sort_direction > 0 ? "+" : "-");
     }
   o << "] in ";
-  base->print_indexable (o);
+  base->print (o);
   if (sort_direction != 0 && sort_column == 0)
     {
       switch (sort_aggr)
@@ -1173,10 +1194,22 @@ void probe::printsig (ostream& o) const
 
 
 void
-probe::collect_derivation_chain (std::vector<probe*> &probes_list)
+probe::collect_derivation_chain (std::vector<probe*> &probes_list) const
 {
-  probes_list.push_back(this);
+  probes_list.push_back(const_cast<probe*>(this));
+  if (base)
+    base->collect_derivation_chain(probes_list);
 }
+
+
+void
+probe::collect_derivation_pp_chain (std::vector<probe_point*> &pp_list) const
+{
+  pp_list.push_back(const_cast<probe_point*>(this->locations[0]));
+  if (base)
+    base->collect_derivation_pp_chain(pp_list);
+}
+
 
 
 void probe_point::print (ostream& o, bool print_extras) const
@@ -1395,6 +1428,12 @@ array_in::visit (visitor* u)
 }
 
 void
+regex_query::visit (visitor* u)
+{
+  u->visit_regex_query (this);
+}
+
+void
 comparison::visit (visitor* u)
 {
   u->visit_comparison (this);
@@ -1470,6 +1509,13 @@ entry_op::visit (visitor* u)
 
 
 void
+perf_op::visit (visitor* u)
+{
+  u->visit_perf_op(this);
+}
+
+
+void
 arrayindex::visit (visitor* u)
 {
   u->visit_arrayindex (this);
@@ -1499,36 +1545,6 @@ hist_op::visit (visitor *u)
   u->visit_hist_op (this);
 }
 
-void
-indexable::print_indexable (std::ostream& o) const
-{
-  const symbol *sym;
-  const hist_op *hist;
-  classify_const_indexable(this, sym, hist);
-  if (sym)
-    sym->print (o);
-  else
-    {
-      assert (hist);
-      hist->print (o);
-    }
-}
-
-void
-indexable::visit_indexable (visitor* u)
-{
-  symbol *sym;
-  hist_op *hist;
-  classify_indexable(this, sym, hist);
-  if (sym)
-    sym->visit (u);
-  else
-    {
-      assert (hist);
-      hist->visit (u);
-    }
-}
-
 
 bool
 indexable::is_symbol(symbol *& sym_out)
@@ -1545,20 +1561,6 @@ indexable::is_hist_op(hist_op *& hist_out)
 }
 
 bool
-indexable::is_const_symbol(const symbol *& sym_out) const
-{
-  sym_out = NULL;
-  return false;
-}
-
-bool
-indexable::is_const_hist_op(const hist_op *& hist_out) const
-{
-  hist_out = NULL;
-  return false;
-}
-
-bool
 symbol::is_symbol(symbol *& sym_out)
 {
   sym_out = this;
@@ -1566,36 +1568,10 @@ symbol::is_symbol(symbol *& sym_out)
 }
 
 bool
-symbol::is_const_symbol(const symbol *& sym_out) const
-{
-  sym_out = this;
-  return true;
-}
-
-const token *
-symbol::get_tok() const
-{
-  return tok;
-}
-
-bool
 hist_op::is_hist_op(hist_op *& hist_out)
 {
   hist_out = this;
   return true;
-}
-
-bool
-hist_op::is_const_hist_op(const hist_op *& hist_out) const
-{
-  hist_out = this;
-  return true;
-}
-
-const token *
-hist_op::get_tok() const
-{
-  return tok;
 }
 
 void
@@ -1607,21 +1583,11 @@ classify_indexable(indexable* ix,
   hist_out = NULL;
   assert(ix != NULL);
   if (!(ix->is_symbol (array_out) || ix->is_hist_op (hist_out)))
-    throw semantic_error(_("Expecting symbol or histogram operator"), ix->get_tok());
+    throw semantic_error(_("Expecting symbol or histogram operator"), ix->tok);
   if (!(hist_out || array_out))
-    throw semantic_error(_("Failed to classify indexable"), ix->get_tok());
+    throw semantic_error(_("Failed to classify indexable"), ix->tok);
 }
 
-void
-classify_const_indexable(const indexable* ix,
-			 const symbol *& array_out,
-			 const hist_op *& hist_out)
-{
-  array_out = NULL;
-  hist_out = NULL;
-  if (!(ix->is_const_symbol(array_out) || ix->is_const_hist_op(hist_out)))
-    throw semantic_error(_("Expecting symbol or histogram operator"), ix->get_tok());
-}
 
 // ------------------------------------------------------------------------
 
@@ -1708,13 +1674,7 @@ traversing_visitor::visit_for_loop (for_loop* s)
 void
 traversing_visitor::visit_foreach_loop (foreach_loop* s)
 {
-  symbol *array = NULL;
-  hist_op *hist = NULL;
-  classify_indexable (s->base, array, hist);
-  if (array)
-    array->visit(this);
-  else
-    hist->visit(this);
+  s->base->visit(this);
 
   for (unsigned i=0; i<s->indexes.size(); i++)
     s->indexes[i]->visit (this);
@@ -1817,6 +1777,13 @@ traversing_visitor::visit_array_in (array_in* e)
 }
 
 void
+traversing_visitor::visit_regex_query (regex_query* e)
+{
+  e->left->visit (this);
+  e->right->visit (this); // TODOXXX do we need to traverse the literal in RHS?
+}
+
+void
 traversing_visitor::visit_comparison (comparison* e)
 {
   e->left->visit (this);
@@ -1877,18 +1844,19 @@ traversing_visitor::visit_entry_op (entry_op* e)
 
 
 void
+traversing_visitor::visit_perf_op (perf_op* e)
+{
+  e->operand->visit (this);
+}
+
+
+void
 traversing_visitor::visit_arrayindex (arrayindex* e)
 {
   for (unsigned i=0; i<e->indexes.size(); i++)
     e->indexes[i]->visit (this);
 
-  symbol *array = NULL;
-  hist_op *hist = NULL;
-  classify_indexable(e->base, array, hist);
-  if (array)
-    return array->visit(this);
-  else
-    return hist->visit(this);
+  e->base->visit(this);
 }
 
 void
@@ -2075,6 +2043,13 @@ varuse_collecting_visitor::visit_entry_op (entry_op *e)
 
 
 void
+varuse_collecting_visitor::visit_perf_op (perf_op *e)
+{
+  functioncall_traversing_visitor::visit_perf_op (e);
+}
+
+
+void
 varuse_collecting_visitor::visit_print_format (print_format* e)
 {
   // NB: Instead of being top-level statements, "print" and "printf"
@@ -2172,19 +2147,11 @@ varuse_collecting_visitor::visit_arrayindex (arrayindex *e)
   symbol *array = NULL;
   hist_op *hist = NULL;
   classify_indexable(e->base, array, hist);
+  expression *value = array ?: hist->stat;
 
-  if (array)
-    {
-      if (current_lrvalue == e) current_lrvalue = array;
-      if (current_lvalue == e) current_lvalue = array;
-      functioncall_traversing_visitor::visit_arrayindex (e);
-    }
-  else // if (hist)
-    {
-      if (current_lrvalue == e) current_lrvalue = hist->stat;
-      if (current_lvalue == e) current_lvalue = hist->stat;
-      functioncall_traversing_visitor::visit_arrayindex (e);
-    }
+  if (current_lrvalue == e) current_lrvalue = value;
+  if (current_lvalue == e) current_lvalue = value;
+  functioncall_traversing_visitor::visit_arrayindex (e);
 
   current_lrvalue = last_lrvalue;
   current_lvalue = last_lvalue;
@@ -2215,13 +2182,7 @@ varuse_collecting_visitor::visit_foreach_loop (foreach_loop* s)
   // NB: we duplicate so don't bother call
   // functioncall_traversing_visitor::visit_foreach_loop (s);
 
-  symbol *array = NULL;
-  hist_op *hist = NULL;
-  classify_indexable (s->base, array, hist);
-  if (array)
-    array->visit(this);
-  else
-    hist->visit(this);
+  s->base->visit(this);
 
   // If the collection is sorted, imply a "write" access to the
   // array in addition to the "read" one already noted above.
@@ -2459,6 +2420,12 @@ throwing_visitor::visit_array_in (array_in* e)
 }
 
 void
+throwing_visitor::visit_regex_query (regex_query* e)
+{
+  throwone (e->tok);
+}
+
+void
 throwing_visitor::visit_comparison (comparison* e)
 {
   throwone (e->tok);
@@ -2508,6 +2475,13 @@ throwing_visitor::visit_defined_op (defined_op* e)
 
 void
 throwing_visitor::visit_entry_op (entry_op* e)
+{
+  throwone (e->tok);
+}
+
+
+void
+throwing_visitor::visit_perf_op (perf_op* e)
 {
   throwone (e->tok);
 }
@@ -2718,6 +2692,14 @@ update_visitor::visit_array_in (array_in* e)
 }
 
 void
+update_visitor::visit_regex_query (regex_query* e)
+{
+  replace (e->left);
+  replace (e->right); // TODOXXX do we need to replace literal in RHS?
+  provide (e);
+}
+
+void
 update_visitor::visit_comparison (comparison* e)
 {
   replace (e->left);
@@ -2786,6 +2768,13 @@ update_visitor::visit_entry_op (entry_op* e)
 }
 
 void
+update_visitor::visit_perf_op (perf_op* e)
+{
+  replace (e->operand);
+  provide (e);
+}
+
+void
 update_visitor::visit_arrayindex (arrayindex* e)
 {
   replace (e->base);
@@ -2823,26 +2812,6 @@ update_visitor::visit_hist_op (hist_op* e)
 {
   replace (e->stat);
   provide (e);
-}
-
-template <> indexable*
-update_visitor::require <indexable> (indexable* src, bool clearok)
-{
-  indexable *dst = NULL;
-  if (src != NULL)
-    {
-      symbol *array_src=NULL;
-      hist_op *hist_src=NULL;
-
-      classify_indexable(src, array_src, hist_src);
-
-      if (array_src)
-        dst = require (array_src);
-      else
-        dst = require (hist_src);
-      assert(clearok || dst);
-    }
-  return dst;
 }
 
 
@@ -2989,6 +2958,12 @@ deep_copy_visitor::visit_array_in (array_in* e)
 }
 
 void
+deep_copy_visitor::visit_regex_query (regex_query* e)
+{
+  update_visitor::visit_regex_query(new regex_query(*e));
+}
+
+void
 deep_copy_visitor::visit_comparison (comparison* e)
 {
   update_visitor::visit_comparison(new comparison(*e));
@@ -3044,6 +3019,12 @@ void
 deep_copy_visitor::visit_entry_op (entry_op* e)
 {
   update_visitor::visit_entry_op(new entry_op(*e));
+}
+
+void
+deep_copy_visitor::visit_perf_op (perf_op* e)
+{
+  update_visitor::visit_perf_op(new perf_op(*e));
 }
 
 void

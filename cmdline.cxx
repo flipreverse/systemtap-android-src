@@ -12,8 +12,6 @@
 // NB: when adding new options, consider very carefully whether they
 // should be restricted from stap clients (after --client-options)!
 struct option stap_long_options[] = {
-  { "kelf", 0, NULL, LONG_OPT_KELF },
-  { "ignore-dwarf", 0, NULL, LONG_OPT_IGNORE_DWARF },
   { "skip-badvars", 0, NULL, LONG_OPT_SKIP_BADVARS },
   { "vp", 1, NULL, LONG_OPT_VERBOSE_PASS },
   { "unprivileged", 0, NULL, LONG_OPT_UNPRIVILEGED },
@@ -53,6 +51,10 @@ struct option stap_long_options[] = {
   { "rlimit-fsize", 1, NULL, LONG_OPT_RLIMIT_FSIZE },
   { "sysroot", 1, NULL, LONG_OPT_SYSROOT },
   { "sysenv", 1, NULL, LONG_OPT_SYSENV },
+  { "suppress-time-limits", 0, NULL, LONG_OPT_SUPPRESS_TIME_LIMITS },
   { "runtime", 1, NULL, LONG_OPT_RUNTIME },
+  { "dyninst", 0, NULL, LONG_OPT_RUNTIME_DYNINST },
+  { "benchmark-sdt-loops", 1, NULL, LONG_OPT_BENCHMARK_SDT_LOOPS },
+  { "benchmark-sdt-threads", 1, NULL, LONG_OPT_BENCHMARK_SDT_THREADS },
   { NULL, 0, NULL, 0 }
 };

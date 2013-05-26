@@ -1,5 +1,5 @@
 // translation pass
-// Copyright (C) 2005-2012 Red Hat Inc.
+// Copyright (C) 2005-2013 Red Hat Inc.
 // Copyright (C) 2005-2008 Intel Corporation.
 // Copyright (C) 2010 Novell Corporation.
 //
@@ -20,6 +20,8 @@
 #include "task_finder.h"
 #include "runtime/k_syms.h"
 #include "dwflpp.h"
+
+#include "re2c-migrate/stapregex.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -43,7 +45,8 @@ extern "C" {
 // limit (a bit more than twice the .debug_frame size of my local
 // vmlinux for 2.6.31.4-83.fc12.x86_64).
 // A larger value was recently found in a libxul.so build.
-#define MAX_UNWIND_TABLE_SIZE (6 * 1024 * 1024)
+// ... and yet again in libxul.so, PR15162
+#define MAX_UNWIND_TABLE_SIZE (16 * 1024 * 1024)
 
 #define STAP_T_01 _("\"Array overflow, check ")
 #define STAP_T_02 _("\"MAXNESTING exceeded\";")
@@ -87,8 +90,12 @@ struct c_unparser: public unparser, public visitor
   void emit_common_header ();
   void emit_global (vardecl* v);
   void emit_global_init (vardecl* v);
+  void emit_global_init_type (vardecl *v);
   void emit_global_param (vardecl* v);
+  void emit_global_init_setters ();
   void emit_functionsig (functiondecl* v);
+  void emit_kernel_module_init ();
+  void emit_kernel_module_exit ();
   void emit_module_init ();
   void emit_module_refresh ();
   void emit_module_exit ();
@@ -182,6 +189,7 @@ struct c_unparser: public unparser, public visitor
   void visit_logical_or_expr (logical_or_expr* e);
   void visit_logical_and_expr (logical_and_expr* e);
   void visit_array_in (array_in* e);
+  void visit_regex_query (regex_query* e);
   void visit_comparison (comparison* e);
   void visit_concatenation (concatenation* e);
   void visit_ternary_expression (ternary_expression* e);
@@ -196,6 +204,7 @@ struct c_unparser: public unparser, public visitor
   void visit_cast_op (cast_op* e);
   void visit_defined_op (defined_op* e);
   void visit_entry_op (entry_op* e);
+  void visit_perf_op (perf_op* e);
 };
 
 // A shadow visitor, meant to generate temporary variable declarations
@@ -228,6 +237,7 @@ struct c_tmpcounter:
   // void visit_logical_or_expr (logical_or_expr* e);
   // void visit_logical_and_expr (logical_and_expr* e);
   void visit_array_in (array_in* e);
+  void visit_regex_query (regex_query* e);
   void visit_comparison (comparison* e);
   void visit_concatenation (concatenation* e);
   // void visit_ternary_expression (ternary_expression* e);
@@ -406,7 +416,7 @@ public:
     if (local)
       return "l->" + c_name();
     else
-      return "global." + c_name();
+      return "global(" + c_name() + ")";
   }
 
   virtual string hist() const
@@ -431,7 +441,7 @@ public:
         if (! local)
           return ""; // module_param
         else
-	  return value() + "[0] = '\\0';";
+          return value() + "[0] = '\\0';";
       case pe_long:
         if (! local)
           return ""; // module_param
@@ -441,7 +451,10 @@ public:
         {
           // See also mapvar::init().
 
-          string prefix = value() + " = _stp_stat_init (";
+          if (local)
+            throw semantic_error(_F("unsupported local stats init for %s", value().c_str()));
+
+          string prefix = "global_set(" + c_name() + ", _stp_stat_init (";
           // Check for errors during allocation.
           string suffix = "if (" + value () + " == NULL) rc = -ENOMEM;";
 
@@ -466,7 +479,7 @@ public:
               throw semantic_error(_F("unsupported stats type for %s", value().c_str()));
             }
 
-          prefix = prefix + "); ";
+          prefix = prefix + ")); ";
           return string (prefix + suffix);
         }
 
@@ -624,10 +637,16 @@ struct mapvar
     return result;
   }
 
-  string call_prefix (string const & fname, vector<tmpvar> const & indices, bool pre_agg=false) const
+  string function_keysym(string const & fname, bool pre_agg=false) const
   {
     string mtype = (is_parallel() && !pre_agg) ? "pmap" : "map";
-    string result = "_stp_" + mtype + "_" + fname + "_" + keysym() + " (";
+    string result = "_stp_" + mtype + "_" + fname + "_" + keysym();
+    return result;
+  }
+
+  string call_prefix (string const & fname, vector<tmpvar> const & indices, bool pre_agg=false) const
+  {
+    string result = function_keysym(fname, pre_agg) + " (";
     result += pre_agg? fetch_existing_aggregate() : value();
     for (unsigned i = 0; i < indices.size(); ++i)
       {
@@ -650,7 +669,7 @@ struct mapvar
     if (!is_parallel())
       throw semantic_error(_("aggregating non-parallel map type"));
 
-    return "_stp_pmap_agg (" + value() + ")";
+    return function_keysym("agg") + " (" + value() + ")";
   }
 
   string fetch_existing_aggregate() const
@@ -747,8 +766,11 @@ struct mapvar
 
   string init () const
   {
-    string mtype = is_parallel() ? "pmap" : "map";
-    string prefix = value() + " = _stp_" + mtype + "_new_" + keysym() + " ("
+    if (local)
+      throw semantic_error(_F("unsupported local map init for %s", value().c_str()));
+
+    string prefix = "global_set(" + c_name() + ", ";
+    prefix += function_keysym("new") + " ("
       + (maxsize > 0 ? lex_cast(maxsize) : "MAXMAPENTRIES")
       + ((wrap == true) ? ", 1" : ", 0");
 
@@ -779,7 +801,7 @@ struct mapvar
 	  }
       }
 
-    prefix = prefix + "); ";
+    prefix = prefix + ")); ";
     return (prefix + suffix);
   }
 
@@ -847,23 +869,25 @@ public:
     return "l->" + name;
   }
 
-  string get_key (exp_type ty, unsigned i) const
+  string get_key (mapvar const& mv, exp_type ty, unsigned i) const
   {
     // bug translator/1175: runtime uses base index 1 for the first dimension
     // see also mapval::get
     switch (ty)
       {
       case pe_long:
-	return "_stp_key_get_int64 ("+ value() + ", " + lex_cast(i+1) + ")";
+	return mv.function_keysym("key_get_int64", true)
+	  + " (" + value() + ", " + lex_cast(i+1) + ")";
       case pe_string:
         // impedance matching: NULL -> empty strings
-	return "(_stp_key_get_str ("+ value() + ", " + lex_cast(i+1) + ") ?: \"\")";
+	return "(" + mv.function_keysym("key_get_str", true)
+	  + " (" + value() + ", " + lex_cast(i+1) + ") ?: \"\")";
       default:
 	throw semantic_error(_("illegal key type"));
       }
   }
 
-  string get_value (exp_type ty) const
+  string get_value (mapvar const& mv, exp_type ty) const
   {
     if (ty != referent_ty)
       throw semantic_error(_("inconsistent iterator value in itervar::get_value()"));
@@ -871,12 +895,12 @@ public:
     switch (ty)
       {
       case pe_long:
-	return "_stp_get_int64 ("+ value() + ")";
+	return mv.function_keysym("get_int64", true) + " ("+ value() + ")";
       case pe_string:
         // impedance matching: NULL -> empty strings
-	return "(_stp_get_str ("+ value() + ") ?: \"\")";
+	return "(" + mv.function_keysym("get_str", true) + " ("+ value() + ") ?: \"\")";
       case pe_stats:
-	return "_stp_get_stat ("+ value() + ")";
+	return mv.function_keysym("get_stat_data", true) + " ("+ value() + ")";
       default:
 	throw semantic_error(_("illegal value type"));
       }
@@ -950,9 +974,7 @@ translator_output::line ()
 void
 c_unparser::emit_common_header ()
 {
-  // Common (static atomic) state of the stap session.
   o->newline();
-  o->newline() << "#include \"common_session_state.h\"";
 
   // Per CPU context for probes. Includes common shared state held for
   // all probes (defined in common_probe_context), the probe locals (union)
@@ -1106,13 +1128,11 @@ c_unparser::emit_common_header ()
   // Use a separate union for compiled-printf locals, no nesting required.
   emit_compiled_printf_locals ();
 
-  o->newline(-1) << "};\n";
+  o->newline(-1) << "};\n"; // end of struct context
+
+  o->newline() << "#include \"runtime_context.h\"";
 
   emit_map_type_instantiations ();
-
-  o->newline() << "#ifdef STAP_NEED_GETTIMEOFDAY";
-  o->newline() << "#include \"time.c\"";  // Don't we all need more?
-  o->newline() << "#endif";
 
   emit_compiled_printfs();
 
@@ -1464,9 +1484,8 @@ c_unparser::emit_global_param (vardecl *v)
 {
   string vn = c_globalname (v->name);
 
-  // XXX: No module parameters with dyninst.
-  if (session->runtime_usermode_p())
-    return;
+  // For dyninst, use the emit_global_init_* functionality instead.
+  assert (!session->runtime_usermode_p());
 
   // NB: systemtap globals can collide with linux macros,
   // e.g. VM_FAULT_MAJOR.  We want the parameter name anyway.  This
@@ -1479,15 +1498,52 @@ c_unparser::emit_global_param (vardecl *v)
   if (v->arity == 0 && v->type == pe_long)
     {
       o->newline() << "module_param_named (" << v->name << ", "
-                   << "global." << vn << ", int64_t, 0);";
+                   << "global(" << vn << "), int64_t, 0);";
     }
   else if (v->arity == 0 && v->type == pe_string)
     {
       // NB: no special copying is needed.
       o->newline() << "module_param_string (" << v->name << ", "
-                   << "global." << vn
-                   << ", MAXSTRINGLEN, 0);";
+                   << "global(" << vn << "), MAXSTRINGLEN, 0);";
     }
+}
+
+
+void
+c_unparser::emit_global_init_setters ()
+{
+  // Hack for dyninst module params: setter function forms a little
+  // linear lookup table ditty to find a global variable by name.
+  o->newline() << "int stp_global_setter (const char *name, const char *value) {";
+  o->newline(1);
+  for (unsigned i=0; i<session->globals.size(); i++)
+    {
+      vardecl* v = session->globals[i];
+      if (v->arity > 0) continue;
+      if (v->type != pe_string && v->type != pe_long) continue;
+
+      // Do not mangle v->name for the comparison!
+      o->line() << "if (0 == strcmp(name,\"" << v->name << "\"))" << " {";
+
+      o->indent(1);
+      if (v->type == pe_string)
+        {
+          c_assign("stp_global_init." + c_globalname(v->name), "value", pe_string, "BUG: global module param", v->tok);
+          o->newline() << "return 0;";
+        }
+      else
+        {
+          o->newline() << "return set_int64_t(value, &stp_global_init." << c_globalname(v->name) << ");";
+        }
+
+      o->newline(-1) << "} else ";
+    }
+
+  // Call the runtime function that handles session attributes, like
+  // log_level, etc.
+  o->line() << "return stp_session_attribute_setter(name, value);";
+  o->newline(-1) << "}";
+  o->newline();
 }
 
 
@@ -1496,12 +1552,33 @@ c_unparser::emit_global (vardecl *v)
 {
   string vn = c_globalname (v->name);
 
-  if (v->arity == 0)
-    o->newline() << c_typename (v->type) << " " << vn << ";";
-  else if (v->type == pe_stats)
-    o->newline() << "PMAP " << vn << ";";
+  string type;
+  if (v->arity > 0)
+    type = (v->type == pe_stats) ? "PMAP" : "MAP";
   else
-    o->newline() << "MAP " << vn << ";";
+    type = c_typename (v->type);
+
+  if (session->runtime_usermode_p())
+    {
+      // In stapdyn mode, the stat/map/pmap pointers are stored as offptr_t in
+      // shared memory.  However, we can keep a little type safety by emitting
+      // FOO_typed and using typeof(FOO_typed) in the global() macros.
+      bool offptr_p  = (v->type == pe_stats) || (v->arity > 0);
+      string stored_type = offptr_p ? "offptr_t" : type;
+
+      // NB: The casted_type is in the unused side of a __builtin_choose_expr
+      // for non-offptr types, so it doesn't matter what we put for them, as
+      // long as it passes syntax long enough for gcc to choose the other expr.
+      string casted_type = offptr_p ? type : "void*";
+
+      o->newline() << "union {";
+      o->newline(1) << casted_type << " " << vn << "_typed;";
+      o->newline() << stored_type << " " << vn << ";";
+      o->newline(-1) << "};";
+    }
+  else
+    o->newline() << type << " " << vn << ";";
+
   o->newline() << "rwlock_t " << vn << "_lock;";
   o->newline() << "#ifdef STP_TIMING";
   o->newline() << "atomic_t " << vn << "_lock_skip_count;";
@@ -1512,22 +1589,35 @@ c_unparser::emit_global (vardecl *v)
 void
 c_unparser::emit_global_init (vardecl *v)
 {
-  string vn = c_globalname (v->name);
-
-  if (v->arity == 0) // can only statically initialize some scalars
+  // We can only statically initialize some scalars.
+  if (v->arity == 0 && v->init)
     {
-      if (v->init)
-	{
-	  o->newline() << "." << vn << " = ";
-	  v->init->visit(this);
-          o->line() << ",";
-	}
+      o->newline() << "." << c_globalname (v->name) << " = ";
+      v->init->visit(this);
+      o->line() << ",";
     }
-  o->newline() << "#ifdef STP_TIMING";
-  o->newline() << "." << vn << "_lock_skip_count = ATOMIC_INIT(0),";
-  o->newline() << "#endif";
+  else if (v->arity == 0 && session->runtime_usermode_p())
+    {
+      // For dyninst: always try to put a default value into the initial
+      // static structure, so we don't have to guess if it was customized.
+      if (v->type == pe_long)
+        o->newline() << "." << c_globalname (v->name) << " = 0,";
+      else if (v->type == pe_string)
+        o->newline() << "." << c_globalname (v->name) << " = { '\\0' },"; // XXX: ""
+    }
+  // The lock and lock_skip_count are handled in emit_module_init.
 }
 
+
+void
+c_unparser::emit_global_init_type (vardecl *v)
+{
+  // We can only statically initialize some scalars.
+  if (v->arity == 0) // ... although we still allow !v->init here.
+    {
+      o->newline() << c_typename(v->type) << " " << c_globalname(v->name) << ";";
+    }
+}
 
 
 void
@@ -1535,6 +1625,64 @@ c_unparser::emit_functionsig (functiondecl* v)
 {
   o->newline() << "static void " << c_funcname(v->name)
 	       << " (struct context * __restrict__ c);";
+}
+
+
+void
+c_unparser::emit_kernel_module_init ()
+{
+  if (session->runtime_usermode_p())
+    return;
+
+  o->newline();
+  o->newline() << "static int systemtap_kernel_module_init (void) {";
+  o->newline(1) << "int rc = 0;";
+  o->newline() << "int i=0, j=0;"; // for derived_probe_group use
+
+  vector<derived_probe_group*> g = all_session_groups (*session);
+  for (unsigned i=0; i<g.size(); i++)
+    {
+      g[i]->emit_kernel_module_init (*session);
+
+      o->newline() << "if (rc) {";
+      o->indent(1);
+      if (i>0)
+        {
+	  for (int j=i-1; j>=0; j--)
+	    g[j]->emit_kernel_module_exit (*session);
+	}
+      o->newline() << "goto out;";
+      o->newline(-1) << "}";
+    }
+  o->newline(-1) << "out:";
+  o->indent(1);
+  o->newline() << "return rc;";
+  o->newline(-1) << "}\n";
+  o->assert_0_indent(); 
+}
+
+
+void
+c_unparser::emit_kernel_module_exit ()
+{
+  if (session->runtime_usermode_p())
+    return;
+
+  o->newline();
+  o->newline() << "static void systemtap_kernel_module_exit (void) {";
+  o->newline(1) << "int i=0, j=0;"; // for derived_probe_group use
+
+  // We're processing the derived_probe_group list in reverse order.
+  // This ensures that probe groups get unregistered in reverse order
+  // of the way they were registered.
+  vector<derived_probe_group*> g = all_session_groups (*session);
+  for (vector<derived_probe_group*>::reverse_iterator i = g.rbegin();
+       i != g.rend(); i++)
+    {
+      (*i)->emit_kernel_module_exit (*session);
+    }
+  o->newline(-1) << "}\n";
+  o->assert_0_indent(); 
 }
 
 
@@ -1637,6 +1785,14 @@ c_unparser::emit_module_init ()
       o->newline() << "if (rc) goto out;";
   }
 
+  // Now that kernel version and permissions are correct,
+  // initialize the global session states before anything else.
+  o->newline() << "rc = stp_session_init();";
+  o->newline() << "if (rc) {";
+  o->newline(1) << "_stp_error (\"couldn't initialize the main session (rc %d)\", rc);";
+  o->newline() << "goto out;";
+  o->newline(-1) << "}";
+
   // initialize gettimeofday (if needed)
   o->newline() << "#ifdef STAP_NEED_GETTIMEOFDAY";
   o->newline() << "rc = _stp_init_time();";  // Kick off the Big Bang.
@@ -1651,7 +1807,7 @@ c_unparser::emit_module_init ()
   o->newline() << "(void) probe_point;";
   o->newline() << "(void) i;";
   o->newline() << "(void) j;";
-  o->newline() << "atomic_set (&session_state, STAP_SESSION_STARTING);";
+  o->newline() << "atomic_set (session_state(), STAP_SESSION_STARTING);";
   // This signals any other probes that may be invoked in the next little
   // while to abort right away.  Currently running probes are allowed to
   // terminate.  These may set STAP_SESSION_ERROR!
@@ -1667,6 +1823,9 @@ c_unparser::emit_module_init ()
       vardecl* v = session->globals[i];
       if (v->index_types.size() > 0)
 	o->newline() << getmap (v).init();
+      else if (session->runtime_usermode_p() && v->arity == 0
+               && (v->type == pe_long || v->type == pe_string))
+	c_assign(getvar (v).value(), "stp_global_init." + c_globalname(v->name), v->type, "BUG: global initialization", v->tok);
       else
 	o->newline() << getvar (v).init();
       // NB: in case of failure of allocation, "rc" will be set to non-zero.
@@ -1677,16 +1836,11 @@ c_unparser::emit_module_init ()
       o->newline() << "goto out;";
       o->newline(-1) << "}";
 
-      o->newline() << "rwlock_init (& global." << c_globalname (v->name) << "_lock);";
+      o->newline() << "global_lock_init(" << c_globalname (v->name) << ");";
+      o->newline() << "#ifdef STP_TIMING";
+      o->newline() << "atomic_set(global_skipped(" << c_globalname (v->name) << "), 0);";
+      o->newline() << "#endif";
     }
-
-  // initialize each Stat used for timing information
-  o->newline() << "#ifdef STP_TIMING";
-  o->newline() << "for (i = 0; i < ARRAY_SIZE(stap_probes); ++i)";
-  o->newline(1) << "stap_probes[i].timing = _stp_stat_init (HIST_NONE);";
-  // NB: we don't check for null return here, but instead at
-  // passage to probe handlers and at final printing.
-  o->newline(-1) << "#endif";
 
   // Print a message to the kernel log about this module.  This is
   // intended to help debug problems with systemtap modules.
@@ -1697,6 +1851,13 @@ c_unparser::emit_module_init ()
 		 << ", (num_online_cpus() * sizeof(struct context))"
 		 << ", " << session->probes.size()
 		 << ");";
+  // In dyninst mode, we need to know when all the globals have been
+  // allocated and we're ready to run probe registration.
+  else
+    {
+      o->newline() << "rc = stp_session_init_finished();";
+      o->newline() << "if (rc) goto out;";
+    }
 
   // Run all probe registrations.  This actually runs begin probes.
 
@@ -1713,7 +1874,7 @@ c_unparser::emit_module_init ()
       o->indent(-1);
       // NB: we need to be in the error state so timers can shutdown cleanly,
       // and so end probes don't run.  OTOH, error probes can run.
-      o->newline() << "atomic_set (&session_state, STAP_SESSION_ERROR);";
+      o->newline() << "atomic_set (session_state(), STAP_SESSION_ERROR);";
       if (i>0)
         for (int j=i-1; j>=0; j--)
           g[j]->emit_module_exit (*session);
@@ -1722,9 +1883,15 @@ c_unparser::emit_module_init ()
     }
 
   // All registrations were successful.  Consider the system started.
-  o->newline() << "if (atomic_read (&session_state) == STAP_SESSION_STARTING)";
+  o->newline() << "if (atomic_read (session_state()) == STAP_SESSION_STARTING)";
   // NB: only other valid state value is ERROR, in which case we don't
-  o->newline(1) << "atomic_set (&session_state, STAP_SESSION_RUNNING);";
+  o->newline(1) << "atomic_set (session_state(), STAP_SESSION_RUNNING);";
+
+  // Run all post-session starting code.
+  for (unsigned i=0; i<g.size(); i++)
+    {
+      g[i]->emit_module_post_init (*session);
+    }
   o->newline(-1) << "return 0;";
 
   // Error handling path; by now all partially registered probe groups
@@ -1744,7 +1911,7 @@ c_unparser::emit_module_init ()
     }
 
   // For any partially registered/unregistered kernel facilities.
-  o->newline() << "atomic_set (&session_state, STAP_SESSION_STOPPED);";
+  o->newline() << "atomic_set (session_state(), STAP_SESSION_STOPPED);";
   o->newline() << "#ifdef STAPCONF_SYNCHRONIZE_SCHED";
   o->newline() << "synchronize_sched();";
   o->newline() << "#endif";
@@ -1789,13 +1956,13 @@ c_unparser::emit_module_exit ()
   // If we aborted startup, then everything has been cleaned up already, and
   // module_exit shouldn't even have been called.  But since it might be, let's
   // beat a hasty retreat to avoid double uninitialization.
-  o->newline() << "if (atomic_read (&session_state) == STAP_SESSION_STARTING)";
+  o->newline() << "if (atomic_read (session_state()) == STAP_SESSION_STARTING)";
   o->newline(1) << "return;";
   o->indent(-1);
 
-  o->newline() << "if (atomic_read (&session_state) == STAP_SESSION_RUNNING)";
+  o->newline() << "if (atomic_read (session_state()) == STAP_SESSION_RUNNING)";
   // NB: only other valid state value is ERROR, in which case we don't
-  o->newline(1) << "atomic_set (&session_state, STAP_SESSION_STOPPING);";
+  o->newline(1) << "atomic_set (session_state(), STAP_SESSION_STOPPING);";
   o->indent(-1);
   // This signals any other probes that may be invoked in the next little
   // while to abort right away.  Currently running probes are allowed to
@@ -1823,7 +1990,7 @@ c_unparser::emit_module_exit ()
   o->newline() << "_stp_runtime_context_wait();";
 
   // cargo cult epilogue
-  o->newline() << "atomic_set (&session_state, STAP_SESSION_STOPPED);";
+  o->newline() << "atomic_set (session_state(), STAP_SESSION_STOPPED);";
   o->newline() << "#ifdef STAPCONF_SYNCHRONIZE_SCHED";
   o->newline() << "synchronize_sched();";
   o->newline() << "#endif";
@@ -1840,8 +2007,18 @@ c_unparser::emit_module_exit ()
 	o->newline() << getvar (v).fini();
     }
 
-  // We're finished with the contexts.
-  o->newline() << "_stp_runtime_contexts_free();";
+  // We're finished with the contexts if we're not in dyninst
+  // mode. The dyninst mode needs the contexts, since print buffers
+  // are stored there.
+  if (!session->runtime_usermode_p())
+    {
+      o->newline() << "_stp_runtime_contexts_free();";
+    }
+  else
+    {
+      o->newline() << "struct context* __restrict__ c;";
+      o->newline() << "c = _stp_runtime_entryfn_get_context();";
+    }
 
   // teardown gettimeofday (if needed)
   o->newline() << "#ifdef STAP_NEED_GETTIMEOFDAY";
@@ -1858,26 +2035,26 @@ c_unparser::emit_module_exit ()
   o->newline() << "#if defined(STP_TIMING) || defined(STP_ALIBI)";
   o->newline() << "_stp_printf(\"----- probe hit report: \\n\");";
   o->newline() << "for (i = 0; i < ARRAY_SIZE(stap_probes); ++i) {";
-  o->newline(1) << "struct stap_probe *const p = &stap_probes[i];";
+  o->newline(1) << "const struct stap_probe *const p = &stap_probes[i];";
   o->newline() << "#ifdef STP_ALIBI";
-  o->newline() << "int alibi = atomic_read(&(p->alibi));";
+  o->newline() << "int alibi = atomic_read(probe_alibi(i));";
   o->newline() << "if (alibi)";
-  o->newline(1) << "_stp_printf (\"%s, (%s), hits: %d,%s\\n\",";
-  o->newline(2) << "p->pp, p->location, alibi, p->derivation);";
+  o->newline(1) << "_stp_printf (\"%s, (%s), hits: %d,%s, index: %d\\n\",";
+  o->newline(2) << "p->pp, p->location, alibi, p->derivation, i);";
   o->newline(-3) << "#endif"; // STP_ALIBI
   o->newline() << "#ifdef STP_TIMING";
-  o->newline() << "if (likely (p->timing)) {"; // NB: check for null stat object
-  o->newline(1) << "struct stat_data *stats = _stp_stat_get (p->timing, 0);";
+  o->newline() << "if (likely (probe_timing(i))) {"; // NB: check for null stat object
+  o->newline(1) << "struct stat_data *stats = _stp_stat_get (probe_timing(i), 0);";
   o->newline() << "if (stats->count) {";
   o->newline(1) << "int64_t avg = _stp_div64 (NULL, stats->sum, stats->count);";
   o->newline() << "_stp_printf (\"%s, (%s), hits: %lld, "
 	       << (!session->runtime_usermode_p() ? "cycles" : "nsecs")
-	       << ": %lldmin/%lldavg/%lldmax,%s\\n\",";
+	       << ": %lldmin/%lldavg/%lldmax,%s, index: %d\\n\",";
   o->newline(2) << "p->pp, p->location, (long long) stats->count,";
   o->newline() << "(long long) stats->min, (long long) avg, (long long) stats->max,";
-  o->newline() << "p->derivation);";
+  o->newline() << "p->derivation, i);";
   o->newline(-3) << "}";
-  o->newline() << "_stp_stat_del (p->timing);";
+  o->newline() << "_stp_stat_del (probe_timing(i));";
   o->newline(-1) << "}";
   o->newline() << "#endif"; // STP_TIMING
   o->newline(-1) << "}";
@@ -1885,13 +2062,13 @@ c_unparser::emit_module_exit ()
   o->newline() << "#endif";
 
   // print final error/skipped counts if non-zero
-  o->newline() << "if (atomic_read (& skipped_count) || "
-               << "atomic_read (& error_count) || "
-               << "atomic_read (& skipped_count_reentrant)) {"; // PR9967
+  o->newline() << "if (atomic_read (skipped_count()) || "
+               << "atomic_read (error_count()) || "
+               << "atomic_read (skipped_count_reentrant())) {"; // PR9967
   o->newline(1) << "_stp_warn (\"Number of errors: %d, "
                 << "skipped probes: %d\\n\", "
-                << "(int) atomic_read (& error_count), "
-                << "(int) atomic_read (& skipped_count));";
+                << "(int) atomic_read (error_count()), "
+                << "(int) atomic_read (skipped_count()));";
   o->newline() << "#ifdef STP_TIMING";
   o->newline() << "{";
   o->newline(1) << "int ctr;";
@@ -1899,17 +2076,17 @@ c_unparser::emit_module_exit ()
     {
       string orig_vn = session->globals[i]->name;
       string vn = c_globalname (orig_vn);
-      o->newline() << "ctr = atomic_read (& global." << vn << "_lock_skip_count);";
+      o->newline() << "ctr = atomic_read (global_skipped(" << vn << "));";
       o->newline() << "if (ctr) _stp_warn (\"Skipped due to global '%s' lock timeout: %d\\n\", "
                    << lex_cast_qstring(orig_vn) << ", ctr);"; 
     }
-  o->newline() << "ctr = atomic_read (& skipped_count_lowstack);";
+  o->newline() << "ctr = atomic_read (skipped_count_lowstack());";
   o->newline() << "if (ctr) _stp_warn (\"Skipped due to low stack: %d\\n\", ctr);";
-  o->newline() << "ctr = atomic_read (& skipped_count_reentrant);";
+  o->newline() << "ctr = atomic_read (skipped_count_reentrant());";
   o->newline() << "if (ctr) _stp_warn (\"Skipped due to reentrancy: %d\\n\", ctr);";
-  o->newline() << "ctr = atomic_read (& skipped_count_uprobe_reg);";
+  o->newline() << "ctr = atomic_read (skipped_count_uprobe_reg());";
   o->newline() << "if (ctr) _stp_warn (\"Skipped due to uprobe register failure: %d\\n\", ctr);";
-  o->newline() << "ctr = atomic_read (& skipped_count_uprobe_unreg);";
+  o->newline() << "ctr = atomic_read (skipped_count_uprobe_unreg());";
   o->newline() << "if (ctr) _stp_warn (\"Skipped due to uprobe unregister failure: %d\\n\", ctr);";
   o->newline(-1) << "}";
   o->newline () << "#endif";
@@ -1918,6 +2095,14 @@ c_unparser::emit_module_exit ()
 
   // NB: PR13386 needs to restore preemption-blocking counts
   o->newline() << "preempt_enable_no_resched();";
+
+  // In dyninst mode, now we're done with the contexts, transport, everything!
+  if (session->runtime_usermode_p())
+    {
+      o->newline() << "_stp_runtime_entryfn_put_context(c);";
+      o->newline() << "_stp_dyninst_transport_shutdown();";
+      o->newline() << "_stp_runtime_contexts_free();";
+    }
 
   o->newline(-1) << "}\n";
 }
@@ -2117,7 +2302,8 @@ c_unparser::emit_probe (derived_probe* v)
         v->emit_privilege_assertion (o);
 
       // emit probe local initialization block
-      v->emit_probe_local_init(o);
+
+      v->emit_probe_local_init(*this->session, o);
 
       // emit all read/write locks for global variables
       if (v->needs_global_locks ())
@@ -2175,7 +2361,12 @@ c_unparser::emit_lock_decls(const varuse_collecting_visitor& vut)
   if (session->verbose > 1)
     clog << "probe " << *current_probe->sole_location() << " locks ";
 
-  o->newline() << "static const struct stp_probe_lock locks[] = {";
+  // We can only make this static in kernel mode.  In stapdyn mode,
+  // the globals and their locks are in shared memory.
+  o->newline();
+  if (!session->runtime_usermode_p())
+    o->line() << "static ";
+  o->line() << "const struct stp_probe_lock locks[] = {";
   o->indent(1);
 
   for (unsigned i = 0; i < session->globals.size(); i++)
@@ -2210,10 +2401,10 @@ c_unparser::emit_lock_decls(const varuse_collecting_visitor& vut)
 	}
 
       o->newline() << "{";
-      o->newline(1) << ".lock = &global." + c_globalname(v->name) + "_lock,";
+      o->newline(1) << ".lock = global_lock(" + c_globalname(v->name) + "),";
       o->newline() << ".write_p = " << (write_p ? 1 : 0) << ",";
       o->newline() << "#ifdef STP_TIMING";
-      o->newline() << ".skipped = &global." << c_globalname (v->name) << "_lock_skip_count,";
+      o->newline() << ".skipped = global_skipped(" << c_globalname (v->name) << "),";
       o->newline() << "#endif";
       o->newline(-1) << "},";
 
@@ -2334,35 +2525,15 @@ c_unparser::emit_map_type_instantiations ()
 	  string ktype = mapvar::key_typename(i->first.at(j));
 	  o->newline() << "#define KEY" << (j+1) << "_TYPE " << ktype;
 	}
+      /* For statistics, flag map-gen to pull in nested pmap-gen too.  */
       if (i->second == pe_stats)
-	o->newline() << "#include \"pmap-gen.c\"";
-      else
-	o->newline() << "#include \"map-gen.c\"";
+	o->newline() << "#define MAP_DO_PMAP 1";
+      o->newline() << "#include \"map-gen.c\"";
+      o->newline() << "#undef MAP_DO_PMAP";
       o->newline() << "#undef VALUE_TYPE";
       for (unsigned j = 0; j < i->first.size(); ++j)
 	{
 	  o->newline() << "#undef KEY" << (j+1) << "_TYPE";
-	}
-
-      /* FIXME
-       * For pmaps, we also need to include map-gen.c, because we might be accessing
-       * the aggregated map.  The better way to handle this is for pmap-gen.c to make
-       * this include, but that's impossible with the way they are set up now.
-       */
-      if (i->second == pe_stats)
-	{
-	  o->newline() << "#define VALUE_TYPE " << mapvar::value_typename(i->second);
-	  for (unsigned j = 0; j < i->first.size(); ++j)
-	    {
-	      string ktype = mapvar::key_typename(i->first.at(j));
-	      o->newline() << "#define KEY" << (j+1) << "_TYPE " << ktype;
-	    }
-	  o->newline() << "#include \"map-gen.c\"";
-	  o->newline() << "#undef VALUE_TYPE";
-	  for (unsigned j = 0; j < i->first.size(); ++j)
-	    {
-	      o->newline() << "#undef KEY" << (j+1) << "_TYPE";
-	    }
 	}
     }
 
@@ -2810,7 +2981,7 @@ c_unparser::record_actions (unsigned actions, const token* tok, bool update)
 
   // Update if needed, or after queueing up a few actions, in case of very
   // large code sequences.
-  if ((update && action_counter > 0) || action_counter >= 10/*<-arbitrary*/)
+  if (((update && action_counter > 0) || action_counter >= 10/*<-arbitrary*/) && !session->suppress_time_limits)
     {
       o->newline() << "c->actionremaining -= " << action_counter << ";";
       o->newline() << "if (unlikely (c->actionremaining <= 0)) {";
@@ -3254,14 +3425,14 @@ c_unparser::visit_foreach_loop (foreach_loop *s)
 	      o->newline() << "else"; // only sort if aggregation was ok
 	      if (s->limit)
 	        {
-		  o->newline(1) << "_stp_map_sortn ("
+		  o->newline(1) << mv.function_keysym("sortn", true) <<" ("
 				<< mv.fetch_existing_aggregate() << ", "
 				<< *res_limit << ", " << sort_column << ", "
 				<< - s->sort_direction << ");";
 		}
 	      else
 	        {
-		  o->newline(1) << "_stp_map_sort ("
+		  o->newline(1) << mv.function_keysym("sort", true) <<" ("
 				<< mv.fetch_existing_aggregate() << ", "
 				<< sort_column << ", "
 				<< - s->sort_direction << ");";
@@ -3276,13 +3447,15 @@ c_unparser::visit_foreach_loop (foreach_loop *s)
 	    {
 	      if (s->limit)
 	        {
-		  o->newline() << "_stp_map_sortn (" << mv.value() << ", "
+		  o->newline() << mv.function_keysym("sortn") <<" ("
+			       << mv.value() << ", "
 			       << *res_limit << ", " << s->sort_column << ", "
 			       << - s->sort_direction << ");";
 		}
 	      else
 	        {
-		  o->newline() << "_stp_map_sort (" << mv.value() << ", "
+		  o->newline() << mv.function_keysym("sort") <<" ("
+			       << mv.value() << ", "
 			       << s->sort_column << ", "
 			       << - s->sort_direction << ");";
 		}
@@ -3337,16 +3510,16 @@ c_unparser::visit_foreach_loop (foreach_loop *s)
 	{
 	  // copy the iter values into the specified locals
 	  var v = getvar (s->indexes[i]->referent);
-	  c_assign (v, iv.get_key (v.type(), i), s->tok);
+	  c_assign (v, iv.get_key (mv, v.type(), i), s->tok);
 	}
 
       if (s->value)
         {
 	  var v = getvar (s->value->referent);
-	  c_assign (v, iv.get_value (v.type()), s->tok);
+	  c_assign (v, iv.get_value (mv, v.type()), s->tok);
         }
 
-      visit_foreach_loop_value(this, s, iv.get_value(array->type));
+      visit_foreach_loop_value(this, s, iv.get_value(mv, array->type));
       record_actions(0, s->block->tok, true);
       o->newline(-1) << "}";
       loop_break_labels.pop_back ();
@@ -3888,6 +4061,29 @@ c_unparser::visit_array_in (array_in* e)
     }
 }
 
+void
+c_tmpcounter::visit_regex_query (regex_query* e)
+{
+  // TODOXXX if e->right is always a literal, do we still need to do
+  // the 'save at least one in a tmpvar' trick as seen in
+  // visit_comparison?
+  e->left->visit(this);
+  e->right->visit(this);
+}
+
+void
+c_unparser::visit_regex_query (regex_query* e)
+{
+  o->line() << "(";
+  o->indent(1);
+  o->newline();
+  if (e->op == "!~") o->line() << "!";
+  stapdfa *dfa = session->dfas[e->re->value];
+  dfa->emit_matchop_start (o);
+  e->left->visit(this);
+  dfa->emit_matchop_end (o);
+  o->newline(-1) << ")";
+}
 
 void
 c_tmpcounter::visit_comparison (comparison* e)
@@ -3904,7 +4100,6 @@ c_tmpcounter::visit_comparison (comparison* e)
   e->left->visit (this);
   e->right->visit (this);
 }
-
 
 void
 c_unparser::visit_comparison (comparison* e)
@@ -4232,6 +4427,13 @@ void
 c_unparser::visit_entry_op (entry_op* e)
 {
   throw semantic_error(_("cannot translate general @entry expression"), e->tok);
+}
+
+
+void
+c_unparser::visit_perf_op (perf_op* e)
+{
+  throw semantic_error(_("cannot translate general @perf expression"), e->tok);
 }
 
 
@@ -4930,8 +5132,8 @@ c_unparser::visit_print_format (print_format* e)
       // PR10750: Enforce a reasonable limit on # of varargs
       // 32 varargs leads to max 256 bytes on the stack
       if (e->args.size() > 32)
-        throw semantic_error(_F(ngettext("additional argument to print", "too many arguments to print (%zu)",
-                                e->args.size()), e->args.size()), e->tok);
+        throw semantic_error(_NF("additional argument to print", "too many arguments to print (%zu)",
+                                e->args.size(), e->args.size()), e->tok);
 
       // Compute actual arguments
       vector<tmpvar> tmp;
@@ -5344,6 +5546,8 @@ static void create_debug_frame_hdr (const unsigned char e_ident[],
     }
 }
 
+static set<string> vdso_paths;
+
 // Get the .debug_frame end .eh_frame sections for the given module.
 // Also returns the lenght of both sections when found, plus the section
 // address (offset) of the eh_frame data. If a debug_frame is found, a
@@ -5367,9 +5571,29 @@ static void get_unwind_data (Dwfl_Module *m,
   Elf *elf;
 
   // fetch .eh_frame info preferably from main elf file.
-  dwfl_module_info (m, NULL, &start, NULL, NULL, NULL, NULL, NULL);
+  const char *modname = dwfl_module_info (m, NULL, &start,
+                                          NULL, NULL, NULL, NULL, NULL);
   elf = dwfl_module_getelf(m, &bias);
   ehdr = gelf_getehdr(elf, &ehdr_mem);
+
+  // This is a little unelegant, since at this point we only have the
+  // kernel normalized machine architecture as string, but we can deduce
+  // the ELF class from that and warn if it is different from the module
+  // ELF class. See PR10272.
+  int kelf_class = elf_class_from_normalized_machine (session.architecture);
+  int melf_class = (int) ehdr->e_ident[EI_CLASS];
+  if (kelf_class != melf_class)
+    {
+      // Don't warn about 32bit VDSO, the user didn't explicitly add those.
+      if (vdso_paths.find (string(modname)) == vdso_paths.end ())
+        session.print_warning ("Kernel ELF class (" + lex_cast (kelf_class)
+                               + ") doesn't match module '" + modname
+                               + "' ELF class (" + lex_cast (melf_class)
+                               + "), backtraces for 32bit programs on 64bit"
+                               + " kernels don't work.");
+      return;
+    }
+
   scn = NULL;
   bool eh_frame_seen = false;
   bool eh_frame_hdr_seen = false;
@@ -5821,6 +6045,47 @@ dump_unwind_tables (Dwfl_Module *m,
   return DWARF_CB_OK;
 }
 
+static void
+dump_unwindsym_cxt_table(systemtap_session& session, ostream& output,
+			 const string& modname, unsigned modindex,
+			 const string& secname, unsigned secindex,
+			 const string& table, void*& data, size_t& len)
+{
+  if (data == NULL || len == 0)
+    return;
+
+  if (len > MAX_UNWIND_TABLE_SIZE)
+    {
+      if (secname.empty())
+	session.print_warning (_F("skipping module %s %s table (too big: %zi > %zi)",
+				  modname.c_str(), table.c_str(),
+				  len, (size_t)MAX_UNWIND_TABLE_SIZE));
+      else
+	session.print_warning (_F("skipping module %s, section %s %s table (too big: %zi > %zi)",
+				  modname.c_str(), secname.c_str(), table.c_str(),
+				  len, (size_t)MAX_UNWIND_TABLE_SIZE));
+      data = NULL;
+      len = 0;
+      return;
+    }
+
+  output << "#if defined(STP_USE_DWARF_UNWINDER) && defined(STP_NEED_UNWIND_DATA)\n";
+  output << "static uint8_t _stp_module_" << modindex << "_" << table;
+  if (!secname.empty())
+    output << "_" << secindex;
+  output << "[] = \n";
+  output << "  {";
+  for (size_t i = 0; i < len; i++)
+    {
+      int h = ((uint8_t *)data)[i];
+      output << h << ","; // decimal is less wordy than hex
+      if ((i + 1) % 16 == 0)
+	output << "\n" << "   ";
+    }
+  output << "};\n";
+  output << "#endif /* STP_USE_DWARF_UNWINDER && STP_NEED_UNWIND_DATA */\n";
+}
+
 static int
 dump_unwindsym_cxt (Dwfl_Module *m,
 		    unwindsym_dump_context *c,
@@ -5840,76 +6105,15 @@ dump_unwindsym_cxt (Dwfl_Module *m,
   Dwarf_Addr eh_addr = c->eh_addr;
   Dwarf_Addr eh_frame_hdr_addr = c->eh_frame_hdr_addr;
 
-  if (debug_frame != NULL && debug_len > 0)
-    {
-      c->output << "#if defined(STP_USE_DWARF_UNWINDER) && defined(STP_NEED_UNWIND_DATA)\n";
-      c->output << "static uint8_t _stp_module_" << stpmod_idx
-		<< "_debug_frame[] = \n";
-      c->output << "  {";
-      if (debug_len > MAX_UNWIND_TABLE_SIZE)
-        {
-          c->session.print_warning ("skipping module " + modname + " debug_frame unwind table (too big: " +
-                                      lex_cast(debug_len) + " > " + lex_cast(MAX_UNWIND_TABLE_SIZE) + ")");
-        }
-      else
-        for (size_t i = 0; i < debug_len; i++)
-          {
-            int h = ((uint8_t *)debug_frame)[i];
-            c->output << h << ","; // decimal is less wordy than hex
-            if ((i + 1) % 16 == 0)
-              c->output << "\n" << "   ";
-          }
-      c->output << "};\n";
-      c->output << "#endif /* STP_USE_DWARF_UNWINDER && STP_NEED_UNWIND_DATA */\n";
-    }
+  dump_unwindsym_cxt_table(c->session, c->output, modname, stpmod_idx, "", 0,
+			   "debug_frame", debug_frame, debug_len);
 
-  if (eh_frame != NULL && eh_len > 0)
-    {
-      c->output << "#if defined(STP_USE_DWARF_UNWINDER) && defined(STP_NEED_UNWIND_DATA)\n";
-      c->output << "static uint8_t _stp_module_" << stpmod_idx
-		<< "_eh_frame[] = \n";
-      c->output << "  {";
-      if (eh_len > MAX_UNWIND_TABLE_SIZE)
-        {
-          c->session.print_warning ("skipping module " + modname + " eh_frame table (too big: " +
-                                      lex_cast(eh_len) + " > " + lex_cast(MAX_UNWIND_TABLE_SIZE) + ")");
-        }
-      else
-        for (size_t i = 0; i < eh_len; i++)
-          {
-            int h = ((uint8_t *)eh_frame)[i];
-            c->output << h << ","; // decimal is less wordy than hex
-            if ((i + 1) % 16 == 0)
-              c->output << "\n" << "   ";
-          }
-      c->output << "};\n";
-      c->output << "#endif /* STP_USE_DWARF_UNWINDER && STP_NEED_UNWIND_DATA */\n";
-    }
+  dump_unwindsym_cxt_table(c->session, c->output, modname, stpmod_idx, "", 0,
+			   "eh_frame", eh_frame, eh_len);
 
-  if (eh_frame_hdr != NULL && eh_frame_hdr_len > 0)
-    {
-      c->output << "#if defined(STP_USE_DWARF_UNWINDER) && defined(STP_NEED_UNWIND_DATA)\n";
-      c->output << "static uint8_t _stp_module_" << stpmod_idx
-		<< "_eh_frame_hdr[] = \n";
-      c->output << "  {";
-      if (eh_frame_hdr_len > MAX_UNWIND_TABLE_SIZE)
-        {
-          c->session.print_warning (_F("skipping module %s eh_frame_hdr table (too big: %s > %s)",
-                                          modname.c_str(), lex_cast(eh_frame_hdr_len).c_str(),
-                                          lex_cast(MAX_UNWIND_TABLE_SIZE).c_str()));
-        }
-      else
-        for (size_t i = 0; i < eh_frame_hdr_len; i++)
-          {
-            int h = ((uint8_t *)eh_frame_hdr)[i];
-            c->output << h << ","; // decimal is less wordy than hex
-            if ((i + 1) % 16 == 0)
-              c->output << "\n" << "   ";
-          }
-      c->output << "};\n";
-      c->output << "#endif /* STP_USE_DWARF_UNWINDER && STP_NEED_UNWIND_DATA */\n";
-    }
-  
+  dump_unwindsym_cxt_table(c->session, c->output, modname, stpmod_idx, "", 0,
+			   "eh_frame_hdr", eh_frame_hdr, eh_frame_hdr_len);
+
   if (c->session.need_unwind && debug_frame == NULL && eh_frame == NULL)
     {
       // There would be only a small benefit to warning.  A user
@@ -5956,32 +6160,8 @@ dump_unwindsym_cxt (Dwfl_Module *m,
       if (secname == ".dynamic" || secname == ".absolute"
 	  || secname == ".text" || secname == "_stext")
 	{
-	  if (debug_frame_hdr != NULL && debug_frame_hdr_len > 0)
-	    {
-	      c->output << "#if defined(STP_USE_DWARF_UNWINDER)"
-			<< " && defined(STP_NEED_UNWIND_DATA)\n";
-	      c->output << "static uint8_t _stp_module_" << stpmod_idx
-			<< "_debug_frame_hdr_" << secidx << "[] = \n";
-	      c->output << "  {";
-	      if (debug_frame_hdr_len > MAX_UNWIND_TABLE_SIZE)
-		{
-                  c->session.print_warning (_F("skipping module %s, section %s debug_frame_hdr"
-                                                 " table (too big: %s > %s)", modname.c_str(),
-                                                 secname.c_str(), lex_cast(debug_frame_hdr_len).c_str(),
-                                                 lex_cast(MAX_UNWIND_TABLE_SIZE).c_str()));
-		}
-	      else
-		for (size_t i = 0; i < debug_frame_hdr_len; i++)
-		  {
-		    int h = ((uint8_t *)debug_frame_hdr)[i];
-                    c->output << h << ","; // decimal is less wordy than hex
-		    if ((i + 1) % 16 == 0)
-		      c->output << "\n" << "   ";
-		  }
-	      c->output << "};\n";
-	      c->output << "#endif /* STP_USE_DWARF_UNWINDER"
-			<< " && STP_NEED_UNWIND_DATA */\n";
-	    }
+	  dump_unwindsym_cxt_table(c->session, c->output, modname, stpmod_idx, secname, secidx,
+				   "debug_frame_hdr", debug_frame_hdr, debug_frame_hdr_len);
 	}
     }
 
@@ -6276,8 +6456,6 @@ add_unwindsym_ldd (systemtap_session &s)
   s.unwindsym_modules.insert (added.begin(), added.end());
 }
 
-static set<string> vdso_paths;
-
 static int find_vdso(const char *path, const struct stat *, int type)
 {
   if (type == FTW_F)
@@ -6514,9 +6692,9 @@ void translate_runtime(systemtap_session& s)
                                         "without is_myproc checking for pid %d (euid %d)"));
 
   s.op->newline() << "#define STAP_MSG_LOC2C_01 "
-                  << lex_cast_qstring(_("kernel read fault at 0x%p (%s)"));
+                  << lex_cast_qstring(_("read fault [man error::fault] at 0x%p (%s)"));
   s.op->newline() << "#define STAP_MSG_LOC2C_02 "
-                  << lex_cast_qstring(_("kernel write fault at 0x%p (%s)"));
+                  << lex_cast_qstring(_("write fault [man error::fault] at 0x%p (%s)"));
   s.op->newline() << "#define STAP_MSG_LOC2C_03 "
                   << lex_cast_qstring(_("divide by zero in DWARF operand (%s)"));
 }
@@ -6597,6 +6775,9 @@ translate_pass (systemtap_session& s)
       // This is at the very top of the file.
       // All "static" defines (not dependend on session state).
       s.op->newline() << "#include \"runtime_defines.h\"";
+      if (s.perf_derived_probes)
+	s.op->newline() << "#define _HAVE_PERF_ 1";
+      s.op->newline() << "#include \"linux/perf_read.h\"";
 
       // Generated macros describing the privilege level required to load/run this module.
       s.op->newline() << "#define STP_PR_STAPUSR 0x" << hex << pr_stapusr << dec;
@@ -6625,6 +6806,9 @@ translate_pass (systemtap_session& s)
       if (s.need_unwind)
 	s.op->newline() << "#define STP_NEED_UNWIND_DATA 1";
 
+      // Emit the total number of probes (not regarding merged probe handlers)
+      s.op->newline() << "#define STP_PROBE_COUNT " << s.probes.size();
+
       s.op->newline() << "#include \"runtime.h\"";
 
       // Emit embeds ahead of time, in case they affect context layout
@@ -6635,29 +6819,75 @@ translate_pass (systemtap_session& s)
 
       s.up->emit_common_header (); // context etc.
 
-      s.op->newline() << "#include \"runtime_context.h\"";
       if (s.need_unwind)
 	s.op->newline() << "#include \"stack.c\"";
 
+      if (s.globals.size()>0)
+	{
+	  s.op->newline() << "struct stp_globals {";
+	  s.op->indent(1);
+	  for (unsigned i=0; i<s.globals.size(); i++)
+	    {
+	      s.up->emit_global (s.globals[i]);
+	    }
+	  s.op->newline(-1) << "};";
+
+	  // We only need to statically initialize globals in kernel modules,
+	  // where module parameters may want to override the script's value.  In
+	  // stapdyn, the globals are actually part of the dynamic shared memory,
+	  // and the static structure is merely used as a source of default values.
+	  s.op->newline();
+	  if (!s.runtime_usermode_p ())
+	    s.op->newline() << "static struct stp_globals stp_global = {";
+	  else
+	   {
+	     s.op->newline() << "static struct {";
+	     s.op->indent(1);
+	     for (unsigned i=0; i<s.globals.size(); i++)
+	       {
+		 assert_no_interrupts();
+                 s.up->emit_global_init_type (s.globals[i]);
+	       }
+	     s.op->newline(-1) << "} stp_global_init = {";
+	   }
+	  s.op->newline(1);
+	  for (unsigned i=0; i<s.globals.size(); i++)
+	    {
+	      assert_no_interrupts();
+              s.up->emit_global_init (s.globals[i]);
+	    }
+	  s.op->newline(-1) << "};";
+
+	  s.op->assert_0_indent();
+	}
+      else
+        // stp_runtime_session wants to incorporate globals, but it
+        // can be empty
+	s.op->newline() << "struct stp_globals {};";
+
+      // Common (static atomic) state of the stap session.
+      s.op->newline() << "#include \"common_session_state.h\"";
+
       s.op->newline() << "#include \"probe_lock.h\" ";
 
-      if (s.globals.size()>0) {
-        s.op->newline() << "static struct {";
-        s.op->indent(1);
-        for (unsigned i=0; i<s.globals.size(); i++)
-          {
-            s.up->emit_global (s.globals[i]);
-          }
-        s.op->newline(-1) << "} global = {";
-        s.op->newline(1);
-        for (unsigned i=0; i<s.globals.size(); i++)
-          {
-            assert_no_interrupts();
-            s.up->emit_global_init (s.globals[i]);
-          }
-        s.op->newline(-1) << "};";
-        s.op->assert_0_indent();
-      }
+      s.op->newline() << "#ifdef STAP_NEED_GETTIMEOFDAY";
+      s.op->newline() << "#include \"time.c\"";  // Don't we all need more?
+      s.op->newline() << "#endif";
+
+      for (map<string,stapdfa*>::iterator it = s.dfas.begin(); it != s.dfas.end(); it++)
+        {
+          assert_no_interrupts();
+          s.op->newline();
+          try
+            {
+              it->second->emit_declaration (s.op);
+            }
+          catch (const semantic_error &e)
+            {
+              s.print_error(e); // TODOXXX want to report the token
+            }
+        }
+      s.op->assert_0_indent();
 
       for (map<string,functiondecl*>::iterator it = s.functions.begin(); it != s.functions.end(); it++)
 	{
@@ -6731,18 +6961,9 @@ translate_pass (systemtap_session& s)
             clog << "*" << endl;                                                \
         }
 
-      s.op->newline() << "static struct stap_probe {";
-      s.op->newline(1) << "void (* const ph) (struct context*);";
-      s.op->newline() << "#ifdef STP_ALIBI";
-      s.op->newline() << "atomic_t alibi;";
-      s.op->newline() << "#define STAP_PROBE_INIT_ALIBI() "
-                      << ".alibi=ATOMIC_INIT(0),";
-      s.op->newline() << "#else";
-      s.op->newline() << "#define STAP_PROBE_INIT_ALIBI()";
-      s.op->newline() << "#endif";
-      s.op->newline() << "#ifdef STP_TIMING";
-      s.op->newline() << "Stat timing;";
-      s.op->newline() << "#endif";
+      s.op->newline() << "struct stap_probe {";
+      s.op->newline(1) << "size_t index;";
+      s.op->newline() << "void (* const ph) (struct context*);";
       s.op->newline() << "#if defined(STP_TIMING) || defined(STP_ALIBI)";
       CALCIT(location);
       CALCIT(derivation);
@@ -6758,26 +6979,36 @@ translate_pass (systemtap_session& s)
       s.op->newline() << "#else";
       s.op->newline() << "#define STAP_PROBE_INIT_NAME(PN)";
       s.op->newline() << "#endif";
-      s.op->newline() << "#define STAP_PROBE_INIT(PH, PP, PN, L, D) "
-                      << "{ .ph=(PH), .pp=(PP), "
+      s.op->newline() << "#define STAP_PROBE_INIT(I, PH, PP, PN, L, D) "
+                      << "{ .index=(I), .ph=(PH), .pp=(PP), "
                       << "STAP_PROBE_INIT_NAME(PN) "
-                      << "STAP_PROBE_INIT_ALIBI() "
                       << "STAP_PROBE_INIT_TIMING(L, D) "
                       << "}";
-      s.op->newline(-1) << "} stap_probes[] = {";
+      s.op->newline(-1) << "} static const stap_probes[] = {";
       s.op->indent(1);
       for (unsigned i=0; i<s.probes.size(); ++i)
         {
           derived_probe* p = s.probes[i];
           p->session_index = i;
-          s.op->newline() << "STAP_PROBE_INIT(&" << p->name << ", "
+          s.op->newline() << "STAP_PROBE_INIT(" << i << ", &" << p->name << ", "
                           << lex_cast_qstring (*p->sole_location()) << ", "
                           << lex_cast_qstring (*p->script_location()) << ", "
                           << lex_cast_qstring (p->tok->location) << ", "
                           << lex_cast_qstring (p->derived_locations()) << "),";
         }
       s.op->newline(-1) << "};";
+      s.op->assert_0_indent();
 #undef CALCIT
+
+      if (s.runtime_usermode_p())
+        {
+          s.op->newline() << "static const char* stp_probe_point(size_t index) {";
+          s.op->newline(1) << "if (index < ARRAY_SIZE(stap_probes))";
+          s.op->newline(1) << "return stap_probes[index].pp;";
+          s.op->newline(-1) << "return NULL;";
+          s.op->newline(-1) << "}";
+          s.op->assert_0_indent();
+        }
 
       s.op->newline();
       s.up->emit_module_init ();
@@ -6787,6 +7018,10 @@ translate_pass (systemtap_session& s)
       s.op->assert_0_indent();
       s.op->newline();
       s.up->emit_module_exit ();
+      s.op->assert_0_indent();
+      s.up->emit_kernel_module_init ();
+      s.op->assert_0_indent();
+      s.up->emit_kernel_module_exit ();
       s.op->assert_0_indent();
       s.op->newline();
 
@@ -6806,12 +7041,15 @@ translate_pass (systemtap_session& s)
 
       s.op->assert_0_indent();
 
-      // PR10298: attempt to avoid collisions with symbols
-      for (unsigned i=0; i<s.globals.size(); i++)
-        {
-          s.op->newline();
-          s.up->emit_global_param (s.globals[i]);
-        }
+      if (s.runtime_usermode_p())
+        s.up->emit_global_init_setters();
+      else
+        // PR10298: attempt to avoid collisions with symbols
+        for (unsigned i=0; i<s.globals.size(); i++)
+          {
+            s.op->newline();
+            s.up->emit_global_param (s.globals[i]);
+          }
       s.op->assert_0_indent();
     }
   catch (const semantic_error& e)

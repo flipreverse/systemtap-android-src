@@ -1,5 +1,5 @@
 // recursive descent parser for systemtap scripts
-// Copyright (C) 2005-2012 Red Hat Inc.
+// Copyright (C) 2005-2013 Red Hat Inc.
 // Copyright (C) 2006 Intel Corporation.
 // Copyright (C) 2007 Bull S.A.S
 //
@@ -161,6 +161,8 @@ private: // nonterminals
   void parse_functiondecl (vector<functiondecl*>&);
   embeddedcode* parse_embeddedcode ();
   probe_point* parse_probe_point ();
+  literal_string* consume_string_literals (const token*);
+  literal_string* parse_literal_string ();
   literal* parse_literal ();
   block* parse_stmt_block ();
   try_block* parse_try_block ();
@@ -180,6 +182,7 @@ private: // nonterminals
   target_symbol *parse_target_symbol (const token* t);
   expression* parse_entry_op (const token* t);
   expression* parse_defined_op (const token* t);
+  expression* parse_perf_op (const token* t);
   expression* parse_expression ();
   expression* parse_assignment ();
   expression* parse_ternary ();
@@ -189,7 +192,7 @@ private: // nonterminals
   expression* parse_boolean_xor ();
   expression* parse_boolean_and ();
   expression* parse_array_in ();
-  expression* parse_comparison ();
+  expression* parse_comparison_or_regex_query ();
   expression* parse_shift ();
   expression* parse_concatenation ();
   expression* parse_additive ();
@@ -433,7 +436,7 @@ parser::next_pp1 ()
   if (cursor < act->curr_macro->body.size())
     {
       token* t = new token(*act->curr_macro->body[cursor]);
-      t->chain = act->tok; // mark chained token
+      t->chain = new token(*act->tok); // mark chained token
       cursor++;
       return t;
     }
@@ -589,12 +592,12 @@ parser::scan_pp1 ()
           if (! (t && t->type == tok_operator && t->content == "("))
             {
               delete new_act;
-              throw parse_error (_F(ngettext
+              throw parse_error (_NF
                                     ("expected '(' in invocation of macro '@%s'"
                                      " taking %d parameter",
                                      "expected '(' in invocation of macro '@%s'"
                                      " taking %d parameters",
-                                     num_params), name.c_str(), num_params), t);
+                                     num_params, name.c_str(), num_params), t);
             }
 
           // XXX perhaps parse/count the full number of params,
@@ -907,6 +910,30 @@ bool eval_pp_conditional (systemtap_session& s,
 
       return result;
     }
+  else if (l->type == tok_identifier && l->content == "runtime")
+    {
+      if (! (r->type == tok_string))
+        throw parse_error (_("expected string literal"), r);
+
+      string query_runtime = r->content;
+      string target_runtime;
+
+      target_runtime = (s.runtime_mode == systemtap_session::dyninst_runtime
+			? "dyninst" : "kernel");
+      int nomatch = fnmatch (query_runtime.c_str(),
+                             target_runtime.c_str(),
+                             FNM_NOESCAPE); // still spooky
+
+      bool result;
+      if (op->type == tok_operator && op->content == "==")
+        result = !nomatch;
+      else if (op->type == tok_operator && op->content == "!=")
+        result = nomatch;
+      else
+        throw parse_error (_("expected '==' or '!='"), op);
+
+      return result;
+    }
   else if (l->type == tok_identifier && startswith(l->content, "CONFIG_"))
     {
       if (r->type == tok_string)
@@ -987,8 +1014,9 @@ bool eval_pp_conditional (systemtap_session& s,
     throw parse_error (_("expected number literal as right value"), r);
 
   else
-    throw parse_error (_("expected 'arch' or 'kernel_v' or 'kernel_vr' or 'CONFIG_...'\n"
-		       "             or comparison between strings or integers"), l);
+    throw parse_error (_("expected 'arch', 'kernel_v', 'kernel_vr', 'systemtap_v',\n"
+			 "             'runtime', 'systemtap_privilege', 'CONFIG_...', or\n"
+			 "             comparison between strings or integers"), l);
 }
 
 
@@ -1697,6 +1725,8 @@ skip:
                (c == '!' && c2 == '=') ||
                (c == '<' && c2 == '=') ||
                (c == '>' && c2 == '=') ||
+               (c == '=' && c2 == '~') ||
+               (c == '!' && c2 == '~') ||
                (c == '+' && c2 == '=') ||
                (c == '-' && c2 == '=') ||
                (c == '*' && c2 == '=') ||
@@ -1833,7 +1863,7 @@ parser::parse ()
     }
   else if (num_errors > 0)
     {
-      cerr << _F(ngettext("%d parse error.", "%d parse errors.", num_errors), num_errors) << endl;
+      cerr << _NF("%d parse error.", "%d parse errors.", num_errors, num_errors) << endl;
       delete f;
       f = 0;
     }
@@ -1979,7 +2009,7 @@ parser::parse_try_block ()
   expect_kw ("catch");
 
   const token* t = peek ();
-  if (t->type == tok_operator && t->content == "(")
+  if (t != NULL && t->type == tok_operator && t->content == "(")
     {
       swallow (); // swallow the '('
 
@@ -2242,6 +2272,8 @@ parser::parse_probe_point ()
       while (1)
         {
           const token* u = peek();
+          if (u == NULL)
+            break;
           // ensure pieces of the identifier are adjacent:
           if (input.ate_whitespace)
             break;
@@ -2336,6 +2368,44 @@ parser::parse_probe_point ()
 }
 
 
+literal_string*
+parser::consume_string_literals(const token *t)
+{
+  literal_string *ls = new literal_string (t->content);
+
+  // PR11208: check if the next token is also a string literal;
+  // auto-concatenate it.  This is complicated to the extent that we
+  // need to skip intermediate whitespace.
+  //
+  // NB for versions prior to 2.0: but don't skip over intervening comments
+  const token *n = peek();
+  while (n != NULL && n->type == tok_string
+         && ! (strverscmp(session.compatible.c_str(), "2.0") < 0
+               && input.ate_comment))
+    {
+      ls->value.append(next()->content); // consume and append the token
+      n = peek();
+    }
+  return ls;
+}
+
+
+// Parse a string literal and perform backslash escaping on the contents:
+literal_string*
+parser::parse_literal_string ()
+{
+  const token* t = next ();
+  literal_string* l;
+  if (t->type == tok_string)
+    l = consume_string_literals (t);
+  else
+    throw parse_error (_("expected literal string"));
+
+  l->tok = t;
+  return l;
+}
+
+
 literal*
 parser::parse_literal ()
 {
@@ -2343,20 +2413,7 @@ parser::parse_literal ()
   literal* l;
   if (t->type == tok_string)
     {
-      literal_string *ls = new literal_string (t->content);
-
-      // PR11208: check if the next token is also a string literal; auto-concatenate it
-      // This is complicated to the extent that we need to skip intermediate whitespace.
-      // NB for versions prior to 2.0: but don't skip over intervening comments
-      const token *n = peek();
-      while (n != NULL && n->type == tok_string
-             && ! (strverscmp(session.compatible.c_str(), "2.0") < 0
-                   && input.ate_comment))
-        {
-          ls->value.append(next()->content); // consume and append the token
-          n = peek();
-        }
-      l = ls;
+      l = consume_string_literals (t);
     }
   else
     {
@@ -2440,6 +2497,8 @@ parser::parse_expr_statement ()
 {
   expr_statement *es = new expr_statement;
   const token* t = peek ();
+  if (t == NULL)
+    throw parse_error (_("expression statement expected"));
   // Copy, we only peeked, parse_expression might swallow.
   es->tok = new token (*t);
   es->value = parse_expression ();
@@ -2978,7 +3037,7 @@ parser::parse_array_in ()
 
   while (1)
     {
-      expression* op1 = parse_comparison ();
+      expression* op1 = parse_comparison_or_regex_query ();
       indexes.push_back (op1);
 
       if (parenthesized)
@@ -3011,7 +3070,7 @@ parser::parse_array_in ()
       arrayindex* a = new arrayindex;
       a->indexes = indexes;
       a->base = parse_indexable();
-      a->tok = a->base->get_tok();
+      a->tok = a->base->tok;
       e->operand = a;
       return e;
     }
@@ -3023,12 +3082,27 @@ parser::parse_array_in ()
 
 
 expression*
-parser::parse_comparison ()
+parser::parse_comparison_or_regex_query ()
 {
   expression* op1 = parse_shift ();
 
-  const token* t = peek ();
-  while (t && t->type == tok_operator
+  // TODOXXX for now, =~ is nonassociative
+  // TODOXXX maybe instead a =~ b == c =~ d --> (a =~ b) == (c =~ d) ??
+  const token *t = peek();
+  if (t && t->type == tok_operator
+      && (t->content == "=~" ||
+          t->content == "!~"))
+    {
+      regex_query* r = new regex_query;
+      r->left = op1;
+      r->op = t->content;
+      r->tok = t;
+      next ();
+      r->right = r->re = parse_literal_string();
+      op1 = r;
+      t = peek ();
+    }
+  else while (t && t->type == tok_operator
       && (t->content == ">" ||
           t->content == "<" ||
           t->content == "==" ||
@@ -3325,6 +3399,9 @@ expression* parser::parse_symbol ()
       if (name == "@entry")
         return parse_entry_op (t);
 
+      if (name == "@perf")
+        return parse_perf_op (t);
+
       if (name.size() > 0 && name[0] == '@')
 	{
 	  stat_op *sop = new stat_op;
@@ -3533,8 +3610,11 @@ target_symbol* parser::parse_target_symbol (const token* t)
   if (t->type == tok_operator && t->content == "&")
     {
       addressof = true;
+      // Don't delete t before trying next token.
+      // We might need it in the error message when there is no next token.
+      const token *next_t = next ();
       delete t;
-      t = next ();
+      t = next_t;
     }
 
   if (t->type == tok_operator && t->content == "@cast")
@@ -3618,6 +3698,24 @@ expression* parser::parse_entry_op (const token* t)
 }
 
 
+// Parse a @perf().  Given head token has already been consumed.
+expression* parser::parse_perf_op (const token* t)
+{
+  perf_op* pop = new perf_op;
+
+  if (strverscmp(session.compatible.c_str(), "2.1") < 0)
+    throw parse_error (_("expected @cast, @var or $var"));
+
+  pop->tok = t;
+  expect_op("(");
+  pop->operand = parse_literal_string ();
+  if (pop->operand->value == "")
+    throw parse_error (_("expected non-empty string"));
+  expect_op(")");
+  return pop;
+}
+
+
 
 void
 parser::parse_target_symbol_components (target_symbol* e)
@@ -3678,7 +3776,7 @@ parser::parse_target_symbol_components (target_symbol* e)
       // check for pretty-print in the form $foo $
       // i.e. as a separate token, esp. for $foo[i]$ and @cast(...)$
       const token* t = peek();
-      if (t->type == tok_identifier &&
+      if (t != NULL && t->type == tok_identifier &&
           t->content.find_first_not_of('$') == string::npos)
         {
           t = next();

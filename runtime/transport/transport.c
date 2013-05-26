@@ -97,7 +97,7 @@ static struct notifier_block _stp_module_panic_notifier_nb = {
 };
 #endif
 
-struct timer_list _stp_ctl_work_timer;
+static struct timer_list _stp_ctl_work_timer;
 
 /*
  *	_stp_handle_start - handle STP_START
@@ -376,22 +376,6 @@ static int _stp_transport_init(void)
         kallsyms_uprobe_get_swbp_addr = (void*) kallsyms_lookup_name ("uprobe_get_swbp_addr");
         if (kallsyms_uprobe_get_swbp_addr == NULL) {
                 printk(KERN_ERR "%s can't resolve uprobe_get_swbp_addr!", THIS_MODULE->name);
-                goto err0;
-        }
-#endif
-#endif
-#if defined(STAPCONF_INODE_URETPROBES) // i.e., kernel-embedded uretprobes
-#if !defined(STAPCONF_URETPROBE_REGISTER_EXPORTED)
-        kallsyms_uretprobe_register = (void*) kallsyms_lookup_name ("uretprobe_register");
-        if (kallsyms_uretprobe_register == NULL) {
-                printk(KERN_ERR "%s can't resolve uretprobe_register!", THIS_MODULE->name);
-                goto err0;
-        }
-#endif
-#if !defined(STAPCONF_URETPROBE_UNREGISTER_EXPORTED)
-        kallsyms_uretprobe_unregister = (void*) kallsyms_lookup_name ("uretprobe_unregister");
-        if (kallsyms_uretprobe_unregister == NULL) {
-                printk(KERN_ERR "%s can't resolve uretprobe_unregister!", THIS_MODULE->name);
                 goto err0;
         }
 #endif

@@ -34,6 +34,8 @@ static int stap_uprobe_change_plus (struct task_struct *tsk, unsigned long reloc
     pid_t sdt_sem_pid;
     int rc = 0;
     int i;
+    int pci;
+    
     if (likely(sups->tfi != tfi)) continue;
     /* skip probes with an address beyond this map event; should not 
        happen unless a shlib/exec got mmapped in weirdly piecemeal */
@@ -82,6 +84,12 @@ static int stap_uprobe_change_plus (struct task_struct *tsk, unsigned long reloc
        * case with relocation=offset=0, so we don't have to worry about it.  */
       sup->sdt_sem_address = (relocation - offset) + sups->sdt_sem_offset;
     } /* sdt_sem_offset */
+
+    for (pci=0; pci < sups->perf_counters_dim; pci++) {
+	if ((sups->perf_counters)[pci] > -1)
+	  _stp_perf_read_init ((sups->perf_counters)[pci], tsk);
+      }
+
     if (slotted_p) {
       struct stap_uprobe *sup = & stap_uprobes[i];
       if (sups->return_p) {
@@ -115,12 +123,12 @@ static int stap_uprobe_change_plus (struct task_struct *tsk, unsigned long reloc
     /* NB: handled_p implies slotted_p */
     if (unlikely (! handled_p)) {
       #ifdef STP_TIMING
-      atomic_inc (& skipped_count_uprobe_reg);
+      atomic_inc (skipped_count_uprobe_reg());
       #endif
       /* NB: duplicates common_entryfn_epilogue,
 	 but then this is not a probe entry fn epilogue. */
-      if (unlikely (atomic_inc_return (& skipped_count) > MAXSKIPPED)) {
-        if (unlikely (pseudo_atomic_cmpxchg(& session_state, STAP_SESSION_RUNNING, STAP_SESSION_ERROR) == STAP_SESSION_RUNNING))
+      if (unlikely (atomic_inc_return (skipped_count()) > MAXSKIPPED)) {
+        if (unlikely (pseudo_atomic_cmpxchg(session_state(), STAP_SESSION_RUNNING, STAP_SESSION_ERROR) == STAP_SESSION_RUNNING))
         _stp_error ("Skipped too many probes, check MAXSKIPPED or try again with stap -t for more details.");
       }
     }

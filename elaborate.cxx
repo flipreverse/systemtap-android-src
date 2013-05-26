@@ -1,5 +1,5 @@
 // elaboration functions
-// Copyright (C) 2005-2012 Red Hat Inc.
+// Copyright (C) 2005-2013 Red Hat Inc.
 // Copyright (C) 2008 Intel Corporation
 //
 // This file is part of systemtap, and is free software.  You can
@@ -15,6 +15,8 @@
 #include "session.h"
 #include "util.h"
 #include "task_finder.h"
+
+#include "re2c-migrate/stapregex.h"
 
 extern "C" {
 #include <sys/utsname.h>
@@ -110,17 +112,17 @@ derived_probe::printsig_nested (ostream& o) const
 
 
 void
-derived_probe::collect_derivation_chain (std::vector<probe*> &probes_list)
+derived_probe::collect_derivation_chain (std::vector<probe*> &probes_list) const
 {
-  probes_list.push_back(this);
+  probes_list.push_back(const_cast<derived_probe*>(this));
   base->collect_derivation_chain(probes_list);
 }
 
 
 void
-derived_probe::collect_derivation_pp_chain (std::vector<probe_point*> &pp_list)
+derived_probe::collect_derivation_pp_chain (std::vector<probe_point*> &pp_list) const
 {
-  pp_list.push_back(base_pp);
+  pp_list.push_back(const_cast<probe_point*>(this->sole_location()));
   base->collect_derivation_pp_chain(pp_list);
 }
 
@@ -131,8 +133,9 @@ derived_probe::derived_locations ()
   ostringstream o;
   vector<probe_point*> reference_point;
   collect_derivation_pp_chain(reference_point);
-  for(unsigned i=0; i<reference_point.size(); ++i)
-    o << " from: " << reference_point[i]->str(false); // no ?,!,etc
+  if (reference_point.size() > 0)
+    for(unsigned i=1; i<reference_point.size(); ++i)
+      o << " from: " << reference_point[i]->str(false); // no ?,!,etc
   return o.str();
 }
 
@@ -141,9 +144,9 @@ probe_point*
 derived_probe::sole_location () const
 {
   if (locations.size() == 0 || locations.size() > 1)
-    throw semantic_error (ngettext("derived_probe with no locations",
-                                   "derived_probe with no locations",
-                                   locations.size()), this->tok);
+    throw semantic_error (_N("derived_probe with no locations",
+                             "derived_probe with too many locations",
+                             locations.size()), this->tok);
   else
     return locations[0];
 }
@@ -152,17 +155,31 @@ derived_probe::sole_location () const
 probe_point*
 derived_probe::script_location () const
 {
-  // XXX PR14297 make this more accurate wrt complex wildcard expansions
-  const probe* p = almost_basest();
-  probe_point *a = p->get_alias_loc();
-  if (a) return a;
-  const vector<probe_point*>& locs = p->locations;
-  if (locs.size() == 0 || locs.size() > 1)
-    throw semantic_error (ngettext("derived_probe with no locations",
-                                   "derived_probe with too many locations",
-                                   locs.size()), this->tok);
-  else
-    return locs[0];
+  // This feeds function::pn() in the tapset, which is documented as the
+  // script-level probe point expression, *after wildcard expansion*.  If
+  // it were not for wildcard stuff, we'd just return the last item in the
+  // derivation chain.  But alas ... we need to search for the last one
+  // that doesn't have a * in the textual representation.  Heuristics, eww.
+  vector<probe_point*> chain;
+  collect_derivation_pp_chain (chain);
+
+  // NB: we actually start looking from the second-to-last item, so the user's
+  // direct input is not considered.  Input like 'kernel.function("init_once")'
+  // will thus be listed with the resolved @file:line too, disambiguating the
+  // distinct functions by this name, and matching our historical behavior.
+  for (int i=chain.size()-2; i>=0; i--)
+    {
+      probe_point pp_copy (* chain [i]);
+      // drop any ?/! denotations that would confuse a glob-char search
+      pp_copy.optional = false;
+      pp_copy.sufficient = false;
+      string pp_printed = lex_cast(pp_copy);
+      if (! contains_glob_chars(pp_printed))
+        return chain[i];
+    }
+
+  // If that didn't work, just fallback to -something-.
+  return sole_location();
 }
 
 
@@ -770,6 +787,7 @@ struct alias_derived_probe: public derived_probe
 
   virtual const probe_alias *get_alias () const { return alias; }
   virtual probe_point *get_alias_loc () const { return alias_loc; }
+  virtual probe_point *sole_location () const;
 
 private:
   const probe_alias *alias; // Used to check for recursion
@@ -793,6 +811,13 @@ alias_derived_probe::alias_derived_probe(probe *base, probe_point *l,
 }
 
 
+probe_point*
+alias_derived_probe::sole_location () const
+{
+  return const_cast<probe_point*>(alias_loc);
+}
+
+
 probe*
 probe::create_alias(probe_point* l, probe_point* a)
 {
@@ -801,6 +826,7 @@ probe::create_alias(probe_point* l, probe_point* a)
   p->tok = tok;
   p->locations.push_back(l);
   p->body = body;
+  p->base = this;
   p->privileged = privileged;
   p->epilogue_style = false;
   return new alias_derived_probe(this, l, p);
@@ -952,6 +978,9 @@ derive_probes (systemtap_session& s,
 
       probe_point *loc = p->locations[i];
 
+      if (s.verbose > 4)
+        clog << "derive-probes " << *loc << endl;
+
       try
         {
           unsigned num_atbegin = dps.size();
@@ -1053,7 +1082,7 @@ struct symbol_fetcher
 
   void visit_arrayindex (arrayindex* e)
   {
-    e->base->visit_indexable (this);
+    e->base->visit (this);
   }
 
   void visit_cast_op (cast_op* e)
@@ -1063,7 +1092,10 @@ struct symbol_fetcher
 
   void throwone (const token* t)
   {
-    throw semantic_error (_("Expecting symbol or array index expression"), t);
+    if (t->type == tok_operator && t->content == ".") // guess someone misused . in $foo->bar.baz expression
+      throw semantic_error (_("Expecting symbol or array index expression, try -> instead"), t);
+    else
+      throw semantic_error (_("Expecting symbol or array index expression"), t);
   }
 };
 
@@ -1460,6 +1492,49 @@ void embeddedcode_info_pass (systemtap_session& s)
 // ------------------------------------------------------------------------
 
 
+// Simple visitor that collects all the regular expressions in the
+// file and adds them to the session DFA table.
+
+struct regex_collecting_visitor: public functioncall_traversing_visitor
+{
+protected:
+  systemtap_session& session;
+
+public:
+  regex_collecting_visitor (systemtap_session& s): session(s) { }
+
+  void visit_regex_query (regex_query *q) {
+    functioncall_traversing_visitor::visit_regex_query (q); // TODOXXX test necessity
+
+    string re = q->re->value;
+    try
+      {
+        regex_to_stapdfa (&session, re, session.dfa_counter);
+      }
+    catch (const semantic_error &e)
+      {
+        throw semantic_error(e.what(), q->right->tok);
+      }
+  }
+};
+
+// Go through the regex match invocations and generate corresponding DFAs.
+void gen_dfa_table (systemtap_session& s)
+{
+  regex_collecting_visitor rcv(s); // TODOXXX
+
+  for (unsigned i=0; i<s.probes.size(); i++)
+    {
+      s.probes[i]->body->visit (& rcv);
+
+      if (s.probes[i]->sole_location()->condition)
+        s.probes[i]->sole_location()->condition->visit (& rcv);
+    }
+}
+
+// ------------------------------------------------------------------------
+
+
 static int semantic_pass_symbols (systemtap_session&);
 static int semantic_pass_optimize1 (systemtap_session&);
 static int semantic_pass_optimize2 (systemtap_session&);
@@ -1619,7 +1694,6 @@ semantic_pass_symbols (systemtap_session& s)
 
   return s.num_errors(); // all those print_error calls
 }
-
 
 
 // Keep unread global variables for probe end value display.
@@ -1895,6 +1969,7 @@ semantic_pass (systemtap_session& s)
       if (rc == 0) rc = semantic_pass_conditions (s);
       if (rc == 0) rc = semantic_pass_optimize1 (s);
       if (rc == 0) rc = semantic_pass_types (s);
+      if (rc == 0) gen_dfa_table(s); // TODOXXX set rc?
       if (rc == 0) add_global_var_display (s);
       if (rc == 0) rc = semantic_pass_optimize2 (s);
       if (rc == 0) rc = semantic_pass_vars (s);
@@ -1911,8 +1986,10 @@ semantic_pass (systemtap_session& s)
     }
 
   // PR11443
-  if (s.listing_mode && s.probes.size() == 0)
-    rc ++;
+  // NB: listing mode only cares whether we have any probes,
+  // so all previous error conditions are disregarded.
+  if (s.listing_mode)
+    rc = s.probes.empty();
 
   return rc;
 }
@@ -2865,9 +2942,10 @@ struct void_statement_reducer: public update_visitor
   void visit_logical_and_expr (logical_and_expr* e);
   void visit_ternary_expression (ternary_expression* e);
 
-  // all of these can be reduced into simpler statements
+  // all of these can (usually) be reduced into simpler statements
   void visit_binary_expression (binary_expression* e);
   void visit_unary_expression (unary_expression* e);
+  void visit_regex_query (regex_query* e); // TODOXXX may or may not be reducible
   void visit_comparison (comparison* e);
   void visit_concatenation (concatenation* e);
   void visit_functioncall (functioncall* e);
@@ -3054,6 +3132,28 @@ void_statement_reducer::visit_unary_expression (unary_expression* e)
 
   relaxed_p = false;
   e->operand->visit(this);
+}
+
+void
+void_statement_reducer::visit_regex_query (regex_query* e)
+{
+  // Whether we need to run a regex query depends on whether
+  // subexpression extraction is enabled, as in:
+  //
+  // str =~ "pat";
+  // println(matched(0)); // NOTE: not totally nice -- are we SURE it matched?
+  // TODOXXX it's debatable whether we should allow this, though
+
+  // TODOXXX since subexpression extraction is not yet implemented,
+  // just treat it as a unary expression wrt the left operand -- since
+  // the right hand side must be a literal (verified by the parses),
+  // evaluating it never has side effects.
+
+  if (session.verbose>2)
+    clog << _("Eliding regex query ") << *e->tok << endl;
+
+  relaxed_p = false;
+  e->left->visit(this);
 }
 
 void
@@ -3272,6 +3372,7 @@ struct const_folder: public update_visitor
   void visit_unary_expression (unary_expression* e);
   void visit_logical_or_expr (logical_or_expr* e);
   void visit_logical_and_expr (logical_and_expr* e);
+  // TODOXXX visit_regex_query could be done if we could run dfa at compiletime
   void visit_comparison (comparison* e);
   void visit_concatenation (concatenation* e);
   void visit_ternary_expression (ternary_expression* e);
@@ -4115,6 +4216,25 @@ typeresolution_info::visit_logical_and_expr (logical_and_expr *e)
   visit_binary_expression (e);
 }
 
+void
+typeresolution_info::visit_regex_query (regex_query *e)
+{
+  // NB: result of regex query is an integer!
+  if (t == pe_stats || t == pe_string)
+    invalid (e->tok, t);
+
+  t = pe_string;
+  e->left->visit (this);
+  t = pe_string;
+  e->right->visit (this); // parser ensures this is a literal known at compile time
+
+  if (e->type == pe_unknown)
+    {
+      e->type = pe_long;
+      resolved (e->tok, e->type);
+    }
+}
+
 
 void
 typeresolution_info::visit_comparison (comparison *e)
@@ -4481,6 +4601,23 @@ typeresolution_info::visit_cast_op (cast_op* e)
   else
     throw semantic_error(_F("type definition '%s' not found in '%s'",
                             e->type_name.c_str(), e->module.c_str()), e->tok);
+}
+
+
+void
+typeresolution_info::visit_perf_op (perf_op* e)
+{
+  // A perf_op should already be resolved
+  if (t == pe_stats || t == pe_string)
+    invalid (e->tok, t);
+
+  e->type = pe_long;
+
+  // (There is no real need to visit our operand - by parser
+  // construction, it's always a string literal, with its type already
+  // set.)
+  t = pe_string;
+  e->operand->visit (this);
 }
 
 

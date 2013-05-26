@@ -17,10 +17,6 @@ AM_CPPFLAGS = -DBINDIR='"$(bindir)"' \
 AM_CFLAGS = -D_GNU_SOURCE -fexceptions -Wall -Werror -Wunused -Wformat=2 -W
 AM_CXXFLAGS = -Wall -Werror
 
-man_MANS = stapprobes.3stap stapfuncs.3stap stapvars.3stap stapex.3stap \
-dtrace.1 stap-merge.1\
-stappaths.7
-
 bin_SCRIPTS = stap-report
 pkglibexec_SCRIPTS = stap-env
 oldinclude_HEADERS = includes/sys/sdt.h includes/sys/sdt-config.h
@@ -29,7 +25,6 @@ bin_PROGRAMS =
 
 if BUILD_TRANSLATOR
 bin_PROGRAMS += stap
-man_MANS += stap.1
 bin_SCRIPTS += dtrace
 
 pkglibexec_PROGRAMS =
@@ -38,7 +33,6 @@ if HAVE_NSS
 pkglibexec_PROGRAMS += stap-sign-module stap-authorize-cert
 
 if BUILD_SERVER
-man_MANS += stap-server.8
 pkglibexec_PROGRAMS += stap-serverd stap-gen-cert
 bin_SCRIPTS += stap-server
 pkglibexec_SCRIPTS += stap-start-server stap-stop-server
@@ -52,9 +46,13 @@ stap_SOURCES = main.cxx session.cxx \
 	tapset-been.cxx tapset-procfs.cxx tapset-timers.cxx tapset-netfilter.cxx \
 	tapset-perfmon.cxx tapset-mark.cxx tapset-itrace.cxx \
 	tapset-utrace.cxx task_finder.cxx dwflpp.cxx rpm_finder.cxx \
-	setupdwfl.cxx remote.cxx privilege.cxx cmdline.cxx
+	setupdwfl.cxx remote.cxx privilege.cxx cmdline.cxx \
+	tapset-dynprobe.cxx tapset-method.cxx
+stap_SOURCES += re2c-migrate/stapregex.cxx \
+	re2c-migrate/re2c-regex.cxx re2c-migrate/re2c-emit.cxx \
+	re2c-migrate/re2c-dfa.cxx re2c-migrate/re2c-globals.cxx
 noinst_HEADERS = sdt_types.h
-stap_LDADD = @stap_LIBS@ @sqlite3_LIBS@ @LIBINTL@
+stap_LDADD = @stap_LIBS@ @sqlite3_LIBS@ @LIBINTL@ -lpthread
 stap_DEPENDENCIES =
 endif
 
@@ -255,7 +253,7 @@ endif
 	(cd $(srcdir)/tapset; find . \( -name '*.stp' -o -name '*.stpm' -o -name README \) -print \
 		| while read f; do $(INSTALL_DATA) -D $$f $(DESTDIR)$(pkgdatadir)/tapset/$$f; done)
 	(cd $(srcdir)/testsuite/systemtap.examples; find . -type f -print \
-		| egrep -v 'check.exp|ChangeLog|examples-index-gen.pl' \
+		| egrep -v 'check.exp|ChangeLog|examples-index-gen.pl|html/.*\.tmpl$$' \
 		| while read f; do if test -x $$f; then \
 			i_cmd="$(INSTALL_PROGRAM)"; else \
 			i_cmd="$(INSTALL_DATA)"; fi; \
@@ -287,6 +285,7 @@ clean-local:
 
 distclean-local:
 	rm -rf build-elfutils include-elfutils lib-elfutils
+	rm -f doc/beginners/en-US doc/beginners/build/en-US/testsuite
 
 uninstall-local:
 	rm -rf $(DESTDIR)$(pkgdatadir)
@@ -310,9 +309,8 @@ if BUILD_SERVER
 	rm -rf $(DESTDIR)$(localstatedir)/run/stap-server
 	rm -f $(DESTDIR)$(localstatedir)/log/stap-server/log
 endif
-	(cd $(srcdir)/man; for f in *.3*; do rm -rf "$(DESTDIR)$(man3dir)/$$f"; done)
 
-SUBDIRS = . stapdyn staprun doc po
+SUBDIRS = . java stapdyn staprun re2c-migrate doc man po
 # NB: the gcov target above uses this to enumarate linked binaries' build directories
 DIST_SUBDIRS = testsuite $(SUBDIRS)
 EXTRA_DIST = m4/ChangeLog
@@ -351,7 +349,7 @@ testsuite/dtrace: dtrace
 
 PHONIES += update-po
 update-po:
-	(cd $(srcdir); ls -1d *.c *.cxx *.h staprun/*.c staprun/*.h dtrace.in) \
+	(cd $(srcdir); ls -1d *.c *.cxx *.h staprun/*.c staprun/*.h) \
 	| grep -v loc2c-test.c \
 	| grep -v config.h \
 	| grep -v git_version.h \
@@ -380,6 +378,7 @@ dist-gzip:
 	(cd $(srcdir); git archive --prefix=systemtap-$(VERSION)/ --format=tar HEAD) | gzip > systemtap-$(VERSION).tar.gz
 
 rpm: dist-gzip
+	if [ `id -u` = 0 ]; then echo NOTE: do not run this as root; exit 1; fi
 	mkdir -p `rpm --eval %_specdir`
 	mkdir -p `rpm --eval %_srcrpmdir`
 	mkdir -p `rpm --eval %_rpmdir`

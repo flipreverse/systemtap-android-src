@@ -17,8 +17,8 @@ struct _stp_procfs_data {
 
 struct stap_procfs_probe {
 	const char *path;
-	struct stap_probe * const read_probe;
-	struct stap_probe * const write_probe;
+	const struct stap_probe * const read_probe;
+	const struct stap_probe * const write_probe;
 
 	char *buffer;
 	const size_t bufsize;
@@ -52,7 +52,7 @@ _stp_proc_open_file(struct inode *inode, struct file *filp)
 	struct stap_procfs_probe *spp;
 	int res;
 
-	spp = (struct stap_procfs_probe *)PDE(inode)->data;
+	spp = (struct stap_procfs_probe *)PDE_DATA(inode);
 	if (spp == NULL) {
 		return -EINVAL;
 	}

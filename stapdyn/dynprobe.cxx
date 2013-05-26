@@ -1,5 +1,5 @@
 // stapdyn probe functions
-// Copyright (C) 2012 Red Hat Inc.
+// Copyright (C) 2012-2013 Red Hat Inc.
 //
 // This file is part of systemtap, and is free software.  You can
 // redistribute it and/or modify it under the terms of the GNU General
@@ -10,7 +10,9 @@
 #include "dynutil.h"
 #include "../util.h"
 
+extern "C" {
 #include "../runtime/dyninst/stapdyn.h"
+}
 
 
 using namespace std;
@@ -59,6 +61,8 @@ find_dynprobes(void* module, vector<dynprobe_target>& targets)
   for (uint64_t i = 0; i < ntargets; ++i)
     {
       const char* path = target_path(i);
+      if (path == NULL)
+	  path = "";
       dynprobe_target target(path);
       targets.push_back(target);
     }
@@ -73,7 +77,7 @@ find_dynprobes(void* module, vector<dynprobe_target>& targets)
       uint64_t semaphore = probe_semaphore(i);
       uint64_t flags = probe_flags ? probe_flags(i) : 0;
       dynprobe_location p(i, offset, semaphore, flags);
-      if (target_index < ntargets)
+      if (p.validate() && target_index < ntargets)
         targets[target_index].probes.push_back(p);
     }
 
@@ -81,12 +85,12 @@ find_dynprobes(void* module, vector<dynprobe_target>& targets)
   for (uint64_t i = 0; i < ntargets; ++i)
     {
       dynprobe_target& t = targets[i];
-      staplog(3) << "target " << t.path << " has "
+      staplog(3) << "target \"" << t.path << "\" has "
                  << t.probes.size() << " probes" << endl;
       for (uint64_t j = 0; j < t.probes.size(); ++j)
         staplog(3) << "  offset:" << lex_cast_hex(t.probes[j].offset)
                    << " semaphore:" << lex_cast_hex(t.probes[j].semaphore)
-                   << " return_p:" << t.probes[j].return_p << endl;
+                   << " flags:" << t.probes[j].flags << endl;
     }
 
   return 0;
@@ -96,8 +100,21 @@ find_dynprobes(void* module, vector<dynprobe_target>& targets)
 dynprobe_location::dynprobe_location(uint64_t index, uint64_t offset,
                                      uint64_t semaphore, uint64_t flags):
       index(index), offset(offset), semaphore(semaphore),
-      return_p(flags & STAPDYN_PROBE_FLAG_RETURN)
+      flags(flags), return_p(flags & STAPDYN_PROBE_FLAG_RETURN)
 {
+}
+
+bool
+dynprobe_location::validate()
+{
+  if (flags & ~STAPDYN_PROBE_ALL_FLAGS)
+    {
+      stapwarn() << "Unknown flags " << lex_cast_hex(flags)
+                 << " in probe " << index << endl;
+      return false;
+    }
+
+  return true;
 }
 
 

@@ -1,7 +1,6 @@
 // tapset for procfs
 // Copyright (C) 2005-2010 Red Hat Inc.
 // Copyright (C) 2005-2007 Intel Corporation.
-// Copyright (C) 2008 James.Bottomley@HansenPartnership.com
 //
 // This file is part of systemtap, and is free software.  You can
 // redistribute it and/or modify it under the terms of the GNU General
@@ -70,6 +69,8 @@ public:
     has_read_probes(false), has_write_probes(false) {} 
 
   void enroll (procfs_derived_probe* probe);
+  void emit_kernel_module_init (systemtap_session& s);
+  void emit_kernel_module_exit (systemtap_session& s);
   void emit_module_decls (systemtap_session& s);
   void emit_module_init (systemtap_session& s);
   void emit_module_exit (systemtap_session& s);
@@ -161,6 +162,29 @@ procfs_derived_probe_group::enroll (procfs_derived_probe* p)
       pset->read_probe = p;
       has_read_probes = true;
     }
+}
+
+
+void
+procfs_derived_probe_group::emit_kernel_module_init (systemtap_session& s)
+{
+  if (probes_by_path.empty())
+    return;
+  s.op->newline() << "rc = _stp_mkdir_proc_module();";
+}
+
+
+void
+procfs_derived_probe_group::emit_kernel_module_exit (systemtap_session& s)
+{
+  if (probes_by_path.empty())
+    return;
+  // If we're using the original transport, it uses the
+  // '/proc/systemtap/{module_name}' directory to store control
+  // files. Let the transport layer clean up that directory.
+  s.op->newline() << "#if (STP_TRANSPORT_VERSION != 1)";
+  s.op->newline() << "_stp_rmdir_proc_module();";
+  s.op->newline() << "#endif";
 }
 
 
@@ -258,8 +282,8 @@ procfs_derived_probe_group::emit_module_decls (systemtap_session& s)
       s.op->newline(1) << "c->ips.procfs_data = &pdata;";
       s.op->newline(-1) << "else {";
 
-      s.op->newline(1) << "if (unlikely (atomic_inc_return (& skipped_count) > MAXSKIPPED)) {";
-      s.op->newline(1) << "atomic_set (& session_state, STAP_SESSION_ERROR);";
+      s.op->newline(1) << "if (unlikely (atomic_inc_return (skipped_count()) > MAXSKIPPED)) {";
+      s.op->newline(1) << "atomic_set (session_state(), STAP_SESSION_ERROR);";
       s.op->newline() << "_stp_exit ();";
       s.op->newline(-1) << "}";
       s.op->newline() << "atomic_dec (& c->busy);";
@@ -316,8 +340,8 @@ procfs_derived_probe_group::emit_module_decls (systemtap_session& s)
       s.op->newline(1) << "c->ips.procfs_data = &pdata;";
       s.op->newline(-1) << "else {";
 
-      s.op->newline(1) << "if (unlikely (atomic_inc_return (& skipped_count) > MAXSKIPPED)) {";
-      s.op->newline(1) << "atomic_set (& session_state, STAP_SESSION_ERROR);";
+      s.op->newline(1) << "if (unlikely (atomic_inc_return (skipped_count()) > MAXSKIPPED)) {";
+      s.op->newline(1) << "atomic_set (session_state(), STAP_SESSION_ERROR);";
       s.op->newline() << "_stp_exit ();";
       s.op->newline(-1) << "}";
       s.op->newline() << "atomic_dec (& c->busy);";
@@ -356,7 +380,7 @@ procfs_derived_probe_group::emit_module_init (systemtap_session& s)
   s.op->indent(-1);
 
   s.op->newline() << "_spp_init(spp);";
-  s.op->newline() << "rc = _stp_create_procfs(spp->path, i, &_stp_proc_fops, spp->permissions);";  
+  s.op->newline() << "rc = _stp_create_procfs(spp->path, i, &_stp_proc_fops, spp->permissions, spp);";
 
   s.op->newline() << "if (rc) {";
   s.op->newline(1) << "_stp_close_procfs();";
@@ -367,8 +391,6 @@ procfs_derived_probe_group::emit_module_init (systemtap_session& s)
   s.op->newline(-1) << "}";
   s.op->newline() << "break;";
   s.op->newline(-1) << "}";
-
-  s.op->newline() << "_stp_procfs_files[i]->data = spp;";
   s.op->newline(-1) << "}"; // for loop
 }
 

@@ -9,6 +9,16 @@ proc installtest_p {} {
 }
 
 
+# only original rhel5/6-era utrace need apply
+proc utrace_orig_p {} {
+    set path "/proc/kallsyms"
+    if {! [catch {exec grep -q utrace_attach $path} dummy]} {
+	return 1
+    }
+    return 0
+}
+
+
 proc utrace_p {} {
     set path "/proc/kallsyms"
     # We've got 2 ways to provide utrace support:
@@ -61,15 +71,24 @@ proc uprobes_p {} {
 }
 
 
-proc dyninst_p {} {
-    global env
-
-    # Was this version of systemtap compiled with dyninst support?
-    # (Use the cached value from setup_systemtap_environment().)
-    if {[info exists env(SYSTEMTAP_DYNINST)] && $env(SYSTEMTAP_DYNINST) == 1} {
-	return 1
-    }
+proc uretprobes_p {} {
+    set path "/proc/kallsyms"
+    if {! [uprobes_p]} { return 0 }
+    if {! [catch {exec grep -q uretprobe $path} dummy]} { return 1 }
+    if {! [catch {exec grep -q utrace_attach $path} dummy]} { return 1 }
     return 0
+}
+
+
+
+proc dyninst_p {} {
+    global systemtap_dyninst_p
+    return $systemtap_dyninst_p
+}
+
+proc nss_p {} {
+    global systemtap_nss_p
+    return $systemtap_nss_p
 }
 
 
@@ -111,7 +130,7 @@ proc print_systemtap_version {} {
 
 
 proc setup_systemtap_environment {} {
-    global srcdir env server_pid logfile
+    global srcdir env server_pid logfile systemtap_dyninst_p systemtap_nss_p
 
     # need an absolute SRCDIR for the top-level src/ tree
     # XXX: or, we could change nearby uses of ${SRCDIR}/testsuite to ${SRCDIR}
@@ -132,6 +151,7 @@ proc setup_systemtap_environment {} {
     set chan [open $env(SYSTEMTAP_DIR)/rc w]
     puts $chan "--modinfo intree=Y"
     puts $chan "-B CONFIG_DEBUG_INFO=Y"
+    puts $chan "--rlimit-cpu=300"
     close $chan
 
     # Erase the old server log file.
@@ -156,10 +176,20 @@ proc setup_systemtap_environment {} {
         }
     }
 
-    # Remember if  this version of systemtap compiled with dyninst support
+    # Remember if this very version of systemtap compiled with dyninst support
     if {! [catch {exec sh -c "stap -V 2>&1 | grep -q DYNINST"} dummy]} {
-	set env(SYSTEMTAP_DYNINST) 1
+	set systemtap_dyninst_p 1
+    } else {
+        set systemtap_dyninst_p 0
     }
+
+    # Remember if this selfsame version of systemtap compiled with nss support
+    if {! [catch {exec sh -c "stap -V 2>&1 | grep -q NSS"} dummy]} {
+        set systemtap_nss_p 1
+    } else {
+        set systemtap_nss_p 0
+    }
+
     return 1
 }
 
@@ -213,6 +243,8 @@ proc setup_server { args } {
 proc start_server { options } {
     global srcdir env server_pid installed_stap logfile
 
+    if {! [nss_p]} { return 0 }
+
     # Server management scripts and data are installed if this is an
     # install test, otherwise there is some setup to do.
     # Make sure the server management scripts and tools are on the $PATH.
@@ -263,6 +295,7 @@ proc shutdown_server {} {
     }
 }
 
+
 proc normalize_arch { arch } {
     if {$arch == "ppc64"} then {return "powerpc"}
     if {$arch == "s390x"} then {return "s390"}
@@ -283,7 +316,7 @@ proc fullpath { path } {
 }
 
 proc get_system_info {} {
-    global Host Snapshot Distro GCC_Version env
+    global Host Snapshot Distro GCC_Version env SElinux
 
     set Host [exec /bin/uname -a]
     if [file exists ../SNAPSHOT] {
@@ -311,6 +344,12 @@ proc get_system_info {} {
     # Plus full version between square brackets.
     set full [exec gcc --version | head -1]
     set GCC_Version "$n \[$full\]"
+    # selinux status
+    if [file exists /usr/sbin/getenforce] {
+        set SElinux [exec /usr/sbin/getenforce]
+    } else {
+        set SElinux "unknown"
+    }
 }
 
 if {! [setup_systemtap_environment]} then {
@@ -389,6 +428,7 @@ for {set i 0} {$i < [arch_compile_flags]} {incr i} {
     exit 1
   }
 }
+catch { eval [list exec rm -f] [glob "hello.c*" "hello-*"] }
 
 proc systemtap_init {args} {}
 proc systemtap_version {} {}

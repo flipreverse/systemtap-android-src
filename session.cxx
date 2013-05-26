@@ -1,5 +1,5 @@
 // session functions
-// Copyright (C) 2010-2012 Red Hat Inc.
+// Copyright (C) 2010-2013 Red Hat Inc.
 //
 // This file is part of systemtap, and is free software.  You can
 // redistribute it and/or modify it under the terms of the GNU General
@@ -9,6 +9,7 @@
 #include "config.h"
 #include "session.h"
 #include "cache.h"
+#include "re2c-migrate/stapregex.h" // TODOXXX
 #include "elaborate.h"
 #include "translate.h"
 #include "buildrun.h"
@@ -34,6 +35,7 @@ extern "C" {
 #include <sys/resource.h>
 #include <elfutils/libdwfl.h>
 #include <unistd.h>
+#include <sys/wait.h>
 }
 
 #if HAVE_NSS
@@ -62,6 +64,7 @@ systemtap_session::systemtap_session ():
   base_hash(0),
   pattern_root(new match_node),
   user_file (0),
+  dfa_counter (0),
   be_derived_probes(0),
   dwarf_derived_probes(0),
   kprobe_derived_probes(0),
@@ -78,11 +81,15 @@ systemtap_session::systemtap_session ():
   tracepoint_derived_probes(0),
   hrtimer_derived_probes(0),
   procfs_derived_probes(0),
+  dynprobe_derived_probes(0),
+  java_derived_probes(0),
   op (0), up (0),
   sym_kprobes_text_start (0),
   sym_kprobes_text_end (0),
   sym_stext (0),
   module_cache (0),
+  benchmark_sdt_loops(0),
+  benchmark_sdt_threads(0),
   last_token (0)
 {
   struct utsname buf;
@@ -135,7 +142,6 @@ systemtap_session::systemtap_session ():
   need_symbols = false;
   uprobes_path = "";
   consult_symtab = false;
-  ignore_dwarf = false;
   load_only = false;
   skip_badvars = false;
   privilege = pr_stapdev;
@@ -156,6 +162,19 @@ systemtap_session::systemtap_session ():
   native_build = true; // presumed
   sysroot = "";
   update_release_sysroot = false;
+  suppress_time_limits = false;
+
+  // PR12443: put compiled-in / -I paths in front, to be preferred during 
+  // tapset duplicate-file elimination
+  const char* s_p = getenv ("SYSTEMTAP_TAPSET");
+  if (s_p != NULL)
+  {
+    include_path.push_back (s_p);
+  }
+  else
+  {
+    include_path.push_back (string(PKGDATADIR) + "/tapset");
+  }
 
   /*  adding in the XDG_DATA_DIRS variable path,
    *  this searches in conjunction with SYSTEMTAP_TAPSET
@@ -172,16 +191,6 @@ systemtap_session::systemtap_session ():
     {
       include_path.push_back(*i + "/systemtap/tapset");
     }
-  }
-
-  const char* s_p = getenv ("SYSTEMTAP_TAPSET");
-  if (s_p != NULL)
-  {
-    include_path.push_back (s_p);
-  }
-  else
-  {
-    include_path.push_back (string(PKGDATADIR) + "/tapset");
   }
 
   const char* s_r = getenv ("SYSTEMTAP_RUNTIME");
@@ -234,6 +243,7 @@ systemtap_session::systemtap_session (const systemtap_session& other,
   base_hash(0),
   pattern_root(new match_node),
   user_file (other.user_file),
+  dfa_counter(0),
   be_derived_probes(0),
   dwarf_derived_probes(0),
   kprobe_derived_probes(0),
@@ -250,11 +260,15 @@ systemtap_session::systemtap_session (const systemtap_session& other,
   tracepoint_derived_probes(0),
   hrtimer_derived_probes(0),
   procfs_derived_probes(0),
+  dynprobe_derived_probes(0),
+  java_derived_probes(0),
   op (0), up (0),
   sym_kprobes_text_start (0),
   sym_kprobes_text_end (0),
   sym_stext (0),
   module_cache (0),
+  benchmark_sdt_loops(other.benchmark_sdt_loops),
+  benchmark_sdt_threads(other.benchmark_sdt_threads),
   last_token (0)
 {
   release = kernel_release = kern;
@@ -304,7 +318,6 @@ systemtap_session::systemtap_session (const systemtap_session& other,
   need_symbols = false;
   uprobes_path = "";
   consult_symtab = other.consult_symtab;
-  ignore_dwarf = other.ignore_dwarf;
   load_only = other.load_only;
   skip_badvars = other.skip_badvars;
   privilege = other.privilege;
@@ -323,6 +336,7 @@ systemtap_session::systemtap_session (const systemtap_session& other,
   sysroot = other.sysroot;
   update_release_sysroot = other.update_release_sysroot;
   sysenv = other.sysenv;
+  suppress_time_limits = other.suppress_time_limits;
 
   include_path = other.include_path;
   runtime_path = other.runtime_path;
@@ -341,6 +355,7 @@ systemtap_session::systemtap_session (const systemtap_session& other,
   c_macros = other.c_macros;
   args = other.args;
   kbuildflags = other.kbuildflags;
+
   globalopts = other.globalopts;
   modinfos = other.modinfos;
 
@@ -400,7 +415,7 @@ void
 systemtap_session::version ()
 {
   clog << _F("Systemtap translator/driver (version %s/%s, %s)\n"
-             "Copyright (C) 2005-2012 Red Hat, Inc. and others\n"
+             "Copyright (C) 2005-2013 Red Hat, Inc. and others\n"
              "This is free software; see the source for copying conditions.",
              VERSION, dwfl_version(NULL), STAP_EXTENDED_VERSION) << endl;
   clog << _("enabled features:")
@@ -430,6 +445,9 @@ systemtap_session::version ()
 #endif
 #ifdef HAVE_DYNINST
        << " DYNINST"
+#endif
+#ifdef HAVE_JAVA
+       << " JAVA"
 #endif
        << endl;
 }
@@ -534,15 +552,14 @@ systemtap_session::usage (int exitcode)
 #endif /* HAVE_LIBSQLITE3 */
     "   --runtime=MODE\n"
     "              set the pass-5 runtime mode, instead of kernel\n"
+#ifdef HAVE_DYNINST
+    "   --dyninst\n"
+    "              shorthand for --runtime=dyninst\n"
+#endif /* HAVE_DYNINST */
     "   --privilege=PRIVILEGE_LEVEL\n"
     "              check the script for constructs not allowed at the given privilege level\n"
     "   --unprivileged\n"
     "              equivalent to --privilege=stapusr\n"
-#if 0 /* PR6864: disable temporarily; should merge with -d somehow */
-    "   --kelf     make do with symbol table from vmlinux\n"
-#endif
-  // Formerly present --ignore-{vmlinux,dwarf} options are for testsuite use
-  // only, and don't belong in the eyesight of a plain user.
     "   --compatible=VERSION\n"
     "              suppress incompatible language/tapset changes beyond VERSION,\n"
     "              instead of %s\n"
@@ -584,6 +601,8 @@ systemtap_session::usage (int exitcode)
     "              where the value on a remote system differs.  Path\n"
     "              variables (e.g. PATH, LD_LIBRARY_PATH) are assumed to be\n"
     "              relative to the sysroot.\n"
+    "   --suppress-time-limits\n"
+    "              disable -DSTP_NO_OVERLOAD -DMAXACTION and -DMAXTRYACTION limits\n"
     , compatible.c_str()) << endl
   ;
 
@@ -681,6 +700,12 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
         case 'd':
 	  server_args.push_back (string ("-") + (char)grc + optarg);
           {
+            // Make sure an empty data object wasn't specified (-d "")
+            if (strlen (optarg) == 0)
+            {
+              cerr << _("Data object (-d) cannot be empty.") << endl;
+              return 1;
+            }
             // At runtime user module names are resolved through their
             // canonical (absolute) path.
             const char *mpath = canonicalize_file_name (optarg);
@@ -893,16 +918,6 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
 	case LONG_OPT_VERSION:
 	  version ();
 	  throw exit_exception (EXIT_SUCCESS);
-
-	case LONG_OPT_KELF:
-	  server_args.push_back ("--kelf");
-	  consult_symtab = true;
-	  break;
-
-	case LONG_OPT_IGNORE_DWARF:
-	  server_args.push_back ("--ignore-dwarf");
-	  ignore_dwarf = true;
-	  break;
 
 	case LONG_OPT_VERBOSE_PASS:
 	  {
@@ -1257,26 +1272,38 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
 	      break;
 	  }
 
-	case LONG_OPT_RUNTIME:
-          if (optarg == string("kernel"))
-            runtime_mode = kernel_runtime;
-          else if (optarg == string("dyninst"))
-            {
-              if (privilege_set && pr_unprivileged != privilege)
-                {
-                  cerr << _("ERROR: --runtime=dyninst implies unprivileged mode only") << endl;
-                  return 1;
-                }
-              privilege = pr_unprivileged;
-              privilege_set = true;
-              runtime_mode = dyninst_runtime;
-            }
-          else
-            {
-              cerr << _F("ERROR: %s is an invalid argument for --runtime", optarg) << endl;
-              return 1;
-            }
+	case LONG_OPT_SUPPRESS_TIME_LIMITS: //require guru_mode to use
+	  if (guru_mode == false)
+	    {
+	      cerr << _F("ERROR %s requires guru mode (-g)", "--suppress-time-limits") << endl;
+	      return 1;
+	    }
+	  else
+	    {
+	      suppress_time_limits = true;
+	      server_args.push_back (string ("--suppress-time-limits"));
+	      c_macros.push_back (string ("STAP_SUPPRESS_TIME_LIMITS_ENABLE"));
+	      break;
+	    }
 
+	case LONG_OPT_RUNTIME:
+          if (!parse_cmdline_runtime (optarg))
+            return 1;
+          break;
+
+	case LONG_OPT_RUNTIME_DYNINST:
+          if (!parse_cmdline_runtime ("dyninst"))
+            return 1;
+          break;
+
+        case LONG_OPT_BENCHMARK_SDT_LOOPS:
+          // XXX This option is secret, not supported, subject to change at our whim
+          benchmark_sdt_loops = strtoul(optarg, NULL, 10);
+          break;
+
+        case LONG_OPT_BENCHMARK_SDT_THREADS:
+          // XXX This option is secret, not supported, subject to change at our whim
+          benchmark_sdt_threads = strtoul(optarg, NULL, 10);
           break;
 
 	case '?':
@@ -1301,6 +1328,36 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
   return 0;
 }
 
+bool
+systemtap_session::parse_cmdline_runtime (const string& opt_runtime)
+{
+  if (opt_runtime == string("kernel"))
+    runtime_mode = kernel_runtime;
+  else if (opt_runtime == string("dyninst"))
+    {
+#ifndef HAVE_DYNINST
+      cerr << _("ERROR: --runtime=dyninst unavailable; this build lacks DYNINST feature") << endl;
+      version();
+      return false;
+#endif
+      if (privilege_set && pr_unprivileged != privilege)
+        {
+          cerr << _("ERROR: --runtime=dyninst implies unprivileged mode only") << endl;
+          return false;
+        }
+      privilege = pr_unprivileged;
+      privilege_set = true;
+      runtime_mode = dyninst_runtime;
+    }
+  else
+    {
+      cerr << _F("ERROR: %s is an invalid argument for --runtime", opt_runtime.c_str()) << endl;
+      return false;
+    }
+
+  return true;
+}
+
 void
 systemtap_session::check_options (int argc, char * const argv [])
 {
@@ -1315,17 +1372,33 @@ systemtap_session::check_options (int argc, char * const argv [])
         args.push_back (string (argv[i]));
     }
 
-  // need a user file
-  // NB: this is also triggered if stap is invoked with no arguments at all
-  if (! have_script)
+  // We don't need a script with --list-servers, --trust-servers, or --dump-probe-types.
+  bool need_script = server_status_strings.empty () && server_trust_spec.empty () && ! dump_probe_types;
+
+  if (benchmark_sdt_loops > 0 || benchmark_sdt_threads > 0)
     {
-      // We don't need a script if --list-servers, --trust-servers or --dump-probe-types was
-      // specified.
-      if (server_status_strings.empty () && server_trust_spec.empty () && ! dump_probe_types)
+      // Secret benchmarking options are for local use only, not servers or --remote
+      if (client_options || !remote_uris.empty())
 	{
-	  cerr << _("A script must be specified.") << endl;
+	  cerr << _("Benchmark options are only for local use.") << endl;
 	  usage(1);
 	}
+
+      // Fill defaults if either is unset.
+      if (benchmark_sdt_loops == 0)
+	benchmark_sdt_loops = 10000000;
+      if (benchmark_sdt_threads == 0)
+	benchmark_sdt_threads = 1;
+
+      need_script = false;
+    }
+
+  // need a user file
+  // NB: this is also triggered if stap is invoked with no arguments at all
+  if (need_script && ! have_script)
+    {
+      cerr << _("A script must be specified.") << endl;
+      usage(1);
     }
 
 #if ! HAVE_NSS
@@ -1506,8 +1579,9 @@ systemtap_session::parse_kernel_config ()
     }
   if (verbose > 2)
     clog << _F("Parsed kernel \"%s\", ", kernel_config_file.c_str())
-         << _F(ngettext("containing %zu tuple", "containing %zu tuples",
-                kernel_config.size()), kernel_config.size()) << endl;
+         << _NF("containing %zu tuple", "containing %zu tuples",
+                kernel_config.size(), kernel_config.size()) << endl;
+
 
   kcf.close();
   return 0;
@@ -1543,9 +1617,9 @@ systemtap_session::parse_kernel_exports ()
         kernel_exports.insert (tokens[1]);
     }
   if (verbose > 2)
-    clog << _F(ngettext("Parsed kernel %s, which contained one vmlinux export",
+    clog << _NF("Parsed kernel %s, which contained one vmlinux export",
                         "Parsed kernel %s, which contained %zu vmlinux exports",
-                         kernel_exports.size()), kernel_exports_file.c_str(),
+                         kernel_exports.size(), kernel_exports_file.c_str(),
                          kernel_exports.size()) << endl;
 
   kef.close();
@@ -1562,23 +1636,23 @@ systemtap_session::parse_kernel_functions ()
   system_map.open(system_map_path.c_str(), ifstream::in);
   if (! system_map.is_open())
     {
-      string system_map_path2 = "/boot/System.map-" + kernel_release;
+      if (verbose > 1)
+	clog << _F("Kernel symbol table %s unavailable, (%s)",
+		   system_map_path.c_str(), strerror(errno)) << endl;
 
+      string system_map_path2 = "/boot/System.map-" + kernel_release;
       system_map.clear();
       system_map.open(system_map_path2.c_str(), ifstream::in);
       if (! system_map.is_open())
         {
-          if (verbose > 3)
-            //TRANSLATORS: specific path cannot be opened
-            clog << system_map_path << _(" and ")
-                 << system_map_path2 << _(" cannot be opened: ")
-                 << strerror(errno) << endl;
-          return 1;
+	  if (verbose > 1)
+	    clog << _F("Kernel symbol table %s unavailable, (%s)",
+		       system_map_path2.c_str(), strerror(errno)) << endl;
         }
     }
 
   string address, type, name;
-  do
+  while (system_map.good())
     {
       system_map >> address >> type >> name;
 
@@ -1602,7 +1676,6 @@ systemtap_session::parse_kernel_functions ()
       // - what about __kprobes_text_start/__kprobes_text_end?
       kernel_functions.insert(name);
     }
-  while (! system_map.eof());
   system_map.close();
   return 0;
 }
@@ -1806,6 +1879,13 @@ systemtap_session::print_error (const semantic_error& e)
         }
       message << endl;
       message_str[i] = message.str();
+    }
+
+  // skip error message printing for listing mode with low verbosity
+  if (this->listing_mode && this->verbose <= 1)
+    {
+      seen_errors.insert (message_str[1]); // increment num_errors()
+      return;
     }
 
   // Duplicate elimination

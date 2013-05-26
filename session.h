@@ -10,8 +10,10 @@
 #define SESSION_H
 
 #include "config.h"
+#if ENABLE_NLS
 #include <libintl.h>
 #include <locale.h>
+#endif
 
 #include <list>
 #include <string>
@@ -54,7 +56,10 @@ struct mark_derived_probe_group;
 struct tracepoint_derived_probe_group;
 struct hrtimer_derived_probe_group;
 struct procfs_derived_probe_group;
+struct dynprobe_derived_probe_group;
+struct java_derived_probe_group;
 struct embeddedcode;
+struct stapdfa;
 class translator_output;
 struct unparser;
 struct semantic_error;
@@ -113,6 +118,7 @@ public:
 
   // command line parsing
   int  parse_cmdline (int argc, char * const argv []);
+  bool parse_cmdline_runtime (const std::string& opt_runtime);
   void version ();
   void usage (int exitcode);
   void check_options (int argc, char * const argv []);
@@ -195,6 +201,7 @@ public:
   bool dump_probe_types;
   int download_dbinfo;
   bool suppress_handler_errors;
+  bool suppress_time_limits;
 
   enum { kernel_runtime, dyninst_runtime } runtime_mode;
   bool runtime_usermode_p() const { return runtime_mode == dyninst_runtime; }
@@ -257,7 +264,6 @@ public:
   // dwarfless operation
   bool consult_symtab;
   std::string kernel_symtab_path;
-  bool ignore_dwarf;
 
   // Skip bad $ vars
   bool skip_badvars;
@@ -289,9 +295,13 @@ public:
   std::vector<stapfile*> files;
   std::vector<vardecl*> globals;
   std::map<std::string,functiondecl*> functions;
+  // probe counter name -> probe associated with counter
+  std::map<std::string, std::pair<std::string,derived_probe*> > perf_counters;
   std::vector<derived_probe*> probes; // see also *_probes groups below
   std::vector<embeddedcode*> embeds;
   std::map<std::string, statistic_decl> stat_decls;
+  std::map<std::string, stapdfa*> dfas;
+  unsigned dfa_counter; // used to give unique names
   // track things that are removed
   std::vector<vardecl*> unused_globals;
   std::vector<derived_probe*> unused_probes; // see also *_probes groups below
@@ -316,6 +326,8 @@ public:
   tracepoint_derived_probe_group* tracepoint_derived_probes;
   hrtimer_derived_probe_group* hrtimer_derived_probes;
   procfs_derived_probe_group* procfs_derived_probes;
+  dynprobe_derived_probe_group* dynprobe_derived_probes;
+  java_derived_probe_group* java_derived_probes;
 
   // NB: It is very important for all of the above (and below) fields
   // to be cleared in the systemtap_session ctor (session.cxx).
@@ -336,6 +348,10 @@ public:
   bool unwindsym_ldd;
   struct module_cache* module_cache;
   std::vector<std::string> build_ids;
+
+  // Secret benchmarking options
+  unsigned long benchmark_sdt_loops;
+  unsigned long benchmark_sdt_threads;
 
   // NB: It is very important for all of the above (and below) fields
   // to be cleared in the systemtap_session ctor (session.cxx).

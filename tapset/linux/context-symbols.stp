@@ -1,5 +1,5 @@
 // context-symbols tapset
-// Copyright (C) 2005-2008, 2011 Red Hat Inc.
+// Copyright (C) 2005-2012 Red Hat Inc.
 // Copyright (C) 2006 Intel Corporation.
 //
 // This file is part of systemtap, and is free software.  You can
@@ -30,19 +30,19 @@ function __stack_raw (n:long) %{ /* pragma:unwind */ /* pure */
  *  no matter how many times stack() is called, or in what order.
  */
 function stack:long (n:long) {
-         r = __stack_raw(n);
-         if (r != 0) return r
+         __r = __stack_raw(n);
+         if (__r != 0) return __r
 
          /* fallback: parse backtrace() to go deeper in the stack */
-         b = backtrace (); orig_n = n;
-         sym = tokenize (b, " ");
-         if (sym == "") @__context_unwind_error(orig_n);
-         while (n > 0) {
-               sym = tokenize ("", " ");
-               if (sym == "") @__context_unwind_error(orig_n);
-               n--;
+         __b = backtrace (); __orig_n = __n;
+         __sym = tokenize (__b, " ");
+         if (__sym == "") @__context_unwind_error(__orig_n);
+         while (__n > 0) {
+               __sym = tokenize ("", " ");
+               if (__sym == "") @__context_unwind_error(__orig_n);
+               __n--;
          }
-         return strtol(sym, 16)
+         return strtol(__sym, 16)
 }
 
 /**
@@ -87,8 +87,8 @@ function sprint_stack:string(stk:string) { return sprint_syms(stk) }
  * sfunction probefunc - Return the probe point's function name, if known
  *
  * Description: This function returns the name of the function being probed
- * based on the current address, as computed by symname(stack(0)) or
- * usymname(ustack(0)) depending on probe context (whether the probe is
+ * based on the current address, as computed by symname(addr()) or
+ * usymname(uaddr()) depending on probe context (whether the probe is
  * a user probe or a kernel probe).
  *
  * Please note: this function's behaviour differs between SystemTap 2.0
@@ -130,9 +130,9 @@ function probefunc:string () %( systemtap_v < "2.0" %?
 %:
 {
 	%( systemtap_privilege != "stapusr" %?
-	   return user_mode() ? usymname(ustack(0)) : symname(stack(0))
+	   return user_mode() ? usymname(uaddr()) : symname(addr())
 	%:
-	   return user_mode() ? usymname(ustack(0))
+	   return user_mode() ? usymname(uaddr())
 	   	  	      : error("kernel probefunc() query from unprivileged script") /* XXX should be impossible */
         %)
 }
@@ -162,9 +162,17 @@ function probemod:string () %{ /* pure */
 		if (m && m->name)
 			strlcpy (STAP_RETVALUE, m->name, MAXSTRINGLEN);
 		else
-			strlcpy (STAP_RETVALUE, "<unknown>", MAXSTRINGLEN);
+#if STAP_COMPAT_VERSION <= STAP_VERSION(2,2)
+			strlcpy (STAP_RETVALUE, "<unknown", MAXSTRINGLEN);
+#else
+			CONTEXT->last_error = "Cannot determine kernel module name";
+#endif
 	} else
+#if STAP_COMPAT_VERSION <= STAP_VERSION(2,2)
 		strlcpy (STAP_RETVALUE, "<unknown>", MAXSTRINGLEN);
+#else
+		CONTEXT->last_error = "Cannot determine kernel module name";
+#endif
 %}
 
 /**
@@ -172,9 +180,9 @@ function probemod:string () %{ /* pure */
  * @addr: The address to map to a kernel module name
  *
  * Description: Returns the module name associated with the given
- * address if known. If not known it will return the string "<unknown>".
- * If the address was not in a kernel module, but in the kernel itself,
- * then the string "kernel" will be returned.
+ * address if known. If not known it will raise an error. If the
+ * address was not in a kernel module, but in the kernel itself, then
+ * the string "kernel" will be returned.
  */
 function modname:string (addr: long) %{ /* pure */
 	struct _stp_module *m;
@@ -199,7 +207,11 @@ function modname:string (addr: long) %{ /* pure */
 	  }
 	preempt_enable_no_resched();
 #endif
+#if STAP_COMPAT_VERSION <= STAP_VERSION(2,2)
 	strlcpy (STAP_RETVALUE, "<unknown>", MAXSTRINGLEN);
+#else
+	CONTEXT->last_error = "Cannot determine kernel module name";
+#endif
 %}
 
 /**
@@ -247,10 +259,10 @@ function symdata:string (addr: long) %{ /* pure */ /* pragma:symbols */
  *  Returns nothing.
  */
 function print_syms (callers:string) {
-         sym = tokenize (callers, " ");
-         while (sym != "") {
-               printf (" %s : %s\n", sym, symdata (strtol(sym,16)));
-               sym = tokenize ("", " ");
+         __sym = tokenize (callers, " ");
+         while (__sym != "") {
+               printf (" %s : %s\n", __sym, symdata (strtol(__sym,16)));
+               __sym = tokenize ("", " ");
          }
 }
 
@@ -274,15 +286,15 @@ function print_syms (callers:string) {
  * print_syms().
  */
 function sprint_syms (callers:string) {
-         sym = tokenize (callers, " ");
-         foo = ""; l = 0
-         while (sym != "") {
+         __sym = tokenize (callers, " ");
+         __foo = ""; __l = 0
+         while (__sym != "") {
                // cleanly handle overflow instead of printing partial line:
-               line = sprintf (" %s : %s\n", sym, symdata (strtol(sym,16)));
-               l += strlen(line)
-               if (l > %{ MAXSTRINGLEN %}) break
-               foo .= line
-               sym = tokenize ("", " ")
+               __line = sprintf (" %s : %s\n", __sym, symdata (strtol(__sym,16)));
+               __l += strlen(__line)
+               if (__l > %{ MAXSTRINGLEN %}) break
+               __foo .= __line
+               __sym = tokenize ("", " ")
          }
-         return foo
+         return __foo
 }

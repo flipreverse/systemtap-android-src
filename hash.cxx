@@ -222,14 +222,13 @@ find_script_hash (systemtap_session& s, const string& script)
   h.add("Bulk Mode (-b): ", s.bulk_mode);
   h.add("Timing (-t): ", s.timing);
   h.add("Prologue Searching (-P): ", s.prologue_searching);
-  h.add("Ignore Dwarf (--ignore-dwarf): ", s.ignore_dwarf);
-  h.add("Consult Symtab (--kelf): ", s.consult_symtab);
   h.add("Skip Badvars (--skip-badvars): ", s.skip_badvars);
   h.add("Privilege (--privilege): ", s.privilege);
   h.add("Compatible (--compatible): ", s.compatible);
   h.add("Omit Werror (undocumented): ", s.omit_werror);
   h.add("Prologue Searching (-P): ", s.prologue_searching);
   h.add("Error suppression (--suppress-handler-errors): ", s.suppress_handler_errors);
+  h.add("Suppress Time Limits (--suppress-time-limits): ", s.suppress_time_limits);
   for (unsigned i = 0; i < s.c_macros.size(); i++)
     h.add("Macros: ", s.c_macros[i]);
 

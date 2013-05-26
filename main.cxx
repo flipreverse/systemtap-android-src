@@ -1,5 +1,5 @@
 // systemtap translator/driver
-// Copyright (C) 2005-2011 Red Hat Inc.
+// Copyright (C) 2005-2013 Red Hat Inc.
 // Copyright (C) 2005 IBM Corp.
 // Copyright (C) 2006 Intel Corporation.
 //
@@ -26,8 +26,10 @@
 #include "tapsets.h"
 #include "setupdwfl.h"
 
+#if ENABLE_NLS
 #include <libintl.h>
 #include <locale.h>
+#endif
 
 #include "stap-probe.h"
 
@@ -75,51 +77,38 @@ printscript(systemtap_session& s, ostream& o)
           assert_no_interrupts();
 
           derived_probe* p = s.probes[i];
-          // NB: p->basest() is not so interesting;
-          // p->almost_basest() doesn't quite work, so ...
-          vector<probe*> chain;
-          p->collect_derivation_chain (chain);
-          probe* second = (chain.size()>1) ? chain[chain.size()-2] : chain[0];
-
-          if (s.verbose > 5) {
-          p->printsig(cerr); cerr << endl;
-          cerr << "chain[" << chain.size() << "]:" << endl;
-          for (unsigned j=0; j<chain.size(); j++)
-            {
-              cerr << "  [" << j << "]: " << endl;
-              cerr << "\tlocations[" << chain[j]->locations.size() << "]:" << endl;
-              for (unsigned k=0; k<chain[j]->locations.size(); k++)
-                {
-                  cerr << "\t  [" << k << "]: ";
-                  chain[j]->locations[k]->print(cerr);
-                  cerr << endl;
-                }
-              const probe_alias *a = chain[j]->get_alias();
-              if (a)
-                {
-                  cerr << "\taliases[" << a->alias_names.size() << "]:" << endl;
-                  for (unsigned k=0; k<a->alias_names.size(); k++)
-                    {
-                      cerr << "\t  [" << k << "]: ";
-                      a->alias_names[k]->print(cerr);
-                      cerr << endl;
-                    }
-                }
-            }
+          if (s.verbose > 2) {
+            vector<probe*> chain;
+            p->collect_derivation_chain (chain);
+            p->printsig(cerr); cerr << endl;
+            cerr << "chain[" << chain.size() << "]:" << endl;
+            for (unsigned j=0; j<chain.size(); j++)
+              {
+                cerr << "  [" << j << "]: " << endl;
+                cerr << "\tlocations[" << chain[j]->locations.size() << "]:" << endl;
+                for (unsigned k=0; k<chain[j]->locations.size(); k++)
+                  {
+                    cerr << "\t  [" << k << "]: ";
+                    chain[j]->locations[k]->print(cerr);
+                    cerr << endl;
+                  }
+                const probe_alias *a = chain[j]->get_alias();
+                if (a)
+                  {
+                    cerr << "\taliases[" << a->alias_names.size() << "]:" << endl;
+                    for (unsigned k=0; k<a->alias_names.size(); k++)
+                      {
+                        cerr << "\t  [" << k << "]: ";
+                        a->alias_names[k]->print(cerr);
+                        cerr << endl;
+                      }
+                  }
+              }
           }
-
+          
           stringstream tmps;
-          // XXX PR14297 make this more accurate wrt complex wildcard expansions
-          const probe_point *a = second->get_alias_loc();
-          if (a)
-            {
-              a->print(tmps);
-            }
-          else
-            {
-              assert (second->locations.size() >= 1);
-              second->locations[0]->print(tmps); // XXX: choosing only one location is less arbitrary here than in get_alias_loc(), but still ...
-            }
+          const probe_point *a = p->script_location();
+          a->print(tmps);
           string pp = tmps.str();
 
           // Now duplicate-eliminate.  An alias may have expanded to
@@ -305,6 +294,58 @@ setup_signals (sighandler_t handler)
 }
 
 
+static void*
+sdt_benchmark_thread(void* p)
+{
+  unsigned long i = *(unsigned long*)p;
+  PROBE(stap, benchmark__thread__start);
+  while (i--)
+    PROBE1(stap, benchmark, i);
+  PROBE(stap, benchmark__thread__end);
+  return NULL;
+}
+
+
+static int
+run_sdt_benchmark(systemtap_session& s)
+{
+  unsigned long loops = s.benchmark_sdt_loops ?: 10000000;
+  unsigned long threads = s.benchmark_sdt_threads ?: 1;
+
+  if (s.verbose > 0)
+    clog << _F("Beginning SDT benchmark with %lu loops in %lu threads.",
+               loops, threads) << endl;
+
+  struct tms tms_before, tms_after;
+  struct timeval tv_before, tv_after;
+  unsigned _sc_clk_tck = sysconf (_SC_CLK_TCK);
+  times (& tms_before);
+  gettimeofday (&tv_before, NULL);
+
+  PROBE(stap, benchmark__start);
+
+  pthread_t pthreads[threads];
+  for (unsigned long i = 0; i < threads; ++i)
+    pthread_create(&pthreads[i], NULL, sdt_benchmark_thread, &loops);
+  for (unsigned long i = 0; i < threads; ++i)
+    pthread_join(pthreads[i], NULL);
+
+  PROBE(stap, benchmark__end);
+
+  times (& tms_after);
+  gettimeofday (&tv_after, NULL);
+  if (s.verbose > 0)
+    clog << _F("Completed SDT benchmark in %ldusr/%ldsys/%ldreal ms.",
+               (tms_after.tms_utime - tms_before.tms_utime) * 1000 / _sc_clk_tck,
+               (tms_after.tms_stime - tms_before.tms_stime) * 1000 / _sc_clk_tck,
+               ((tv_after.tv_sec - tv_before.tv_sec) * 1000 +
+                ((long)tv_after.tv_usec - (long)tv_before.tv_usec) / 1000))
+         << endl;
+
+  return EXIT_SUCCESS;
+}
+
+
 // Compilation passes 0 through 4
 static int
 passes_0_4 (systemtap_session &s)
@@ -458,6 +499,7 @@ passes_0_4 (systemtap_session &s)
   // but since .stpm files can consist only of '@define' constructs,
   // we can parse each one without reference to the others.
   set<pair<dev_t, ino_t> > seen_library_macro_files;
+  set<string> seen_library_macro_files_names;
 
   for (unsigned i=0; i<s.include_path.size(); i++)
     {
@@ -494,13 +536,30 @@ passes_0_4 (systemtap_session &s)
                 {
                   pair<dev_t,ino_t> here = make_pair(tapset_file_stat.st_dev,
                                                      tapset_file_stat.st_ino);
-                  if (seen_library_macro_files.find(here)
-                      != seen_library_macro_files.end())
-                    continue;
+                  if (seen_library_macro_files.find(here) != seen_library_macro_files.end()) {
+                    if (s.verbose>2)
+                      clog << _F("Skipping tapset \"%s\", duplicate inode.", globbuf.gl_pathv[j]) << endl;
+                    continue; 
+                  }
                   seen_library_macro_files.insert (here);
                 }
 
-              // XXX: privilege only for /usr/share/systemtap?
+              // PR12443: duplicate-eliminate harder
+              string full_path = globbuf.gl_pathv[j];
+              string tapset_base = s.include_path[i]; // not dir; it has arch suffixes too
+              if (full_path.size() > tapset_base.size()) {
+                string tail_part = full_path.substr(tapset_base.size());
+                if (seen_library_macro_files_names.find (tail_part) != seen_library_macro_files_names.end()) {
+                  if (s.verbose>2)
+                      clog << _F("Skipping tapset \"%s\", duplicate name.", globbuf.gl_pathv[j]) << endl;
+                  continue;
+                }
+                seen_library_macro_files_names.insert (tail_part);
+              }
+
+              if (s.verbose>2)
+                clog << _F("Processing tapset \"%s\"", globbuf.gl_pathv[j]) << endl;
+
               stapfile* f = parse_library_macros (s, globbuf.gl_pathv[j]);
               if (f == 0)
                 s.print_warning("macro tapset '" + string(globbuf.gl_pathv[j])
@@ -522,6 +581,7 @@ passes_0_4 (systemtap_session &s)
 
   // Next, gather and parse the library files.
   set<pair<dev_t, ino_t> > seen_library_files;
+  set<string> seen_library_files_names;
 
   for (unsigned i=0; i<s.include_path.size(); i++)
     {
@@ -558,13 +618,36 @@ passes_0_4 (systemtap_session &s)
                 {
                   pair<dev_t,ino_t> here = make_pair(tapset_file_stat.st_dev,
                                                      tapset_file_stat.st_ino);
-                  if (seen_library_files.find(here) != seen_library_files.end())
-                    continue;
+                  if (seen_library_files.find(here) != seen_library_files.end()) {
+                    if (s.verbose>2)
+                      clog << _F("Skipping tapset \"%s\", duplicate inode.", globbuf.gl_pathv[j]) << endl;
+                    continue; 
+                  }
                   seen_library_files.insert (here);
                 }
 
-              // XXX: privilege only for /usr/share/systemtap?
-              stapfile* f = parse (s, globbuf.gl_pathv[j], true);
+              // PR12443: duplicate-eliminate harder
+              string full_path = globbuf.gl_pathv[j];
+              string tapset_base = s.include_path[i]; // not dir; it has arch suffixes too
+              if (full_path.size() > tapset_base.size()) {
+                string tail_part = full_path.substr(tapset_base.size());
+                if (seen_library_files_names.find (tail_part) != seen_library_files_names.end()) {
+                  if (s.verbose>2)
+                      clog << _F("Skipping tapset \"%s\", duplicate name.", globbuf.gl_pathv[j]) << endl;
+                  continue;
+                }
+                seen_library_files_names.insert (tail_part);
+              }
+
+              if (s.verbose>2)
+                clog << _F("Processing tapset \"%s\"", globbuf.gl_pathv[j]) << endl;
+
+              // NB: we don't need to restrict privilege only for /usr/share/systemtap, i.e., 
+              // excluding user-specified $XDG_DATA_DIRS.  That's because stapdev gets
+              // root-equivalent privileges anyway; stapsys and stapusr use a remote compilation
+              // with a trusted environment, where client-side $XDG_DATA_DIRS are not passed.
+
+              stapfile* f = parse (s, globbuf.gl_pathv[j], true /* privileged */);
               if (f == 0)
                 s.print_warning("tapset '" + string(globbuf.gl_pathv[j])
                                 + "' has errors, and will be skipped."); // TODOXXX internationalization?
@@ -647,10 +730,7 @@ passes_0_4 (systemtap_session &s)
     }
 
   if (rc && !s.listing_mode)
-    cerr << _("Pass 1: parse failed.  Try again with another '--vp 1' option.") << endl;
-    //cerr << "Pass 1: parse failed.  "
-    //     << "Try again with another '--vp 1' option."
-    //     << endl;
+    cerr << _("Pass 1: parse failed.  [man error::pass1]") << endl;
 
   PROBE1(stap, pass1__end, &s);
 
@@ -685,13 +765,7 @@ passes_0_4 (systemtap_session &s)
                       << endl;
 
   if (rc && !s.listing_mode && !s.try_server ())
-    cerr << _("Pass 2: analysis failed.  Try again with another '--vp 01' option.") << endl;
-    //cerr << "Pass 2: analysis failed.  "
-    //     << "Try again with another '--vp 01' option."
-    //     << endl;
-
-  /* Print out list of missing files.  XXX should be "if (rc)" ? */
-  missing_rpm_list_print(s,"-debuginfo");
+    cerr << _("Pass 2: analysis failed.  [man error::pass2]") << endl;
 
   PROBE1(stap, pass2__end, &s);
 
@@ -763,10 +837,7 @@ passes_0_4 (systemtap_session &s)
          << endl;
 
   if (rc && ! s.try_server ())
-    cerr << _("Pass 3: translation failed.  Try again with another '--vp 001' option.") << endl;
-    //cerr << "Pass 3: translation failed.  "
-    //     << "Try again with another '--vp 001' option."
-    //     << endl;
+    cerr << _("Pass 3: translation failed.  [man error::pass3]") << endl;
 
   PROBE1(stap, pass3__end, &s);
 
@@ -801,10 +872,8 @@ passes_0_4 (systemtap_session &s)
                       << endl;
 
   if (rc && ! s.try_server ())
-    cerr << _("Pass 4: compilation failed.  Try again with another '--vp 0001' option.") << endl;
-    //cerr << "Pass 4: compilation failed.  "
-    //     << "Try again with another '--vp 0001' option."
-    //     << endl;
+    cerr << _("Pass 4: compilation failed.  [man error::pass4]") << endl;
+
   else
     {
       // Update cache. Cache cleaning is kicked off at the beginning of this function.
@@ -857,10 +926,7 @@ pass_5 (systemtap_session &s, vector<remote*> targets)
                       << endl;
 
   if (rc)
-    cerr << _("Pass 5: run failed.  Try again with another '--vp 00001' option.") << endl;
-    //cerr << "Pass 5: run failed.  "
-    //     << "Try again with another '--vp 00001' option."
-    //     << endl;
+    cerr << _("Pass 5: run failed.  [man error::pass5]") << endl;
   else
     // Interrupting pass-5 to quit is normal, so we want an EXIT_SUCCESS below.
     pending_interrupts = 0;
@@ -919,10 +985,11 @@ main (int argc, char * const argv [])
   // Initialize defaults.
   try {
     systemtap_session s;
-
+#if ENABLE_NLS
     setlocale (LC_ALL, "");
     bindtextdomain (PACKAGE, LOCALEDIR);
     textdomain (PACKAGE);
+#endif
 
     // Set up our handler to catch routine signals, to allow clean
     // and reasonably timely exit.
@@ -981,6 +1048,10 @@ main (int argc, char * const argv [])
     // we didn't know if verbose was set.
     if (rc == 0 && s.verbose>1)
       clog << _F("Created temporary directory \"%s\"", s.tmpdir.c_str()) << endl;
+
+    // Run the benchmark and quit right away.
+    if (s.benchmark_sdt_loops || s.benchmark_sdt_threads)
+      return run_sdt_benchmark(s);
 
     // Prepare connections for each specified remote target.
     vector<remote*> targets;

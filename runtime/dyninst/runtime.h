@@ -26,7 +26,7 @@
 #include <fcntl.h>
 #include <stddef.h>
 #include <unistd.h>
-
+#include <sys/syscall.h>
 
 #include "loc2c-runtime.h"
 #include "stapdyn.h"
@@ -35,7 +35,7 @@
 #define CONFIG_64BIT 1
 #endif
 
-#define BITS_PER_LONG __BITS_PER_LONG
+#define BITS_PER_LONG __WORDSIZE
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -43,6 +43,7 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 
 #include "linux_types.h"
+#include "offset_list.h"
 
 
 #ifndef NSEC_PER_SEC
@@ -91,8 +92,12 @@ static inline int pseudo_atomic_cmpxchg(atomic_t *v, int oldval, int newval)
 #define MODULE_LICENSE(str)
 #define MODULE_INFO(tag,info)
 
-/* Semi-forward declaration from runtime_context.h, needed by stat.c. */
+/* Semi-forward declarations from runtime_context.h, needed by stat.c/shm.c. */
 static int _stp_runtime_num_contexts;
+
+/* Semi-forward declarations from this file, needed by stat.c/transport.c. */
+static int stp_pthread_mutex_init_shared(pthread_mutex_t *mutex);
+static int stp_pthread_cond_init_shared(pthread_cond_t *cond);
 
 #define for_each_possible_cpu(cpu) for ((cpu) = 0; (cpu) < _stp_runtime_num_contexts; (cpu)++)
 
@@ -102,6 +107,31 @@ static int _stp_runtime_num_contexts;
 
 #define preempt_disable() 0
 #define preempt_enable_no_resched() 0
+
+static int _stp_sched_getcpu(void)
+{
+    /* We prefer sched_getcpu directly, of course.  It wasn't added until glibc
+     * 2.6 though, and has no direct feature indication, but CPU_ZERO_S was
+     * added shortly after too.  */
+#ifdef CPU_ZERO_S
+    return sched_getcpu();
+
+#elif defined(SYS_getcpu)
+    /* A manual getcpu is fine too, though not necessarily as fast since it
+     * can't be optimized as a vdso/vsyscall.  */
+    unsigned cpu;
+    int ret = syscall(SYS_getcpu, &cpu, NULL, NULL);
+    return (ret < 0) ? ret : (int)cpu;
+
+#else
+    /* XXX Any other way to find our cpu?  Manual vgetcpu? */
+    return -2;
+#endif
+}
+
+/* see common_session_state.h */
+static inline struct _stp_transport_session_data *stp_transport_data(void);
+static inline struct _stp_session_attributes *stp_session_attributes(void);
 
 /*
  * By definition, we can only debug our own processes with dyninst, so
@@ -116,6 +146,7 @@ static int _stp_runtime_num_contexts;
 
 #include "io.c"
 #include "alloc.c"
+#include "shm.c"
 #include "print.h"
 #include "stp_string.c"
 #include "arith.c"
@@ -127,12 +158,117 @@ static int _stp_runtime_num_contexts;
 #include "addr-map.c"
 #include "stat.c"
 #include "unwind.c"
+#include "session_attributes.c"
+
+/* Support function for int64_t module parameters. */
+static int set_int64_t(const char *val, int64_t *mp)
+{
+  char *endp;
+  long long ll;
+
+  if (!val)
+    return -EINVAL;
+
+  ll = strtoull(val, &endp, 0);
+
+  if ((endp == val) || ((int64_t)ll != ll) || (*endp != '\0'))
+    return -EINVAL;
+
+  *mp = (int64_t)ll;
+  return 0;
+}
 
 static int systemtap_module_init(void);
 static void systemtap_module_exit(void);
 
-static unsigned long stap_hash_seed; /* Init during module startup */
+static inline unsigned long _stap_hash_seed(); /* see common_session_state.h */
+#define stap_hash_seed _stap_hash_seed()
 
+typedef pthread_rwlock_t rwlock_t; /* for globals */
+
+static int stp_pthread_mutex_init_shared(pthread_mutex_t *mutex)
+{
+	int rc;
+	pthread_mutexattr_t attr;
+
+	rc = pthread_mutexattr_init(&attr);
+	if (rc != 0) {
+	    _stp_error("pthread_mutexattr_init failed");
+	    return rc;
+	}
+
+	rc = pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+	if (rc != 0) {
+	    _stp_error("pthread_mutexattr_setpshared failed");
+	    goto err_attr;
+	}
+
+	rc = pthread_mutex_init(mutex, &attr);
+	if (rc != 0) {
+	    _stp_error("pthread_mutex_init failed");
+	    goto err_attr;
+	}
+
+err_attr:
+	(void)pthread_mutexattr_destroy(&attr);
+	return rc;
+}
+
+static int stp_pthread_cond_init_shared(pthread_cond_t *cond)
+{
+	int rc;
+	pthread_condattr_t attr;
+
+	rc = pthread_condattr_init(&attr);
+	if (rc != 0) {
+	    _stp_error("pthread_condattr_init failed");
+	    return rc;
+	}
+
+	rc = pthread_condattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+	if (rc != 0) {
+	    _stp_error("pthread_condattr_setpshared failed");
+	    goto err_attr;
+	}
+
+	rc = pthread_cond_init(cond, &attr);
+	if (rc != 0) {
+	    _stp_error("pthread_cond_init failed");
+	    goto err_attr;
+	}
+
+err_attr:
+	(void)pthread_condattr_destroy(&attr);
+	return rc;
+}
+
+static int stp_pthread_rwlock_init_shared(pthread_rwlock_t *rwlock)
+{
+	int rc;
+	pthread_rwlockattr_t attr;
+
+	rc = pthread_rwlockattr_init(&attr);
+	if (rc != 0) {
+	    _stp_error("pthread_rwlockattr_init failed");
+	    return rc;
+	}
+
+	rc = pthread_rwlockattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+	if (rc != 0) {
+	    _stp_error("pthread_rwlockattr_setpshared failed");
+	    goto err_attr;
+	}
+
+	rc = pthread_rwlock_init(rwlock, &attr);
+	if (rc != 0) {
+	    _stp_error("pthread_rwlock_init failed");
+	    goto err_attr;
+	}
+
+err_attr:
+	(void)pthread_rwlockattr_destroy(&attr);
+	return rc;
+}
 
 /*
  * For stapdyn to work in a multiprocess environment, the module must be
@@ -141,94 +277,109 @@ static unsigned long stap_hash_seed; /* Init during module startup */
  * "session"-level (like probe begin/end/error).
  *
  * So stp_dyninst_ctor/dtor are the process-level functions, using gcc
- * attributes to get called at the right time.
+ * attributes to get called at the right time.  One startup exception is
+ * stp_dyninst_shm_connect, which has to later be called manually with the shm
+ * path being used in this session.
  *
- * The session-level resources have to be started by the stapdyn mutator, since
- * only it knows which process is the "master" mutatee, so it can call
- * stp_dyninst_session_init only in the right one.  That process will run the
- * session exit in the dtor, since dyninst doesn't have a suitable exit hook.
- * It may still be invoked manually from stapdyn for detaching though.
+ * The session-level resources have to be started by the stapdyn mutator, and
+ * are called within stapdyn itself.  This primarily involves allocating the
+ * shared memory and initializing its contents, but also running those global
+ * begin/end/error probes.
  *
- * The stp_dyninst_master is set as a PID, so it can be checked and made not to
- * inherit across forks.
- *
- * XXX Once we have a shared-memory area (which will be necessary anyway for a
- * multiprocess session to share globals), then a process refcount may be
- * better for begin/end than this "master" designation.
- *
- * XXX Functions like _exit() which bypass destructors are a problem...
+ * NB: We used to keep code that tried to deal with stapdyn 2.0, which didn't
+ * know about shm initialization, and ran everything in the mutatees only.
+ * We've now broken that tie, and stp_dyninst_session_init will detect that
+ * shm wasn't initialized and bow out.
  */
 
-static pid_t stp_dyninst_master = 0;
+static int _stp_runtime_contexts_init(void);
+
+static int stp_dyninst_ctor_rc = 0;
 
 __attribute__((constructor))
 static void stp_dyninst_ctor(void)
 {
-    stap_hash_seed = _stp_random_u ((unsigned long)-1);
+    int rc = 0;
 
     _stp_mem_fd = open("/proc/self/mem", O_RDWR /*| O_LARGEFILE*/);
     if (_stp_mem_fd != -1) {
         fcntl(_stp_mem_fd, F_SETFD, FD_CLOEXEC);
     }
+    else {
+        rc = -errno;
+    }
 
-    /* XXX We don't really want to be using the target's stdio. (PR14491)
-     * But while we are, clone our own FILE handles so we're not affected by
-     * the target's actions, liking closing stdout early.
-     */
-    _stp_out = _stp_clone_file(stdout);
-    _stp_err = _stp_clone_file(stderr);
+    if (rc == 0)
+        rc = _stp_runtime_contexts_init();
+
+    if (rc == 0)
+        rc = _stp_print_init();
+
+    stp_dyninst_ctor_rc = rc;
 }
 
-static int _stp_runtime_contexts_init(void);
+const char* stp_dyninst_shm_init(void)
+{
+    return _stp_shm_init();
+}
+
+int stp_dyninst_shm_connect(const char* name)
+{
+    int rc;
+
+    /* We don't have a chance to indicate errors in the ctor, so do it here. */
+    if (stp_dyninst_ctor_rc != 0) {
+	return stp_dyninst_ctor_rc;
+    }
+
+    rc = _stp_shm_connect(name);
+    return rc;
+}
 
 int stp_dyninst_session_init(void)
 {
     /* We don't have a chance to indicate errors in the ctor, so do it here. */
-    if (_stp_mem_fd < 0) {
-	return -errno;
+    if (stp_dyninst_ctor_rc != 0) {
+	return stp_dyninst_ctor_rc;
     }
-    
-    int rc = _stp_runtime_contexts_init();
-    if (rc != 0)
-	return rc;
 
-    rc = _stp_print_init();
-    if (rc != 0)
-	return rc;
+    /* If shared memory has not been initialized yet, we're probably dealing
+     * with stapdyn 2.0 -- we no longer support this case.  */
+    if (_stp_shm_base == NULL)
+	return -ENOMEM;
 
-    rc = systemtap_module_init();
-    if (rc == 0) {
-	stp_dyninst_master = getpid();
-    }
-    return rc;
+    return systemtap_module_init();
+}
+
+/* This is called during systemtap_module_init, after globals/etc are set up,
+ * but before any probes are actually executed.
+ * (Perhaps it would be cleaner if the translator split those stages?)
+ */
+static int stp_dyninst_session_init_finished(void)
+{
+    _stp_shm_finalize();
+
+    /* Now that the shared memory is finalized, start the
+     * transport. If we started it before now, allocations could have
+     * caused the base address of the shared memory to move around,
+     * which would cause the addresses of the mutexes to move
+     * around. */
+    return _stp_dyninst_transport_session_start();
 }
 
 void stp_dyninst_session_exit(void)
 {
-    if (stp_dyninst_master == getpid()) {
-	systemtap_module_exit();
-	_stp_print_cleanup();
-	stp_dyninst_master = 0;
-    }
+    systemtap_module_exit();
 }
 
 __attribute__((destructor))
 static void stp_dyninst_dtor(void)
 {
-    stp_dyninst_session_exit();
+    _stp_print_cleanup();
+    _stp_shm_destroy();
 
     if (_stp_mem_fd != -1) {
 	close (_stp_mem_fd);
-    }
-
-    if (_stp_out && _stp_out != stdout) {
-	fclose(_stp_out);
-	_stp_out = stdout;
-    }
-
-    if (_stp_err && _stp_err != stderr) {
-	fclose(_stp_err);
-	_stp_err = stderr;
     }
 }
 

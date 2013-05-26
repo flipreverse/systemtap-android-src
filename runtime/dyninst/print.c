@@ -21,15 +21,8 @@
 #error "Relay host/guest output not supported for --runtime=dyninst"
 #endif
 
+#include "transport.c"
 #include "vsprintf.c"
-
-typedef struct {
-	size_t buf_alloc;
-	size_t buf_used;
-	void *buf;
-} _stp_pbuf_t;
-
-static _stp_pbuf_t *_stp_pbuf = NULL;
 
 static void _stp_print_kernel_info(char *vstr, int ctx, int num_probes)
 {
@@ -38,87 +31,64 @@ static void _stp_print_kernel_info(char *vstr, int ctx, int num_probes)
 
 static int _stp_print_init(void)
 {
-	int i;
-
-	/* Allocate an array: _stp_pbuf_t[_stp_runtime_num_contexts] */
-	_stp_pbuf = calloc(sizeof(_stp_pbuf_t) * _stp_runtime_num_contexts, 1);
-	if (_stp_pbuf == NULL)
-		return -ENOMEM;
-
-	/* Let's go ahead and pre-allocate the buffers. Note they
-	   might grow later.  */
-	for (i = 0; i < _stp_runtime_num_contexts; i++) {
-		_stp_pbuf[i].buf_alloc = STP_BUFFER_SIZE;
-		_stp_pbuf[i].buf = malloc(STP_BUFFER_SIZE);
-		if (_stp_pbuf[i].buf == NULL) {
-			_stp_print_cleanup();
-			return -ENOMEM;
-		}
-	}
+	/* Since 'print_buf' is now in the context structure (see
+	 * common_probe_context.h), there isn't anything to do for
+	 * regular print buffers. */
 	return 0;
 }
 
 static void _stp_print_cleanup(void)
 {
-	int i;
-
-	if (_stp_pbuf == NULL)
-		return;
-
-	for (i = 0; i < _stp_runtime_num_contexts; i++) {
-		if (_stp_pbuf[i].buf)
-			free(_stp_pbuf[i].buf);
-	}
-	if (_stp_pbuf) {
-		free(_stp_pbuf);
-		_stp_pbuf = NULL;
-	}
+	/* Since 'print_buf' is now in the context structure (see
+	 * common_probe_context.h), there isn't anything to free for
+	 * it. */
 }
 
 static inline void _stp_print_flush(void)
 {
-	_stp_pbuf_t *pbuf;
-
-	fflush(_stp_err);
-
-	pbuf = &_stp_pbuf[_stp_runtime_get_data_index()];
-	if (pbuf->buf_used) {
-		fwrite(pbuf->buf, pbuf->buf_used, 1, _stp_out);
-		fflush(_stp_out);
-		pbuf->buf_used = 0;
-	}
+	_stp_dyninst_transport_write();
+	return;
 }
 
 static void * _stp_reserve_bytes (int numbytes)
 {
-	_stp_pbuf_t *pbuf;
-	size_t size;
-
-	pbuf = &_stp_pbuf[_stp_runtime_get_data_index()];
-	size = pbuf->buf_used + numbytes;
-	if (size > pbuf->buf_alloc) {
-		/* XXX: Should the new size be a multiple of
-		   STP_BUFFER_SIZE? */
-		void *buf = realloc(pbuf->buf, size);
-		if (!buf)
-			return NULL;
-		pbuf->buf = buf;
-		pbuf->buf_alloc = size;
-	}
-	void *ret = pbuf->buf + pbuf->buf_used;
-	pbuf->buf_used += numbytes;
-	return ret;
+	return _stp_dyninst_transport_reserve_bytes(numbytes);
 }
+
+#ifndef STP_MAXBINARYARGS
+#define STP_MAXBINARYARGS 127
+#endif
 
 static void _stp_unreserve_bytes (int numbytes)
 {
-	_stp_pbuf_t *pbuf;
+	_stp_dyninst_transport_unreserve_bytes(numbytes);
+	return;
+}
 
-	pbuf = &_stp_pbuf[_stp_runtime_get_data_index()];
-	if (unlikely(numbytes <= 0 || numbytes > pbuf->buf_used))
-		return;
+/** Write 64-bit args directly into the output stream.
+ * This function takes a variable number of 64-bit arguments
+ * and writes them directly into the output stream.  Marginally faster
+ * than doing the same in _stp_vsnprintf().
+ * @sa _stp_vsnprintf()
+ */
+static void _stp_print_binary (int num, ...)
+{
+	va_list vargs;
+	int i;
+	int64_t *args;
+	
+	if (unlikely(num > STP_MAXBINARYARGS))
+		num = STP_MAXBINARYARGS;
 
-	pbuf->buf_used -= numbytes;
+	args = _stp_reserve_bytes(num * sizeof(int64_t));
+
+	if (likely(args != NULL)) {
+		va_start(vargs, num);
+		for (i = 0; i < num; i++) {
+			args[i] = va_arg(vargs, int64_t);
+		}
+		va_end(vargs);
+	}
 }
 
 static void _stp_printf (const char *fmt, ...)

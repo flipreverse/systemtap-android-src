@@ -1,7 +1,6 @@
 // tapset for timers
-// Copyright (C) 2005-2009 Red Hat Inc.
+// Copyright (C) 2005-2013 Red Hat Inc.
 // Copyright (C) 2005-2007 Intel Corporation.
-// Copyright (C) 2008 James.Bottomley@HansenPartnership.com
 //
 // This file is part of systemtap, and is free software.  You can
 // redistribute it and/or modify it under the terms of the GNU General
@@ -148,6 +147,7 @@ itrace_derived_probe_group::emit_probe_decl (systemtap_session& s,
 {
   s.op->newline() << "{";
   s.op->line() << " .tgt={";
+  s.op->line() << " .purpose=\"itrace\",";
 
   if (p->has_path)
     {
@@ -180,7 +180,7 @@ itrace_derived_probe_group::emit_module_decls (systemtap_session& s)
   s.op->newline() << "struct stap_itrace_probe {";
   s.op->indent(1);
   s.op->newline() << "struct stap_task_finder_target tgt;";
-  s.op->newline() << "struct stap_probe * const probe;";
+  s.op->newline() << "const struct stap_probe * const probe;";
   s.op->newline() << "int single_step;";
   s.op->newline(-1) << "};";
   s.op->newline() << "static void enter_itrace_probe(struct stap_itrace_probe *p, struct pt_regs *regs, void *data);";

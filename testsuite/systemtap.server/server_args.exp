@@ -1,4 +1,5 @@
 set test "Server Argument Test"
+if {! [nss_p]} { unsupported $test; return }
 
 # Each test will take 3 seconds or more due to the use of avahi to browse for
 # servers, so limit iterations to some small but reasonable number.
@@ -45,10 +46,9 @@ proc stap_direct_and_with_client {stap options} {
 	    -re {^.*\r\n} { exp_continue }
 	    timeout { 
 		exec kill -INT -[exp_pid]
-		wait
 	    }
 	}
-	catch close
+	catch {close}; catch {wait}
 	if { $fallthrough == 0 } {
 	    return $passed
 	}

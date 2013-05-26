@@ -1,5 +1,6 @@
 # many of these tests use as_root
 if {! [installtest_p]} { return }
+if {! [nss_p]} { return }
 
 # Let's start with a clean slate in terms of trust.
 exec rm -fr $env(SYSTEMTAP_DIR)/ssl
@@ -32,11 +33,10 @@ proc list_servers { TEST_NAME SERVER_SPEC args } {
 	}
 	timeout { 
 	    exec kill -INT -[exp_pid]
-	    wait
 	    set failed 1
 	}
     }
-    catch close
+    catch {close}; catch {wait}
 
     if {$failed != 0} {
 	fail "$TEST_NAME"
@@ -290,11 +290,10 @@ expect {
     -timeout 150
     timeout { 
 	exec kill -INT -[exp_pid]
-	wait
 	set failed 1
     }
 }
-catch close
+catch {close}; catch {wait}
 
 # Our server should no longer be trusted.
 list_servers "List current trusted servers after revokation by host name" trusted
@@ -335,11 +334,10 @@ expect {
     -timeout 150
     timeout { 
 	exec kill -INT -[exp_pid]
-	wait
 	set failed 1
     }
 }
-catch close
+catch {close}; catch {wait}
 
 # Our server should be trusted again, separate from the previously discovered
 # trusted servers.
@@ -510,10 +508,9 @@ foreach privilege {"--unprivileged" "--privilege=stapusr" "--privilege=stapsys"}
 	-re {^.*\r\n} { exp_continue }
 	timeout { 
 	    exec kill -INT -[exp_pid]
-	    wait
 	}
     }
-    catch close
+    catch {close}; catch {wait}
     if {$failed == 0} {
 	pass "$test"
     }
@@ -592,11 +589,10 @@ foreach privilege {"--unprivileged" "--privilege=stapusr" "--privilege=stapsys"}
 	    }
 	    timeout { 
 		exec kill -INT -[exp_pid]
-		wait
 		set failed 1
 	    }
 	}
-	catch close
+	catch {close}; catch {wait}
 	if {$failed == 0} {
 	    pass "$test"
 	} else {
@@ -672,11 +668,10 @@ if {$no_module == 1 || ! [installtest_p]} {
 	}
 	timeout { 
 	    exec kill -INT -[exp_pid]
-	    wait
 	    set failed 1
 	}
     }
-    catch close
+    catch {close}; catch {wait}
     if {$failed == 0} {
 	pass "$test"
     } else {

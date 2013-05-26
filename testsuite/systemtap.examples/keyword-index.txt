@@ -164,7 +164,7 @@ io/deviceseeks.stp - Histograms of Seek Behavior for Each Device
 keywords: disk
 
   The deviceseeks.stp script generates a histogram showing the
-  frequency of different sized seeks on each device.
+  frequency of different sized seeks (in sectors) on each device.
 
   # stap deviceseeks.stp -c "sleep 0.2"
 
@@ -208,20 +208,6 @@ keywords: nfs disk
   # stap nfsd_unlink.stp -c "sleep 0.2"
 
 
-= DROP =
-
-network/netfilter_drop.stp - System-Wide Network Packet Dropping Tool
-keywords: network drop packets
-
-  The script drops the specified number of packets of the specified
-  protocol. Valid protocols are TCP, UDP, or ALL. If ALL is specified,
-  all incoming packets are dropped. The number of packets to drop can
-  be specified with a positive integer. A value of 0 indicates that
-  packets should be dropped until the user manually exits.
-
-  # stap -g netfilter_drop.stp TCP 1 -c "sleep 2"
-
-
 = FILE =
 
 io/iotime.stp - Trace Time Spent in Read and Write for Files 
@@ -255,7 +241,7 @@ keywords: process file
 = FILESYSTEM =
 
 general/badname.stp - Bad Filename Filter
-keywords: filesystem
+keywords: filesystem guru
 
   The badname.stp script shows how one could prevent the creation of
   files with undesirable names using guru mode.
@@ -350,6 +336,82 @@ keywords: syscall locking futex
   # stap futexes.stp -c "sleep 0.2"
 
 
+= GURU =
+
+general/badname.stp - Bad Filename Filter
+keywords: filesystem guru
+
+  The badname.stp script shows how one could prevent the creation of
+  files with undesirable names using guru mode.
+
+  # stap -g badname.stp -c "touch /tmp/myXXXbadnameXXXfile.$$ 2>&1 | grep \
+  denied"
+
+
+io/eatmydata.stp - disable fsync
+keywords: io guru simple
+
+  Suppresses fsync() syscalls from processes identified by stap -c/-x
+  by turning them into presumed-faster fsync() on file descriptor 1
+  (stdout).
+
+  # stap -g eatmydata.stp -c 'strace ls || true'
+
+
+io/ttyspy.stp - Monitor TTY Typing
+keywords: io tty monitoring guru
+
+  The ttyspy.stp script uses tty_audit hooks to monitor recent typing
+  activity on the system, printing a scrolling record of recent
+  keystrokes, on a per-tty basis.
+
+  # stap --skip-badvars -g ttyspy.stp -c "sleep 1"
+
+
+network/netfilter_drop.stp - System-Wide Network Packet Dropping Tool
+keywords: network packets guru
+
+  The script drops the specified number of packets of the specified
+  protocol. Valid protocols are TCP, UDP, or ALL. If ALL is specified,
+  all incoming packets are dropped. The number of packets to drop can
+  be specified with a positive integer. A value of 0 indicates that
+  packets should be dropped until the user manually exits.
+
+  # stap -g netfilter_drop.stp TCP 1 -c "sleep 2"
+
+
+network/tcp_init_cwnd.stp - Increase Initial TCP Congestion Window to 10
+keywords: network tcp socket guru
+
+  Run the tcp_init_cwnd.stp script in the background to override a
+  kernel's default tcp cwnd value to 10, which has been found to
+  improve latency for web server type workloads.  The script prints a
+  count of cwnd value changes when it is stopped.
+
+  # stap -g tcp_init_cwnd.stp -c "sleep 0.2"
+
+
+process/noptrace.stp - Disable ptrace from Hierarchies of Processes
+keywords: process security guru
+
+  Blocks ptrace(2) attempts from processes identified by stap -c/-x, as
+  also specifiable from /proc/systemtap/stap_XXX/ control files. 
+  Processes may be added or removed from the blocked list.
+
+  # stap -g noptrace.stp -c 'strace ls || true'
+
+
+process/threadstacks.stp - Override default new-pthread stack sizes
+keywords: thread guru
+
+  Overrides default NPTL pthread_create stack size for all new threads
+  created by target processes.	Reports one line per process when the
+  related glibc variable __default_stacksize is updated.  Moot for
+  glibc versions that support $LIBC_PTHREAD_DEFAULT_STACKSIZE_NP.
+
+  # stap -g threadstacks.stp -Gsize=65536 -c "sleep 1" -d stap
+
+
 = INTERRUPT =
 
 interrupt/interrupts-by-dev.stp - Record Interrupts on a Per-Device Basis
@@ -402,6 +464,16 @@ keywords: io statistics
   the distributions of times.
 
   # stap alias_suffixes.stp -c "sleep 0.2"
+
+
+io/eatmydata.stp - disable fsync
+keywords: io guru simple
+
+  Suppresses fsync() syscalls from processes identified by stap -c/-x
+  by turning them into presumed-faster fsync() on file descriptor 1
+  (stdout).
+
+  # stap -g eatmydata.stp -c 'strace ls || true'
 
 
 io/inodewatch.stp - Monitoring Reads and Writes to a File
@@ -554,7 +626,7 @@ keywords: io
 
 
 io/ttyspy.stp - Monitor TTY Typing
-keywords: io tty monitoring
+keywords: io tty monitoring guru
 
   The ttyspy.stp script uses tty_audit hooks to monitor recent typing
   activity on the system, printing a scrolling record of recent
@@ -684,6 +756,18 @@ keywords: syscall locking futex
   # stap futexes.stp -c "sleep 0.2"
 
 
+process/mutex-contention.stp - pthread mutex contention analysis
+keywords: locking
+
+  Tracks pthread-mutex initialization/use and underlying futex
+  operations, to identify (with backtraces/symbol-names) the mutexes
+  suffering most contention.  Invoke with "-d SHLIB --ldd", perhaps
+  with -DMAXMAPENTRIES=NNNN for some large NNNN, if the arrays overflow
+  due to heavy activity.
+
+  # stap mutex-contention.stp -c "sleep 0.2"
+
+
 = MEMORY =
 
 general/sizeof.stp - Print the Size of a C Type
@@ -703,8 +787,8 @@ keywords: memory watchpoint
   a traceback each time the address is accessed. This script needs to
   be run as root to allow access to the breakpoint hardware.
 
-  # stap --all-modules hw_watch_addr.stp 0x`grep "pid_max$" /proc/kallsyms` \
-  -c "sleep 1"
+  # stap --all-modules hw_watch_addr.stp 0x`grep "vm_dirty_ratio" \
+  /proc/kallsyms` -c "sleep 5"
 
 
 memory/hw_watch_sym.stp - Watch a Kernel Symbol Using Breakpoint Hardware
@@ -715,7 +799,7 @@ keywords: memory watchpoint
   accessed. This script needs to be run as root to allow access to the
   breakpoint hardware.
 
-  # stap --all-modules hw_watch_sym.stp pid_max -c "sleep 1"
+  # stap --all-modules hw_watch_sym.stp vm_dirty_ratio -c "sleep 5"
 
 
 memory/kmalloc-top - Show Paths to Kernel Malloc Invocations
@@ -857,7 +941,7 @@ keywords: io monitoring disk
 
 
 io/ttyspy.stp - Monitor TTY Typing
-keywords: io tty monitoring
+keywords: io tty monitoring guru
 
   The ttyspy.stp script uses tty_audit hooks to monitor recent typing
   activity on the system, printing a scrolling record of recent
@@ -920,7 +1004,7 @@ keywords: network device traffic
 
 
 network/netfilter_drop.stp - System-Wide Network Packet Dropping Tool
-keywords: network drop packets
+keywords: network packets guru
 
   The script drops the specified number of packets of the specified
   protocol. Valid protocols are TCP, UDP, or ALL. If ALL is specified,
@@ -1003,7 +1087,7 @@ keywords: network tcp socket
 
 
 network/tcp_init_cwnd.stp - Increase Initial TCP Congestion Window to 10
-keywords: network tcp socket
+keywords: network tcp socket guru
 
   Run the tcp_init_cwnd.stp script in the background to override a
   kernel's default tcp cwnd value to 10, which has been found to
@@ -1091,7 +1175,7 @@ keywords: memory numa
 = PACKETS =
 
 network/netfilter_drop.stp - System-Wide Network Packet Dropping Tool
-keywords: network drop packets
+keywords: network packets guru
 
   The script drops the specified number of packets of the specified
   protocol. Valid protocols are TCP, UDP, or ALL. If ALL is specified,
@@ -1107,9 +1191,10 @@ keywords: network drop packets
 general/eventcount.stp - Count Specified Events
 keywords: statistics thread process
 
-  The script prints a count of specified events and their related tid's
-  over the course of execution.  Numerous configuration options exist
-  to control filtering / reporting, see the script source.
+  The script periodically prints a count of specified events and their
+  related tid's over the course of execution.  Numerous configuration
+  options exist to control filtering / reporting, see the script
+  source.
 
   # stap eventcount.stp syscall.* -c 'sleep 0.2'
 
@@ -1173,7 +1258,7 @@ keywords: process
 
 
 process/noptrace.stp - Disable ptrace from Hierarchies of Processes
-keywords: process security
+keywords: process security guru
 
   Blocks ptrace(2) attempts from processes identified by stap -c/-x, as
   also specifiable from /proc/systemtap/stap_XXX/ control files. 
@@ -1202,7 +1287,7 @@ keywords: process
 
 
 process/psig.stp - Print Process File Descriptors
-keywords: process signal
+keywords: process signals
 
   Run psig.stp to produce a human-readable summary of the signal
   handling configuration of a given process.  Specify the process-id as
@@ -1232,6 +1317,16 @@ keywords: process scheduler time tracepoint
   specific PID.
 
   # stap schedtimes.stp -c "sleep 0.2"
+
+
+process/thread-business.stp - monitor syscall history
+keywords: process syscall
+
+  Prints a periodic tabular report about the counts of syscall activity
+  of all threads on the system, along with a textual
+  recent-syscall-history for each
+
+  # stap thread-business.stp -c "sleep 10"
 
 
 process/wait4time.stp - Trace Time Spent in wait4 Syscalls
@@ -1374,6 +1469,16 @@ keywords: profiling
   # stap linetimes.stp kernel sys_nanosleep -c "sleep 0.2"
 
 
+profiling/perf.stp - Show performance ratios using perf.counter to access performance counters
+keywords: profiling
+
+  On exit the perf.stp script provides a sorted list showing cycles per
+  insn, branches per insn, and cache refs per insn
+
+  # stap perf.stp -c "find /usr/bin -name \"l*\" -printf \"%h/%f %s %Cx \
+  %Ck%CM %Y\n\""
+
+
 profiling/periodic.stp - Show the Period of the Various Timers on the System
 keywords: profiling
 
@@ -1408,6 +1513,17 @@ keywords: profiling
   -d /PATH/TO/EXEC to add more symbolic info.
 
   # stap pf3.stp -c "sleep 6" --all-modules --ldd
+
+
+profiling/pf4.stp - Profile Kernel/User Backtraces
+keywords: profiling
+
+  The pf4.stp script sets up time-based sampling. Every five seconds it
+  prints out a sorted list with the top twenty kernel and/or user stack
+  backtraces (on a per-cpu basis).  Use any of --ldd, --all-modules, -d
+  MODULE, -d /PATH/TO/EXEC to add more symbolic info.
+
+  # stap pf4.stp -c "sleep 6" --all-modules --ldd
 
 
 profiling/sched_switch.stp - Display the Task Switches Happening in the Scheduler
@@ -1481,6 +1597,19 @@ keywords: virtualization qemu kvm io
   times each IO port read and written.
 
   # stap qemu_io.stp -c "sleep 0.2"
+
+
+= REGEX =
+
+general/regex.stp - Report opened files whose names match a given regex
+keywords: regex
+
+  Uses the regex functionality to detect opened files whose names match
+  a pattern given on the command line. If no command line parameter is
+  given, demonstrate by filtering for files that end with an extension
+  showing them to be an archive.
+
+  # stap regex.stp -c "sleep 0.2"
 
 
 = SCHEDULER =
@@ -1586,7 +1715,7 @@ keywords: monitoring security audit backtrace
 
 
 process/noptrace.stp - Disable ptrace from Hierarchies of Processes
-keywords: process security
+keywords: process security guru
 
   Blocks ptrace(2) attempts from processes identified by stap -c/-x, as
   also specifiable from /proc/systemtap/stap_XXX/ control files. 
@@ -1595,10 +1724,10 @@ keywords: process security
   # stap -g noptrace.stp -c 'strace ls || true'
 
 
-= SIGNAL =
+= SIGNALS =
 
 process/psig.stp - Print Process File Descriptors
-keywords: process signal
+keywords: process signals
 
   Run psig.stp to produce a human-readable summary of the signal
   handling configuration of a given process.  Specify the process-id as
@@ -1606,8 +1735,6 @@ keywords: process signal
 
   # stap -DMAXACTION=10000 -g psig.stp -x $$
 
-
-= SIGNALS =
 
 process/sig_by_pid.stp -  Signal Counts by Process ID
 keywords: signals
@@ -1657,6 +1784,16 @@ keywords: simple
   prints out "hello world" message and then immediately exits.
 
   # stap helloworld.stp
+
+
+io/eatmydata.stp - disable fsync
+keywords: io guru simple
+
+  Suppresses fsync() syscalls from processes identified by stap -c/-x
+  by turning them into presumed-faster fsync() on file descriptor 1
+  (stdout).
+
+  # stap -g eatmydata.stp -c 'strace ls || true'
 
 
 = SLAB =
@@ -1721,7 +1858,7 @@ keywords: network tcp socket
 
 
 network/tcp_init_cwnd.stp - Increase Initial TCP Congestion Window to 10
-keywords: network tcp socket
+keywords: network tcp socket guru
 
   Run the tcp_init_cwnd.stp script in the background to override a
   kernel's default tcp cwnd value to 10, which has been found to
@@ -1729,6 +1866,41 @@ keywords: network tcp socket
   count of cwnd value changes when it is stopped.
 
   # stap -g tcp_init_cwnd.stp -c "sleep 0.2"
+
+
+= STAPGAMES =
+
+stapgames/block.stp - block breaker game
+keywords: stapgames
+
+  A block game where you progressively break the ceiling blocks until
+  clearing the level
+
+  # stap -p4 -Itapset/ block.stp
+
+
+stapgames/eater.stp - eater game
+keywords: stapgames
+
+  walk through a maze, eat stuff
+
+  # stap -p4 -Itapset/ eater.stp
+
+
+stapgames/lifegame.stp - life game
+keywords: stapgames
+
+  watch as your creation morphes into different forms
+
+  # stap -p4 -Itapset/ lifegame.stp
+
+
+stapgames/pingpong.stp - pingpong game
+keywords: stapgames
+
+  A simulated ball bounces around the terminal reflecting at the edges
+
+  # stap -p4 -Itapset/ pingpong.stp
 
 
 = STATISTICS =
@@ -1750,9 +1922,10 @@ keywords: io statistics
 general/eventcount.stp - Count Specified Events
 keywords: statistics thread process
 
-  The script prints a count of specified events and their related tid's
-  over the course of execution.  Numerous configuration options exist
-  to control filtering / reporting, see the script source.
+  The script periodically prints a count of specified events and their
+  related tid's over the course of execution.  Numerous configuration
+  options exist to control filtering / reporting, see the script
+  source.
 
   # stap eventcount.stp syscall.* -c 'sleep 0.2'
 
@@ -1895,6 +2068,16 @@ keywords: syscall
   # ./syscalltimes -c 'sleep 0.2'
 
 
+process/thread-business.stp - monitor syscall history
+keywords: process syscall
+
+  Prints a periodic tabular report about the counts of syscall activity
+  of all threads on the system, along with a textual
+  recent-syscall-history for each
+
+  # stap thread-business.stp -c "sleep 10"
+
+
 process/wait4time.stp - Trace Time Spent in wait4 Syscalls
 keywords: syscall process
 
@@ -1933,7 +2116,7 @@ keywords: network tcp socket
 
 
 network/tcp_init_cwnd.stp - Increase Initial TCP Congestion Window to 10
-keywords: network tcp socket
+keywords: network tcp socket guru
 
   Run the tcp_init_cwnd.stp script in the background to override a
   kernel's default tcp cwnd value to 10, which has been found to
@@ -1948,11 +2131,23 @@ keywords: network tcp socket
 general/eventcount.stp - Count Specified Events
 keywords: statistics thread process
 
-  The script prints a count of specified events and their related tid's
-  over the course of execution.  Numerous configuration options exist
-  to control filtering / reporting, see the script source.
+  The script periodically prints a count of specified events and their
+  related tid's over the course of execution.  Numerous configuration
+  options exist to control filtering / reporting, see the script
+  source.
 
   # stap eventcount.stp syscall.* -c 'sleep 0.2'
+
+
+process/threadstacks.stp - Override default new-pthread stack sizes
+keywords: thread guru
+
+  Overrides default NPTL pthread_create stack size for all new threads
+  created by target processes.	Reports one line per process when the
+  related glibc variable __default_stacksize is updated.  Moot for
+  glibc versions that support $LIBC_PTHREAD_DEFAULT_STACKSIZE_NP.
+
+  # stap -g threadstacks.stp -Gsize=65536 -c "sleep 1" -d stap
 
 
 = TIME =
@@ -2126,7 +2321,7 @@ keywords: network traffic
 = TTY =
 
 io/ttyspy.stp - Monitor TTY Typing
-keywords: io tty monitoring
+keywords: io tty monitoring guru
 
   The ttyspy.stp script uses tty_audit hooks to monitor recent typing
   activity on the system, printing a scrolling record of recent
@@ -2217,8 +2412,8 @@ keywords: memory watchpoint
   a traceback each time the address is accessed. This script needs to
   be run as root to allow access to the breakpoint hardware.
 
-  # stap --all-modules hw_watch_addr.stp 0x`grep "pid_max$" /proc/kallsyms` \
-  -c "sleep 1"
+  # stap --all-modules hw_watch_addr.stp 0x`grep "vm_dirty_ratio" \
+  /proc/kallsyms` -c "sleep 5"
 
 
 memory/hw_watch_sym.stp - Watch a Kernel Symbol Using Breakpoint Hardware
@@ -2229,6 +2424,6 @@ keywords: memory watchpoint
   accessed. This script needs to be run as root to allow access to the
   breakpoint hardware.
 
-  # stap --all-modules hw_watch_sym.stp pid_max -c "sleep 1"
+  # stap --all-modules hw_watch_sym.stp vm_dirty_ratio -c "sleep 5"
 
 
