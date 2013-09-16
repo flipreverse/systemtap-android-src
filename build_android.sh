@@ -31,7 +31,7 @@ if [ -e "Makefile" ]; then
 	make clean
 fi
 
-ac_cv_file__usr_include_avahi_common=no ac_cv_file__usr_include_avahi_client=no ac_cv_file__usr_include_nspr=no ac_cv_file__usr_include_nspr4=no ac_cv_file__usr_include_nss=no ac_cv_file__usr_include_nss3=no ac_cv_func_malloc_0_nonnull=yes ./configure --prefix=$BUILD_PREFIX --host=$COMPILER_PREFIX CXXFLAGS="$FLAGS" CFLAGS="$FLAGS" --disable-translator --disable-docs --disable-refdocs  --disable-grapher --without-rpm --without-nss
+ac_cv_prog_have_jar=no ac_cv_prog_have_javac=no ac_cv_with_java=no ac_cv_file__usr_include_avahi_common=no ac_cv_file__usr_include_avahi_client=no ac_cv_file__usr_include_nspr=no ac_cv_file__usr_include_nspr4=no ac_cv_file__usr_include_nss=no ac_cv_file__usr_include_nss3=no ac_cv_func_malloc_0_nonnull=yes ./configure --prefix=$BUILD_PREFIX --host=$COMPILER_PREFIX CXXFLAGS="$FLAGS" CFLAGS="$FLAGS" --disable-translator --disable-docs --disable-refdocs  --disable-grapher --without-rpm --without-nss
 
 if [ $? -ne 0 ]; then
 	echo "Error configuring the workspace"
