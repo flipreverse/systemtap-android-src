@@ -29,11 +29,11 @@ struct recursive_expansion_error : public semantic_error
 {
   ~recursive_expansion_error () throw () {}
   recursive_expansion_error (const std::string& msg, const token* t1=0):
-    semantic_error (msg, t1) {}
+    SEMANTIC_ERROR (msg, t1) {}
 
   recursive_expansion_error (const std::string& msg, const token* t1,
                              const token* t2):
-    semantic_error (msg, t1, t2) {}
+    SEMANTIC_ERROR (msg, t1, t2) {}
 };
 
 // ------------------------------------------------------------------------
@@ -52,7 +52,8 @@ public:
   symresolution_info (systemtap_session& s);
 
   vardecl* find_var (const std::string& name, int arity, const token *tok);
-  functiondecl* find_function (const std::string& name, unsigned arity);
+  functiondecl* find_function (const std::string& name, unsigned arity, const token *tok);
+  std::set<std::string> collect_functions(void);
 
   void visit_block (block *s);
   void visit_symbol (symbol* e);
@@ -124,6 +125,7 @@ struct typeresolution_info: public visitor
   void visit_stat_op (stat_op* e);
   void visit_hist_op (hist_op* e);
   void visit_cast_op (cast_op* e);
+  void visit_atvar_op (atvar_op* e);
   void visit_defined_op (defined_op* e);
   void visit_entry_op (entry_op* e);
   void visit_perf_op (perf_op* e);
@@ -329,6 +331,7 @@ match_node
   void find_and_build (systemtap_session& s,
                        probe* p, probe_point *loc, unsigned pos,
                        std::vector<derived_probe *>& results);
+  std::string suggest_functors(std::string functor);
   void try_suffix_expansion (systemtap_session& s,
                              probe *p, probe_point *loc, unsigned pos,
                              std::vector<derived_probe *>& results);

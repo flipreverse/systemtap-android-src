@@ -607,6 +607,10 @@ struct base_query
   systemtap_session & sess;
   dwflpp & dw;
 
+  // Used to keep track of which modules were visited during
+  // iterate_over_modules()
+  set<string> visited_modules;
+
   // Parameter extractors.
   static bool has_null_param(literal_map_t const & params,
                              string const & k);
@@ -839,6 +843,11 @@ struct dwarf_builder: public derived_probe_builder
   map <string,dwflpp*> user_dw;
   string user_path;
   string user_lib;
+
+  // Holds modules to suggest functions from. NB: aggregates over
+  // recursive calls to build() when deriving globby probes.
+  set <string> modules_seen;
+
   dwarf_builder() {}
 
   dwflpp *get_kern_dw(systemtap_session& sess, const string& module)
@@ -1002,7 +1011,7 @@ dwarf_query::query_module_symtab()
       if (dw.name_has_wildcard(function_str_val))
         {
           // Until we augment the blacklist sufficently...
-          if (function_str_val.find_first_not_of("*?") == string::npos)
+	  if ((function_str_val.find_first_not_of("*?") == string::npos) && !dw.has_gnu_debugdata())
             {
               // e.g., kernel.function("*")
               cerr << _F("Error: Pattern '%s' matches every single "
@@ -1081,8 +1090,9 @@ dwarf_query::handle_query_module()
     query_module_dwarf();
 
   // Consult the symbol table if we haven't found all we're looking for.
-  // asm functions can show up in the symbol table but not in dwarf.
-  if (sess.consult_symtab && !query_done)
+  // asm functions can show up in the symbol table but not in dwarf,
+  // or if we want to check the .gnu_debugdata section
+  if ((sess.consult_symtab || dw.has_gnu_debugdata()) && !query_done)
     query_module_symtab();
 }
 
@@ -1207,7 +1217,7 @@ dwarf_query::parse_function_spec(const string & spec)
   return;
 
 bad:
-  throw semantic_error(_F("malformed specification '%s'", spec.c_str()),
+  throw SEMANTIC_ERROR(_F("malformed specification '%s'", spec.c_str()),
                        base_probe->tok);
 }
 
@@ -1489,7 +1499,7 @@ query_addr(Dwarf_Addr addr, dwarf_query *q)
             msg << _F(" (no line info found for '%s', in module '%s')",
                       dw.cu_name().c_str(), dw.module_name.c_str());
           if (! q->sess.guru_mode)
-            throw semantic_error(msg.str());
+            throw SEMANTIC_ERROR(msg.str());
           else
            q->sess.print_warning(msg.str());
         }
@@ -1653,7 +1663,8 @@ query_srcfile_line (const dwarf_line_t& line, void * arg)
               Dwarf_Die scope;
               q->dw.inner_die_containing_pc(i->die, addr, scope);
               query_statement (i->name, i->decl_file,
-                               q->line[0], &scope, addr, q);
+                               lineno, // NB: not q->line !
+                               &scope, addr, q);
             }
 	  else
 	    query_inline_instance_info (*i, q);
@@ -1998,7 +2009,7 @@ validate_module_elf (Dwfl_Module *mod, const char *name,  base_query *q)
       msg << _F("ELF machine %s|%s (code %d) mismatch with target %s in '%s'",
                 expect_machine.c_str(), expect_machine2.c_str(), elf_machine,
                 sess_machine.c_str(), debug_filename);
-      throw semantic_error(msg.str ());
+      throw SEMANTIC_ERROR(msg.str ());
     }
 
   if (q->sess.verbose>1)
@@ -2108,10 +2119,16 @@ query_module (Dwfl_Module *mod,
       // .plt is translated to .plt.statement(N).  We only want to iterate for the
       // .plt case
       else if (q->has_plt && ! q->has_statement)
-        q->dw.iterate_over_plt (q, &q->query_plt_callback);
+        {
+          q->dw.iterate_over_plt (q, &q->query_plt_callback);
+          q->visited_modules.insert(name);
+        }
       else
-        // search the module for matches of the probe point.
-        q->handle_query_module();
+        {
+          // search the module for matches of the probe point.
+          q->handle_query_module();
+          q->visited_modules.insert(name);
+        }
 
       // If we know that there will be no more matches, abort early.
       if (q->dw.module_name_final_match(q->module_val) || pending_interrupts)
@@ -2135,7 +2152,7 @@ base_query::query_library_callback (void *q, const char *data)
 }
 
 
-void
+string
 query_one_library (const char *library, dwflpp & dw,
     const string user_lib, probe * base_probe, probe_point *base_loc,
     vector<derived_probe *> & results)
@@ -2161,15 +2178,20 @@ query_one_library (const char *library, dwflpp & dw,
       probe *new_base = new probe (new probe (base_probe, specific_loc), derived_loc);
       derive_probes(dw.sess, new_base, results);
       if (dw.sess.verbose > 2)
-        clog << _("module=") << library_path;
+        clog << _("module=") << library_path << endl;
+      return library_path;
     }
+  return "";
 }
 
 
 void
 dwarf_query::query_library (const char *library)
 {
-  query_one_library (library, dw, user_lib, base_probe, base_loc, results);
+  string library_path =
+    query_one_library (library, dw, user_lib, base_probe, base_loc, results);
+  if (!library_path.empty())
+    visited_modules.insert(library_path);
 }
 
 struct plt_expanding_visitor: public var_expanding_visitor
@@ -2190,6 +2212,7 @@ base_query::query_plt_callback (void *q, const char *entry, size_t address)
   base_query *me = (base_query*)q;
   if (me->dw.function_name_matches_pattern (entry, me->plt_val))
     me->query_plt (entry, address);
+  me->dw.mod_info->plt_funcs.insert(entry);
 }
 
 
@@ -2279,11 +2302,11 @@ struct dwarf_var_expanding_visitor: public var_expanding_visitor
   void visit_target_symbol_saved_return (target_symbol* e);
   void visit_target_symbol_context (target_symbol* e);
   void visit_target_symbol (target_symbol* e);
+  void visit_atvar_op (atvar_op* e);
   void visit_cast_op (cast_op* e);
   void visit_entry_op (entry_op* e);
   void visit_perf_op (perf_op* e);
 private:
-  vector<Dwarf_Die>& getcuscope(target_symbol *e);
   vector<Dwarf_Die>& getscopes(target_symbol *e);
 };
 
@@ -2354,7 +2377,7 @@ var_expanding_visitor::rewrite_lvalue(const token* tok, const std::string& eop,
 	  ops.resize(ops.size() - 1);	// chop off the last ','
 
 	  // Throw the error.
-	  throw semantic_error (_NF("Only the following assign operator is implemented on target variables: %s",
+	  throw SEMANTIC_ERROR (_NF("Only the following assign operator is implemented on target variables: %s",
                                             "Only the following assign operators are implemented on target variables: %s",
                                            valid_ops_size, ops.c_str()), tok);
 
@@ -2550,11 +2573,11 @@ dwarf_pretty_print::init_ts (const target_symbol& e)
   ts = new target_symbol (e);
 
   if (ts->addressof)
-    throw semantic_error(_("cannot take address of pretty-printed variable"), ts->tok);
+    throw SEMANTIC_ERROR(_("cannot take address of pretty-printed variable"), ts->tok);
 
   if (ts->components.empty() ||
       ts->components.back().type != target_symbol::comp_pretty_print)
-    throw semantic_error(_("invalid target_symbol for pretty-print"), ts->tok);
+    throw SEMANTIC_ERROR(_("invalid target_symbol for pretty-print"), ts->tok);
   print_full = ts->components.back().member.length() > 1;
   ts->components.pop_back();
 }
@@ -3512,7 +3535,7 @@ dwarf_var_expanding_visitor::gen_kretprobe_saved_return(expression* e)
       getfn = "_get_kretprobe_long";
       break;
     default:
-      throw semantic_error(_("unknown type to save in kretprobe"), e->tok);
+      throw SEMANTIC_ERROR(_("unknown type to save in kretprobe"), e->tok);
     }
 
   // Create the entry code
@@ -3685,11 +3708,28 @@ dwarf_var_expanding_visitor::visit_target_symbol_context (target_symbol* e)
 
 
 void
+dwarf_var_expanding_visitor::visit_atvar_op (atvar_op *e)
+{
+  // Fill in our current module context if needed
+  if (e->module.empty())
+    e->module = q.dw.module_name;
+
+  if (e->module == q.dw.module_name && e->cu_name.empty())
+    {
+      // process like any other local
+      // e->sym_name() will do the right thing
+      visit_target_symbol(e);
+      return;
+    }
+
+  var_expanding_visitor::visit_atvar_op(e);
+}
+
+
+void
 dwarf_var_expanding_visitor::visit_target_symbol (target_symbol *e)
 {
-  assert(e->name.size() > 0
-	 && ((e->name[0] == '$' && e->target_name == "")
-	      || (e->name == "@var" && e->target_name != "")));
+  assert(e->name.size() > 0 && (e->name[0] == '$' || e->name == "@var"));
   visited = true;
   bool defined_being_checked = (defined_ops.size() > 0 && (defined_ops.top()->operand == e));
   // In this mode, we avoid hiding errors or generating extra code such as for .return saved $vars
@@ -3698,7 +3738,7 @@ dwarf_var_expanding_visitor::visit_target_symbol (target_symbol *e)
     {
       bool lvalue = is_active_lvalue(e);
       if (lvalue && !q.sess.guru_mode)
-        throw semantic_error(_("write to target variable not permitted; need stap -g"), e->tok);
+        throw SEMANTIC_ERROR(_("write to target variable not permitted; need stap -g"), e->tok);
 
       // XXX: process $context vars should be writable
 
@@ -3710,7 +3750,7 @@ dwarf_var_expanding_visitor::visit_target_symbol (target_symbol *e)
           && e->name != "$$return") // nor the other special variable handled below
         {
           if (lvalue)
-            throw semantic_error(_("write to target variable not permitted in .return probes"), e->tok);
+            throw SEMANTIC_ERROR(_("write to target variable not permitted in .return probes"), e->tok);
           visit_target_symbol_saved_return(e);
           return;
         }
@@ -3719,10 +3759,10 @@ dwarf_var_expanding_visitor::visit_target_symbol (target_symbol *e)
           || (q.has_return && (e->name == "$$return")))
         {
           if (lvalue)
-            throw semantic_error(_("cannot write to context variable"), e->tok);
+            throw SEMANTIC_ERROR(_("cannot write to context variable"), e->tok);
 
           if (e->addressof)
-            throw semantic_error(_("cannot take address of context variable"), e->tok);
+            throw SEMANTIC_ERROR(_("cannot take address of context variable"), e->tok);
 
           e->assert_no_components("dwarf", true);
 
@@ -3734,7 +3774,7 @@ dwarf_var_expanding_visitor::visit_target_symbol (target_symbol *e)
           e->components.back().type == target_symbol::comp_pretty_print)
         {
           if (lvalue)
-            throw semantic_error(_("cannot write to pretty-printed variable"), e->tok);
+            throw SEMANTIC_ERROR(_("cannot write to pretty-printed variable"), e->tok);
 
           if (q.has_return && (e->name == "$return"))
             {
@@ -3860,68 +3900,13 @@ dwarf_var_expanding_visitor::visit_perf_op (perf_op *e)
       provide (sym);
     }
   else
-    throw semantic_error(_F("perf counter '%s' not defined", e_lit_val.c_str()));
+    throw SEMANTIC_ERROR(_F("perf counter '%s' not defined", e_lit_val.c_str()));
 }
 
-vector<Dwarf_Die>&
-dwarf_var_expanding_visitor::getcuscope(target_symbol *e)
-{
-  Dwarf_Off cu_off = 0;
-  const char *cu_name = NULL;
-
-  string prefixed_srcfile = string("*/") + e->cu_name;
-
-  Dwarf_Off off = 0;
-  size_t cuhl;
-  Dwarf_Off noff;
-  Dwarf_Off module_bias;
-  Dwarf *dw = dwfl_module_getdwarf(q.dw.module, &module_bias);
-  while (dwarf_nextcu (dw, off, &noff, &cuhl, NULL, NULL, NULL) == 0)
-    {
-      Dwarf_Die die_mem;
-      Dwarf_Die *die;
-      die = dwarf_offdie (dw, off + cuhl, &die_mem);
-
-      /* We are not interested in partial units. */
-      if (dwarf_tag (die) == DW_TAG_compile_unit)
-	{
-	  const char *die_name = dwarf_diename (die);
-	  if (strcmp (die_name, e->cu_name.c_str()) == 0) // Perfect match.
-	    {
-	      cu_name = die_name;
-	      cu_off = off + cuhl;
-	      break;
-	    }
-
-	  if (fnmatch(prefixed_srcfile.c_str(), die_name, 0) == 0)
-	    if (cu_name == NULL || strlen (die_name) < strlen (cu_name))
-	      {
-		cu_name = die_name;
-		cu_off = off + cuhl;
-	      }
-	}
-      off = noff;
-    }
-
-  if (cu_name == NULL)
-    throw semantic_error ("unable to find CU '" + e->cu_name + "'"
-			  + " while searching for '" + e->target_name + "'",
-			  e->tok);
-
-  vector<Dwarf_Die> *cu_scope = new vector<Dwarf_Die>;
-  Dwarf_Die cu_die;
-  dwarf_offdie (dw, cu_off, &cu_die);
-  cu_scope->push_back(cu_die);
-  return *cu_scope;
-}
 
 vector<Dwarf_Die>&
 dwarf_var_expanding_visitor::getscopes(target_symbol *e)
 {
-  // "static globals" can only be found in the top-level CU.
-  if (e->name == "@var" && e->cu_name != "")
-    return this->getcuscope(e);
-
   if (scopes.empty())
     {
       if(scope_die != NULL)
@@ -3929,7 +3914,7 @@ dwarf_var_expanding_visitor::getscopes(target_symbol *e)
       if (scopes.empty())
         //throw semantic_error (_F("unable to find any scopes containing %d", addr), e->tok);
         //                        ((scope_die == NULL) ? "" : (string (" in ") + (dwarf_diename(scope_die) ?: "<unknown>") + "(" + (dwarf_diename(q.dw.cu) ?: "<unknown>") ")" ))
-        throw semantic_error ("unable to find any scopes containing "
+        throw SEMANTIC_ERROR ("unable to find any scopes containing "
                               + lex_cast_hex(addr)
                               + ((scope_die == NULL) ? ""
                                  : (string (" in ")
@@ -4025,7 +4010,7 @@ dwarf_cast_query::handle_query_module()
           e.components.back().type == target_symbol::comp_pretty_print)
         {
           if (lvalue)
-            throw semantic_error(_("cannot write to pretty-printed variable"), e.tok);
+            throw SEMANTIC_ERROR(_("cannot write to pretty-printed variable"), e.tok);
 
           dwarf_pretty_print dpp(dw, type_die, e.operand, true, userspace_p, e);
           result = dpp.expand();
@@ -4096,7 +4081,7 @@ void dwarf_cast_expanding_visitor::visit_cast_op (cast_op* e)
 {
   bool lvalue = is_active_lvalue(e);
   if (lvalue && !s.guru_mode)
-    throw semantic_error(_("write to @cast context variable not permitted; need stap -g"), e->tok);
+    throw SEMANTIC_ERROR(_("write to @cast context variable not permitted; need stap -g"), e->tok);
 
   if (e->module.empty())
     e->module = "kernel"; // "*" may also be reasonable to search all kernel modules
@@ -4158,6 +4143,185 @@ void dwarf_cast_expanding_visitor::visit_cast_op (cast_op* e)
     }
 
   result->visit (this);
+}
+
+
+struct dwarf_atvar_expanding_visitor: public var_expanding_visitor
+{
+  systemtap_session& s;
+  dwarf_builder& db;
+
+  dwarf_atvar_expanding_visitor(systemtap_session& s, dwarf_builder& db):
+    s(s), db(db) {}
+  void visit_atvar_op (atvar_op* e);
+};
+
+
+struct dwarf_atvar_query: public base_query
+{
+  atvar_op& e;
+  const bool userspace_p, lvalue;
+  functioncall*& result;
+  unsigned& tick;
+  const string cu_name_pattern;
+
+  dwarf_atvar_query(dwflpp& dw, const string& module, atvar_op& e,
+                    const bool userspace_p, const bool lvalue,
+                    functioncall*& result,
+                    unsigned& tick):
+    base_query(dw, module), e(e),
+    userspace_p(userspace_p), lvalue(lvalue), result(result),
+    tick(tick), cu_name_pattern(string("*/") + e.cu_name) {}
+
+  void handle_query_module ();
+  void query_library (const char *) {}
+  void query_plt (const char *entry, size_t addr) {}
+  static int atvar_query_cu (Dwarf_Die *cudie, void *data);
+};
+
+
+int
+dwarf_atvar_query::atvar_query_cu (Dwarf_Die * cudie, void * data)
+{
+  dwarf_atvar_query * q = static_cast<dwarf_atvar_query *>(data);
+
+  if (! q->e.cu_name.empty())
+    {
+      const char *die_name = dwarf_diename(cudie);
+
+      if (strcmp(die_name, q->e.cu_name.c_str()) != 0 // Perfect match
+          && fnmatch(q->cu_name_pattern.c_str(), die_name, 0) != 0)
+        {
+          return DWARF_CB_OK;
+        }
+    }
+
+  try
+    {
+      vector<Dwarf_Die>  scopes(1, *cudie);
+
+      q->dw.focus_on_cu (cudie);
+
+      if (! q->e.components.empty() &&
+          q->e.components.back().type == target_symbol::comp_pretty_print)
+        {
+          dwarf_pretty_print dpp (q->dw, scopes, 0, q->e.sym_name(),
+                                  q->userspace_p, q->e);
+          q->result = dpp.expand();
+          return DWARF_CB_ABORT;
+        }
+
+      exp_type type = pe_long;
+      string code = q->dw.literal_stmt_for_local (scopes, 0, q->e.sym_name(),
+                                                  &q->e, q->lvalue, type);
+
+      if (code.empty())
+        return DWARF_CB_OK;
+
+      string fname = (string(q->lvalue ? "_dwarf_tvar_set"
+                                       : "_dwarf_tvar_get")
+                      + "_" + q->e.sym_name()
+                      + "_" + lex_cast(q->tick++));
+
+      q->result = synthetic_embedded_deref_call (q->sess, fname, code, type,
+                                                 q->userspace_p, q->lvalue,
+                                                 &q->e);
+    }
+  catch (const semantic_error& er)
+    {
+      // Here we suppress the error because we often just have too many
+      // when scanning all the CUs.
+      return DWARF_CB_OK;
+    }
+
+  if (q->result) {
+      return DWARF_CB_ABORT;
+  }
+
+  return DWARF_CB_OK;
+}
+
+
+void
+dwarf_atvar_query::handle_query_module ()
+{
+
+  dw.iterate_over_cus(atvar_query_cu, this, false);
+}
+
+
+void
+dwarf_atvar_expanding_visitor::visit_atvar_op (atvar_op* e)
+{
+  const bool lvalue = is_active_lvalue(e);
+  if (lvalue && !s.guru_mode)
+    throw SEMANTIC_ERROR(_("write to @var variable not permitted; "
+                           "need stap -g"), e->tok);
+
+  if (e->module.empty())
+    e->module = "kernel";
+
+  functioncall* result = NULL;
+
+  // split the module string by ':' for alternatives
+  vector<string> modules;
+  tokenize(e->module, modules, ":");
+  bool userspace_p = false;
+  for (unsigned i = 0; !result && i < modules.size(); ++i)
+    {
+      string& module = modules[i];
+
+      dwflpp* dw;
+      try
+        {
+          userspace_p = is_user_module(module);
+          if (!userspace_p)
+            {
+              // kernel or kernel module target
+              dw = db.get_kern_dw(s, module);
+            }
+          else
+            {
+              module = find_executable(module, "", s.sysenv);
+              dw = db.get_user_dw(s, module);
+            }
+        }
+      catch (const semantic_error& er)
+        {
+          /* ignore and go to the next module */
+          continue;
+        }
+
+      dwarf_atvar_query q (*dw, module, *e, userspace_p, lvalue, result, tick);
+      dw->iterate_over_modules(&query_module, &q);
+
+      if (result)
+        {
+          s.unwindsym_modules.insert(module);
+
+          if (lvalue)
+            {
+              // Provide the functioncall to our parent, so that it can be
+              // used to substitute for the assignment node immediately above
+              // us.
+              assert(!target_symbol_setter_functioncalls.empty());
+              *(target_symbol_setter_functioncalls.top()) = result;
+            }
+
+          result->visit(this);
+          return;
+        }
+
+      /* Unable to find the variable in the current module, so we chain
+       * an error in atvar_op */
+      semantic_error  er(ERR_SRC, _F("unable to find global '%s' in %s%s%s",
+                            e->sym_name().c_str(), module.c_str(),
+                            e->cu_name.empty() ? "" : _(", in "),
+                            e->cu_name.c_str()));
+      e->chain (er);
+    }
+
+  provide(e);
 }
 
 
@@ -4233,7 +4397,7 @@ check_process_probe_kernel_support(systemtap_session& s)
       && kernel_supports_inode_uprobes(s))
     return;
 
-  throw semantic_error (_("process probes not available without kernel CONFIG_UTRACE or CONFIG_TRACEPOINTS/CONFIG_ARCH_SUPPORTS_UPROBES/CONFIG_UPROBES"));
+  throw SEMANTIC_ERROR (_("process probes not available without kernel CONFIG_UTRACE or CONFIG_TRACEPOINTS/CONFIG_ARCH_SUPPORTS_UPROBES/CONFIG_UPROBES"));
 }
 
 
@@ -4289,9 +4453,9 @@ dwarf_derived_probe::dwarf_derived_probe(const string& funcname,
     {
       // Assert kernel relocation invariants
       if (section == "" && dwfl_addr != addr) // addr should be absolute
-        throw semantic_error (_("missing relocation basis"), tok);
+        throw SEMANTIC_ERROR (_("missing relocation basis"), tok);
       if (section != "" && dwfl_addr == addr) // addr should be an offset
-        throw semantic_error (_("inconsistent relocation address"), tok);
+        throw SEMANTIC_ERROR (_("inconsistent relocation address"), tok);
     }
 
   // XXX: hack for strange g++/gcc's
@@ -4301,7 +4465,7 @@ dwarf_derived_probe::dwarf_derived_probe(const string& funcname,
 
   // Range limit maxactive() value
   if (has_maxactive && (maxactive_val < 0 || maxactive_val > USHRT_MAX))
-    throw semantic_error (_F("maxactive value out of range [0,%s]",
+    throw SEMANTIC_ERROR (_F("maxactive value out of range [0,%s]",
                           lex_cast(USHRT_MAX).c_str()), q.base_loc->components.front()->tok);
 
   // Expand target variables in the probe body
@@ -4719,6 +4883,9 @@ dwarf_derived_probe::register_patterns(systemtap_session& s)
   dwarf_builder *dw = new dwarf_builder();
 
   update_visitor *filter = new dwarf_cast_expanding_visitor(s, *dw);
+  s.code_filters.push_back(filter);
+
+  filter = new dwarf_atvar_expanding_visitor(s, *dw);
   s.code_filters.push_back(filter);
 
   register_function_and_statement_variants(s, root->bind(TOK_KERNEL), dw, pr_privileged);
@@ -5436,7 +5603,7 @@ struct sdt_uprobe_var_expanding_visitor: public var_expanding_visitor
       DRI ("r7", 7, SI);
       DRI ("r8", 8, SI);
       DRI ("r9", 9, SI);
-      DRI ("sl", 10, SI);
+      DRI ("r10", 10, SI); DRI ("sl", 10, SI);
       DRI ("fp", 11, SI);
       DRI ("ip", 12, SI);
       DRI ("sp", 13, SI);
@@ -5474,6 +5641,7 @@ struct sdt_uprobe_var_expanding_visitor: public var_expanding_visitor
   void visit_target_symbol (target_symbol* e);
   void visit_target_symbol_arg (target_symbol* e);
   void visit_target_symbol_context (target_symbol* e);
+  void visit_atvar_op (atvar_op* e);
   void visit_cast_op (cast_op* e);
 };
 
@@ -5482,7 +5650,7 @@ void
 sdt_uprobe_var_expanding_visitor::visit_target_symbol_context (target_symbol* e)
 {
   if (e->addressof)
-    throw semantic_error(_("cannot take address of context variable"), e->tok);
+    throw SEMANTIC_ERROR(_("cannot take address of context variable"), e->tok);
 
   if (e->name == "$$name")
     {
@@ -5565,7 +5733,7 @@ sdt_uprobe_var_expanding_visitor::visit_target_symbol_arg (target_symbol *e)
 	  // both of which get resolved later.
 	  // Throw it now, and it might be resolved by DWARF later.
 	  need_debug_info = true;
-	  throw semantic_error(_("target-symbol requires debuginfo"), e->tok);
+	  throw SEMANTIC_ERROR(_("target-symbol requires debuginfo"), e->tok);
 	}
 
       assert (arg_tokens.size() >= argno);
@@ -5728,9 +5896,9 @@ sdt_uprobe_var_expanding_visitor::visit_target_symbol_arg (target_symbol *e)
       // On ARM test for [REGISTER, OFFSET]
      if (elf_machine == EM_ARM)
        {
-         rc = regexp_match (asmarg, string("^\\[(")+regnames+string("), #([+-]?[0-9]+)([+-][0-9]*)?([+-][0-9]*)?\\]$"), matches);
+         rc = regexp_match (asmarg, string("^\\[(")+regnames+string(")(, #([+-]?[0-9]+)([+-][0-9]*)?([+-][0-9]*)?)?\\]$"), matches);
          reg = 1;
-         offset1 = 2;
+         offset1 = 3;
        }
      else
        {
@@ -5906,14 +6074,14 @@ sdt_uprobe_var_expanding_visitor::visit_target_symbol_arg (target_symbol *e)
       if (! session.suppress_warnings)
         {
           if (probe_type == UPROBE3_TYPE)
-            session.print_warning (_F("Can't parse SDT_V3 operand '%s'", asmarg.c_str()), e->tok);
+            session.print_warning (_F("Can't parse SDT_V3 operand '%s' [man error::sdt]", asmarg.c_str()), e->tok);
           else // must be *PROBE2; others don't get asm operands
-            session.print_warning (_F("Downgrading SDT_V2 probe argument to dwarf, can't parse '%s'", 
+            session.print_warning (_F("Downgrading SDT_V2 probe argument to dwarf, can't parse '%s' [man error::sdt]", 
                                       asmarg.c_str()), e->tok);
         }
       assert (argexpr == 0);
       need_debug_info = true;
-      throw semantic_error(_("SDT asm not understood, requires debuginfo"), e->tok);
+      throw SEMANTIC_ERROR(_("SDT asm not understood, requires debuginfo [man error::sdt]"), e->tok);
 
     matched:
       assert (argexpr != 0);
@@ -5925,7 +6093,7 @@ sdt_uprobe_var_expanding_visitor::visit_target_symbol_arg (target_symbol *e)
       if (e->components.empty()) // We have a scalar
         {
           if (e->addressof)
-            throw semantic_error(_("cannot take address of sdt variable"), e->tok);
+            throw SEMANTIC_ERROR(_("cannot take address of sdt variable"), e->tok);
           provide (argexpr);
           return;
         }
@@ -5958,8 +6126,7 @@ sdt_uprobe_var_expanding_visitor::visit_target_symbol (target_symbol* e)
   try
     {
       assert(e->name.size() > 0
-	     && ((e->name[0] == '$' && e->target_name == "")
-		 || (e->name == "@var" && e->target_name != "")));
+             && (e->name[0] == '$' || e->name == "@var"));
 
       if (e->name == "$$name" || e->name == "$$provider" || e->name == "$$parms" || e->name == "$$vars")
         visit_target_symbol_context (e);
@@ -5971,6 +6138,19 @@ sdt_uprobe_var_expanding_visitor::visit_target_symbol (target_symbol* e)
       e->chain (er);
       provide (e);
     }
+}
+
+
+void
+sdt_uprobe_var_expanding_visitor::visit_atvar_op (atvar_op* e)
+{
+  need_debug_info = true;
+
+  // Fill in our current module context if needed
+  if (e->module.empty())
+    e->module = process_name;
+
+  var_expanding_visitor::visit_atvar_op(e);
 }
 
 
@@ -6001,7 +6181,7 @@ plt_expanding_visitor::visit_target_symbol (target_symbol *e)
       // variable not found -> throw a semantic error
       // (only to be caught right away, but this may be more complex later...)
       string alternatives = "$$name";
-      throw semantic_error(_F("unable to find plt variable '%s' (alternatives: %s)",
+      throw SEMANTIC_ERROR(_F("unable to find plt variable '%s' (alternatives: %s)",
                               e->name.c_str(), alternatives.c_str()), e->tok);
     }
   catch (const semantic_error &er)
@@ -6591,6 +6771,69 @@ sdt_query::query_library (const char *library)
     query_one_library (library, dw, user_lib, base_probe, base_loc, results);
 }
 
+string
+suggest_plt_functions(systemtap_session& sess,
+                      const set<string>& modules,
+                      const string& func)
+{
+  if (func.empty() || modules.empty() || sess.module_cache == NULL)
+    return "";
+
+  set<string> funcs;
+  const map<string, module_info*> &cache = sess.module_cache->cache;
+
+  for (set<string>::iterator itmod = modules.begin();
+       itmod != modules.end(); ++itmod)
+    {
+      map<string, module_info*>::const_iterator itcache;
+      if ((itcache = cache.find(*itmod)) != cache.end())
+        funcs.insert(itcache->second->plt_funcs.begin(),
+                     itcache->second->plt_funcs.end());
+    }
+
+  if (sess.verbose > 2)
+    clog << "suggesting from " << funcs.size() << " functions" << endl;
+
+  if (funcs.empty())
+    return "";
+
+  return levenshtein_suggest(func, funcs, 5); // print top 5 funcs only
+}
+
+string
+suggest_dwarf_functions(systemtap_session& sess,
+                        const set<string>& modules,
+                        string func)
+{
+  // Trim any @ component
+  size_t pos = func.find('@');
+  if (pos != string::npos)
+    func.erase(pos);
+
+  if (func.empty() || modules.empty() || sess.module_cache == NULL)
+    return "";
+
+  // We must first aggregate all the functions from the cache
+  set<string> funcs;
+  const map<string, module_info*> &cache = sess.module_cache->cache;
+
+  for (set<string>::iterator itmod = modules.begin();
+      itmod != modules.end(); ++itmod)
+    {
+      map<string, module_info*>::const_iterator itcache;
+      if ((itcache = cache.find(*itmod)) != cache.end())
+        funcs.insert(itcache->second->sym_seen.begin(),
+                     itcache->second->sym_seen.end());
+    }
+
+  if (sess.verbose > 2)
+    clog << "suggesting from " << funcs.size() << " functions" << endl;
+
+  if (funcs.empty())
+    return "";
+
+  return levenshtein_suggest(func, funcs, 5); // print top 5 funcs only
+}
 
 void
 dwarf_builder::build(systemtap_session & sess,
@@ -6629,7 +6872,7 @@ dwarf_builder::build(systemtap_session & sess,
           wordexp_t words;
           int rc = wordexp(sess.cmd.c_str(), &words, WRDE_NOCMD|WRDE_UNDEF);
           if(rc || words.we_wordc <= 0)
-            throw semantic_error(_("unspecified process probe is invalid without a -c COMMAND"));
+            throw SEMANTIC_ERROR(_("unspecified process probe is invalid without a -c COMMAND"));
           module_name = sess.sysroot + words.we_wordv[0];
           filled_parameters[TOK_PROCESS] = new literal_string(module_name);// this needs to be used in place of the blank map
           // in the case of TOK_MARK we need to modify locations as well
@@ -6653,9 +6896,11 @@ dwarf_builder::build(systemtap_session & sess,
 
           // Evaluate glob here, and call derive_probes recursively with each match.
           glob_t the_blob;
+          set<string> dupes;
           int rc = glob (module_name.c_str(), 0, NULL, & the_blob);
           if (rc)
-            throw semantic_error (_F("glob %s error (%s)", module_name.c_str(), lex_cast(rc).c_str() ));
+            throw SEMANTIC_ERROR (_F("glob %s error (%s)", module_name.c_str(), lex_cast(rc).c_str() ));
+          unsigned results_pre = finished_results.size();
           for (unsigned i = 0; i < the_blob.gl_pathc; ++i)
             {
               assert_no_interrupts();
@@ -6671,9 +6916,14 @@ dwarf_builder::build(systemtap_session & sess,
                   // patterns like process("stap*").  Otherwise it may go through
                   // to the next round of expansion as ("stap"), leading to a $PATH
                   // search that's not consistent with the glob search already done.
+                  string canononicalized = resolve_path (globbed);
+                  globbed = canononicalized.c_str();
 
-                  char *cf = canonicalize_file_name (globbed);
-                  if (cf) globbed = cf;
+                  // The canonical names can result in duplication, for example
+                  // having followed symlinks that are common with shared
+                  // libraries.  Filter those out.
+                  if (!dupes.insert(canononicalized).second)
+                    continue;
 
                   // synthesize a new probe_point, with the glob-expanded string
                   probe_point *pp = new probe_point (*location);
@@ -6707,6 +6957,46 @@ dwarf_builder::build(systemtap_session & sess,
             }
 
           globfree (& the_blob);
+
+          unsigned results_post = finished_results.size();
+
+          // Did we fail to find a function by name? Let's suggest
+          // something!
+          string func;
+          if (results_pre == results_post
+              && get_param(filled_parameters, TOK_FUNCTION, func)
+              && !func.empty())
+            {
+              if (sess.verbose > 2)
+                {
+                  clog << "suggesting functions from modules:" << endl;
+                  for (set<string>::const_iterator it = modules_seen.begin();
+                      it != modules_seen.end(); ++it)
+                    {
+                      clog << *it << endl;
+                    }
+                }
+              string sugs = suggest_dwarf_functions(sess, modules_seen, func);
+              modules_seen.clear();
+              if (!sugs.empty())
+                throw SEMANTIC_ERROR (_NF("no match (similar function: %s)",
+                                          "no match (similar functions: %s)",
+                                          sugs.find(',') == string::npos,
+                                          sugs.c_str()));
+            }
+          else if (results_pre == results_post
+                   && get_param(filled_parameters, TOK_PLT, func)
+                   && !func.empty())
+            {
+              string sugs = suggest_plt_functions(sess, modules_seen, func);
+              modules_seen.clear();
+              if (!sugs.empty())
+                throw SEMANTIC_ERROR (_NF("no match (similar function: %s)",
+                                          "no match (similar functions: %s)",
+                                          sugs.find(',') == string::npos,
+                                          sugs.c_str()));
+            }
+
           return; // avoid falling through
         }
 
@@ -6821,7 +7111,7 @@ dwarf_builder::build(systemtap_session & sess,
         {
           if (kernel_supports_inode_uprobes(sess) &&
               !kernel_supports_inode_uretprobes(sess))
-            throw semantic_error
+            throw SEMANTIC_ERROR
               (_("process return probes not available [man error::inode-uprobes]"));
         }
 
@@ -6837,13 +7127,14 @@ dwarf_builder::build(systemtap_session & sess,
       dw = get_user_dw(sess, module_name);
     }
 
+  assert(dw);
+
   if (sess.verbose > 3)
     clog << _F("dwarf_builder::build for %s", module_name.c_str()) << endl;
 
   string dummy_mark_name; // NB: PR10245: dummy value, need not substitute - => __
   if (get_param(parameters, TOK_MARK, dummy_mark_name))
     {
-      assert(dw);
       sdt_query sdtq(base, location, *dw, filled_parameters, finished_results, user_lib);
       dw->iterate_over_modules(&query_module, &sdtq);
       return;
@@ -6859,7 +7150,7 @@ dwarf_builder::build(systemtap_session & sess,
       // assert guru mode for absolute probes
       if (! q.base_probe->privileged)
         {
-          throw semantic_error (_("absolute statement probe in unprivileged script; need stap -g"),
+          throw SEMANTIC_ERROR (_("absolute statement probe in unprivileged script; need stap -g"),
                                 q.base_probe->tok);
         }
 
@@ -6877,6 +7168,9 @@ dwarf_builder::build(systemtap_session & sess,
 
   dw->iterate_over_modules(&query_module, &q);
 
+  // We need to update modules_seen with the modules we've visited
+  modules_seen.insert(q.visited_modules.begin(),
+                      q.visited_modules.end());
 
   // PR11553 special processing: .return probes requested, but
   // some inlined function instances matched.
@@ -6916,6 +7210,59 @@ dwarf_builder::build(systemtap_session & sess,
           clog << endl;
         }
     } // i_n_r > 0
+
+  // Did we fail to find a function by name? Let's suggest something! We
+  // need to check for optional because otherwise, we will be suggesting
+  // things during intermediate results without including all the
+  // possible functions. For example, process("/usr/bin/*").function
+  // will go through here for each executable found (all labelled as
+  // optionals). Similarly for library(glob) probes. TODO: find a
+  // mechanism to have suggestions for optional probes as well when no
+  // probes could be derived, e.g. probepoint1?, probepoint2 should
+  // suggest for both 1 and 2 if both fail to resolve (maybe print as a
+  // warning?). This may entails detecting the difference between script
+  // optional probes and probes that are optional in recursive calls.
+  string func;
+  if (results_pre == results_post && !location->optional
+      && get_param(filled_parameters, TOK_FUNCTION, func)
+      && !func.empty())
+    {
+      if (sess.verbose > 2)
+        {
+          clog << "suggesting functions from modules:" << endl;
+          for (set<string>::const_iterator it = modules_seen.begin();
+              it != modules_seen.end(); ++it)
+            clog << *it << endl;
+        }
+      string sugs = suggest_dwarf_functions(sess, modules_seen, func);
+      modules_seen.clear();
+      if (!sugs.empty())
+        // Note that this error will not even be printed out if it is
+        // exactly the same suggestion as a previous throw (since
+        // print_error() filters out identical errors). Which makes
+        // sense since it's possible that the user misspelled the same
+        // function in different probes, in which case the first
+        // suggestion is sufficient.
+        throw SEMANTIC_ERROR (_NF("no match (similar function: %s)",
+                                  "no match (similar functions: %s)",
+                                  sugs.find(',') == string::npos,
+                                  sugs.c_str()));
+    }
+  else if (results_pre == results_post && !location->optional
+           && get_param(filled_parameters, TOK_PLT, func)
+           && !func.empty())
+    {
+      string sugs = suggest_plt_functions(sess, modules_seen, func);
+      modules_seen.clear();
+      if (!sugs.empty())
+        throw SEMANTIC_ERROR (_NF("no match (similar function: %s)",
+                                  "no match (similar functions: %s)",
+                                  sugs.find(',') == string::npos,
+                                  sugs.c_str()));
+    }
+  else if (results_pre != results_post)
+    // Something was derived so we won't need to suggest something
+    modules_seen.clear();
 }
 
 symbol_table::~symbol_table()
@@ -6925,7 +7272,7 @@ symbol_table::~symbol_table()
 
 void
 symbol_table::add_symbol(const char *name, bool weak, bool descriptor,
-                         Dwarf_Addr addr, Dwarf_Addr */*high_addr*/)
+                         Dwarf_Addr addr, Dwarf_Addr* /*high_addr*/)
 {
 #ifdef __powerpc__
   // Map ".sys_foo" to "sys_foo".
@@ -7176,7 +7523,7 @@ symbol_table::purge_syscall_stubs()
 }
 
 void
-module_info::get_symtab(dwarf_query *q)
+module_info::get_symtab(base_query *q)
 {
   if (symtab_status != info_unknown)
     return;
@@ -7219,6 +7566,8 @@ module_info::update_symtab(cu_function_cache_t *funcs)
   for (cu_function_cache_t::iterator func = funcs->begin();
        func != funcs->end(); func++)
     {
+      sym_seen.insert(func->first);
+
       // optimization: inlines will never be in the symbol table
       if (dwarf_func_inline(&func->second) != 0)
         continue;
@@ -7348,7 +7697,7 @@ struct uprobe_builder: public derived_probe_builder
     int64_t process, address;
 
     if (kernel_supports_inode_uprobes(sess))
-      throw semantic_error (_("absolute process probes not available [man error::inode-uprobes]"));
+      throw SEMANTIC_ERROR (_("absolute process probes not available [man error::inode-uprobes]"));
 
     bool b1 = get_param (parameters, TOK_PROCESS, process);
     (void) b1;
@@ -8311,12 +8660,26 @@ kprobe_derived_probe_group::emit_module_decls (systemtap_session& s)
   s.op->newline() << "for (i=0; i<" << probes_by_module.size()
 		  << " && *p > 0; i++) {";
   s.op->newline(1) << "struct stap_dwarfless_probe *sdp = & stap_dwarfless_probes[i];";
-  s.op->newline() << "if (! sdp->address)";
+  s.op->newline() << "if (! sdp->address) {";
+  s.op->indent(1);
+  s.op->newline() << "const char *colon;";
+  s.op->newline() << "if (owner && (colon = strchr(sdp->symbol_string, ':'))) {";
+  s.op->indent(1);
+  s.op->newline() << "if ((strlen(owner->name) == (colon - sdp->symbol_string))";
+  s.op->newline() << "    && (strncmp(sdp->symbol_string, owner->name, colon - sdp->symbol_string) == 0)";
+  s.op->newline() << "    && (strcmp(colon + 1, name) == 0)) {";
+  s.op->newline(1) << "sdp->address = val;";
+  s.op->newline() << "(*p)--;";
+  s.op->newline(-1) << "}";
+  s.op->newline(-1) << "}";
+  s.op->newline() << "else {";
   s.op->newline(1) << "if (strcmp(sdp->symbol_string, name) == 0) {";
   s.op->newline(1) << "sdp->address = val;";
   s.op->newline() << "(*p)--;";
   s.op->newline(-1) << "}";
-  s.op->newline(-2) << "}";
+  s.op->newline(-1) << "}";
+  s.op->newline(-1) << "}";
+  s.op->newline(-1) << "}";
   s.op->newline() << "return (p > 0) ? 0 : -1;";
   s.op->newline(-1) << "}";
   s.op->newline() << "#endif";
@@ -8587,7 +8950,7 @@ kprobe_builder::build(systemtap_session & sess,
     {
       // assert guru mode for absolute probes
       if ( has_statement_num && has_absolute && !base->privileged )
-	throw semantic_error (_("absolute statement probe in unprivileged script; need stap -g"), base->tok);
+	throw SEMANTIC_ERROR (_("absolute statement probe in unprivileged script; need stap -g"), base->tok);
 
       finished_results.push_back (new kprobe_derived_probe (sess,
 							    finished_results,
@@ -8953,10 +9316,10 @@ hwbkpt_builder::build(systemtap_session & sess,
   bool has_addr, has_symbol_str, has_write, has_rw, has_len;
 
   if (! (sess.kernel_config["CONFIG_PERF_EVENTS"] == string("y")))
-      throw semantic_error (_("CONFIG_PERF_EVENTS not available on this kernel"),
+      throw SEMANTIC_ERROR (_("CONFIG_PERF_EVENTS not available on this kernel"),
                             location->components[0]->tok);
   if (! (sess.kernel_config["CONFIG_HAVE_HW_BREAKPOINT"] == string("y")))
-      throw semantic_error (_("CONFIG_HAVE_HW_BREAKPOINT not available on this kernel"),
+      throw SEMANTIC_ERROR (_("CONFIG_HAVE_HW_BREAKPOINT not available on this kernel"),
                             location->components[0]->tok);
 
   has_addr = get_param (parameters, TOK_HWBKPT, hwbkpt_address);
@@ -9056,15 +9419,20 @@ tracepoint_var_expanding_visitor::visit_target_symbol_arg (target_symbol* e)
 
   if (arg == NULL)
     {
-      stringstream alternatives;
+      set<string> vars;
       for (unsigned i = 0; i < args.size(); ++i)
-        alternatives << " $" << args[i].name;
-      alternatives << " $$name $$parms $$vars";
+        vars.insert("$" + args[i].name);
+      vars.insert("$$name");
+      vars.insert("$$parms");
+      vars.insert("$$vars");
+      string sugs = levenshtein_suggest(e->name, vars); // no need to limit, there's not that many
 
       // We hope that this value ends up not being referenced after all, so it
       // can be optimized out quietly.
-      throw semantic_error(_F("unable to find tracepoint variable '%s' (alternatives: %s)",
-                              e->name.c_str(), alternatives.str().c_str()), e->tok);
+      throw SEMANTIC_ERROR(_F("unable to find tracepoint variable '%s'%s",
+                              e->name.c_str(), sugs.empty() ? "" :
+                              (_(" (alternatives: ") + sugs + ")").c_str()), e->tok);
+                              // NB: we use 'alternatives' because we list all
       // NB: we can have multiple errors, since a target variable
       // may be expanded in several different contexts:
       //     trace ("*") { $foo->bar }
@@ -9077,7 +9445,7 @@ tracepoint_var_expanding_visitor::visit_target_symbol_arg (target_symbol* e)
   // we can only write to dereferenced fields, and only if guru mode is on
   bool lvalue = is_active_lvalue(e);
   if (lvalue && (!dw.sess.guru_mode || e->components.empty()))
-    throw semantic_error(_F("write to tracepoint variable '%s' not permitted; need stap -g", e->name.c_str()), e->tok);
+    throw SEMANTIC_ERROR(_F("write to tracepoint variable '%s' not permitted; need stap -g", e->name.c_str()), e->tok);
 
   // XXX: if a struct/union arg is passed by value, then writing to its fields
   // is also meaningless until you dereference past a pointer member.  It's
@@ -9086,7 +9454,7 @@ tracepoint_var_expanding_visitor::visit_target_symbol_arg (target_symbol* e)
   if (e->components.empty())
     {
       if (e->addressof)
-        throw semantic_error(_("cannot take address of tracepoint variable"), e->tok);
+        throw SEMANTIC_ERROR(_("cannot take address of tracepoint variable"), e->tok);
 
       // Just grab the value from the probe locals
       symbol* sym = new symbol;
@@ -9104,7 +9472,7 @@ tracepoint_var_expanding_visitor::visit_target_symbol_arg (target_symbol* e)
       if (e->components.back().type == target_symbol::comp_pretty_print)
         {
           if (lvalue)
-            throw semantic_error(_("cannot write to pretty-printed variable"), e->tok);
+            throw SEMANTIC_ERROR(_("cannot write to pretty-printed variable"), e->tok);
 
           dwarf_pretty_print dpp(dw, &arg->type_die, e2, arg->isptr, false, *e);
           dpp.expand()->visit (this);
@@ -9141,10 +9509,10 @@ void
 tracepoint_var_expanding_visitor::visit_target_symbol_context (target_symbol* e)
 {
   if (e->addressof)
-    throw semantic_error(_("cannot take address of context variable"), e->tok);
+    throw SEMANTIC_ERROR(_("cannot take address of context variable"), e->tok);
 
   if (is_active_lvalue (e))
-    throw semantic_error(_F("write to tracepoint '%s' not permitted", e->name.c_str()), e->tok);
+    throw SEMANTIC_ERROR(_F("write to tracepoint '%s' not permitted", e->name.c_str()), e->tok);
 
   if (e->name == "$$name")
     {
@@ -9211,14 +9579,11 @@ tracepoint_var_expanding_visitor::visit_target_symbol (target_symbol* e)
 {
   try
     {
-      assert(e->name.size() > 0
-	     && ((e->name[0] == '$' && e->target_name == "")
-		 || (e->name == "@var" && e->target_name != "")));
+      assert(e->name.size() > 0 && e->name[0] == '$');
 
       if (e->name == "$$name" || e->name == "$$parms" || e->name == "$$vars")
         visit_target_symbol_context (e);
-      else if (e->name == "@var")
-	throw semantic_error(_("cannot use @var DWARF variables in tracepoints"), e->tok);
+
       else
         visit_target_symbol_arg (e);
     }
@@ -9228,7 +9593,6 @@ tracepoint_var_expanding_visitor::visit_target_symbol (target_symbol* e)
       provide (e);
     }
 }
-
 
 
 tracepoint_derived_probe::tracepoint_derived_probe (systemtap_session& s,
@@ -9254,7 +9618,7 @@ tracepoint_derived_probe::tracepoint_derived_probe (systemtap_session& s,
 #if 0 /* This convention is not enforced. */
   size_t header_pos = decl_file.rfind("trace/");
   if (header_pos == string::npos)
-    throw semantic_error ("cannot parse header location for tracepoint '"
+    throw SEMANTIC_ERROR ("cannot parse header location for tracepoint '"
                                   + tracepoint_name + "' in '"
                                   + decl_file + "'");
   header = decl_file.substr(header_pos);
@@ -9355,7 +9719,7 @@ tracepoint_derived_probe::build_args(dwflpp&, Dwarf_Die& func_die)
           // read the type of this parameter
           if (!dwarf_attr_die (&arg, DW_AT_type, &tparg.type_die)
               || !dwarf_type_name(&tparg.type_die, tparg.c_type))
-            throw semantic_error (_F("cannot get type of parameter '%s' of tracepoint '%s'",
+            throw SEMANTIC_ERROR (_F("cannot get type of parameter '%s' of tracepoint '%s'",
                                      tparg.name.c_str(), tracepoint_name.c_str()));
 
           tparg.usable = resolve_tracepoint_arg_type(tparg);
@@ -9702,6 +10066,7 @@ int
 tracepoint_query::handle_query_cu(Dwarf_Die * cudie)
 {
   dw.focus_on_cu (cudie);
+  dw.mod_info->get_symtab(this);
 
   // look at each function to see if it's a tracepoint
   string function = "stapprobe_" + tracepoint;
@@ -9940,12 +10305,21 @@ tracepoint_builder::init_dw(systemtap_session& s)
               assert_no_interrupts();
               Dwarf_Attribute attr;
               const char* name = dwarf_formstring (dwarf_attr (cudie, DW_AT_comp_dir, &attr));
-              if (name) 
+              if (name)
                 {
-                  if (s.verbose > 2)
-                    clog << _F("Located kernel source tree (DW_AT_comp_dir) at '%s'", name) << endl;
+                  // check that the path actually exists locally before we try to use it
+                  if (file_exists(name))
+                    {
+                      if (s.verbose > 2)
+                        clog << _F("Located kernel source tree (DW_AT_comp_dir) at '%s'", name) << endl;
+                      s.kernel_source_tree = name;
+                    }
+                  else
+                    {
+                      if (s.verbose > 2)
+                        clog << _F("Ignoring inaccessible kernel source tree (DW_AT_comp_dir) at '%s'", name) << endl;
+                    }
 
-                  s.kernel_source_tree = name;
                   break; // skip others; modern Kbuild uses same comp_dir for them all
                 }
             }
@@ -9963,6 +10337,7 @@ tracepoint_builder::init_dw(systemtap_session& s)
   glob_suffixes.push_back("include/trace/events/*.h");
   glob_suffixes.push_back("include/trace/*.h");
   glob_suffixes.push_back("arch/x86/kvm/*trace.h");
+  glob_suffixes.push_back("arch/x86/include/asm/trace/*.h");
   glob_suffixes.push_back("fs/xfs/linux-*/xfs_tr*.h");
   glob_suffixes.push_back("fs/xfs/xfs_trace*.h");
 
@@ -9994,11 +10369,15 @@ tracepoint_builder::init_dw(systemtap_session& s)
               endswith(header, "_event_types.h"))
             continue;
 
+          // With headers now plopped under arch/FOO/include/asm/*,
+          // the following logic miss some tracepoints.
+#if 0
           // skip identical headers from the build and source trees.
           size_t root_pos = header.rfind("include/");
           if (root_pos != string::npos &&
               !duped_headers.insert(header.substr(root_pos + 8)).second)
             continue;
+#endif
 
           system_headers.push_back(header);
         }
@@ -10028,7 +10407,23 @@ tracepoint_builder::build(systemtap_session& s,
   assert(get_param (parameters, TOK_TRACE, tracepoint));
 
   tracepoint_query q(*dw, tracepoint, base, location, finished_results);
+  unsigned results_pre = finished_results.size();
   dw->iterate_over_modules(&query_module, &q);
+  unsigned results_post = finished_results.size();
+
+  // Did we fail to find a match? Let's suggest something!
+  if (results_pre == results_post)
+    {
+      size_t pos;
+      string sugs = suggest_dwarf_functions(s, q.visited_modules, tracepoint);
+      while ((pos = sugs.find("stapprobe_")) != string::npos)
+        sugs.erase(pos, string("stapprobe_").size());
+      if (!sugs.empty())
+        throw SEMANTIC_ERROR (_NF("no match (similar function: %s)",
+                                  "no match (similar functions: %s)",
+                                  sugs.find(',') == string::npos,
+                                  sugs.c_str()));
+    }
 }
 
 

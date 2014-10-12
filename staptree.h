@@ -33,15 +33,21 @@ struct semantic_error: public std::runtime_error
   const token* tok1;
   const token* tok2;
   const semantic_error *chain;
+  const std::string errsrc;
 
   ~semantic_error () throw () {}
 
-  semantic_error (const std::string& msg, const token* t1=0):
-    runtime_error (msg), tok1 (t1), tok2 (0), chain (0) {}
+  semantic_error (const std::string& src, const std::string& msg, const token* t1=0):
+    runtime_error (msg), tok1 (t1), tok2 (0), chain (0), errsrc(src) {}
 
-  semantic_error (const std::string& msg, const token* t1,
+  semantic_error (const std::string& src, const std::string& msg, const token* t1,
                   const token* t2):
-    runtime_error (msg), tok1 (t1), tok2 (t2), chain (0) {}
+    runtime_error (msg), tok1 (t1), tok2 (t2), chain (0), errsrc(src) {}
+
+  std::string errsrc_chain(void) const
+    {
+      return errsrc + (chain ? "|" + chain->errsrc_chain() : "");
+    }
 };
 
 // ------------------------------------------------------------------------
@@ -166,11 +172,13 @@ struct array_in: public expression
   void visit (visitor* u);
 };
 
-struct regex_query: public binary_expression
+struct regex_query: public expression
 {
-  literal_string *re; // XXX somewhat redundant with right
-  void print (std::ostream& o) const;
+  expression* left;
+  std::string op;
+  literal_string* right;
   void visit (visitor* u);
+  void print (std::ostream& o) const;
 };
 
 struct comparison: public binary_expression
@@ -266,12 +274,10 @@ struct target_symbol: public symbol
     };
 
   bool addressof;
-  std::string target_name;
-  std::string cu_name;
   std::vector<component> components;
   semantic_error* saved_conversion_error; // hand-made linked list
   target_symbol(): addressof(false), saved_conversion_error (0) {}
-  std::string sym_name ();
+  virtual std::string sym_name ();
   void chain (const semantic_error& er);
   void print (std::ostream& o) const;
   void visit (visitor* u);
@@ -291,6 +297,13 @@ struct cast_op: public target_symbol
   void visit (visitor* u);
 };
 
+struct atvar_op: public target_symbol
+{
+  std::string target_name, cu_name, module;
+  virtual std::string sym_name ();
+  void print (std::ostream& o) const;
+  void visit (visitor* u);
+};
 
 struct defined_op: public expression
 {
@@ -789,6 +802,7 @@ struct visitor
   virtual void visit_stat_op (stat_op* e) = 0;
   virtual void visit_hist_op (hist_op* e) = 0;
   virtual void visit_cast_op (cast_op* e) = 0;
+  virtual void visit_atvar_op (atvar_op* e) = 0;
   virtual void visit_defined_op (defined_op* e) = 0;
   virtual void visit_entry_op (entry_op* e) = 0;
   virtual void visit_perf_op (perf_op* e) = 0;
@@ -836,6 +850,7 @@ struct traversing_visitor: public visitor
   void visit_stat_op (stat_op* e);
   void visit_hist_op (hist_op* e);
   void visit_cast_op (cast_op* e);
+  void visit_atvar_op (atvar_op* e);
   void visit_defined_op (defined_op* e);
   void visit_entry_op (entry_op* e);
   void visit_perf_op (perf_op* e);
@@ -886,6 +901,7 @@ struct varuse_collecting_visitor: public functioncall_traversing_visitor
   void visit_post_crement (post_crement *e);
   void visit_foreach_loop (foreach_loop *s);
   void visit_cast_op (cast_op* e);
+  void visit_atvar_op (atvar_op *e);
   void visit_defined_op (defined_op* e);
   void visit_entry_op (entry_op* e);
   void visit_perf_op (perf_op* e);
@@ -941,6 +957,7 @@ struct throwing_visitor: public visitor
   void visit_stat_op (stat_op* e);
   void visit_hist_op (hist_op* e);
   void visit_cast_op (cast_op* e);
+  void visit_atvar_op (atvar_op* e);
   void visit_defined_op (defined_op* e);
   void visit_entry_op (entry_op* e);
   void visit_perf_op (perf_op* e);
@@ -1019,6 +1036,7 @@ struct update_visitor: public visitor
   virtual void visit_stat_op (stat_op* e);
   virtual void visit_hist_op (hist_op* e);
   virtual void visit_cast_op (cast_op* e);
+  virtual void visit_atvar_op (atvar_op* e);
   virtual void visit_defined_op (defined_op* e);
   virtual void visit_entry_op (entry_op* e);
   virtual void visit_perf_op (perf_op* e);
@@ -1077,6 +1095,7 @@ struct deep_copy_visitor: public update_visitor
   virtual void visit_stat_op (stat_op* e);
   virtual void visit_hist_op (hist_op* e);
   virtual void visit_cast_op (cast_op* e);
+  virtual void visit_atvar_op (atvar_op* e);
   virtual void visit_defined_op (defined_op* e);
   virtual void visit_entry_op (entry_op* e);
   virtual void visit_perf_op (perf_op* e);

@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <string.h>
 #include <search.h>
+#include <signal.h>
 
 #include "transport.h"
 
@@ -274,6 +275,21 @@ __stp_d_t_run_command(char *command)
 	/* Notice we're not waiting on the resulting process to finish. */
 }
 
+static void
+__stp_d_t_request_exit(void)
+{
+	/*
+	 * We want stapdyn to trigger this module's exit code from outside.  It
+	 * knows to do this on receipt of signals, so we must kill ourselves.
+	 * The signal handler will forward that to the main thread.
+	 *
+	 * NB: If the target process was created rather than attached, SIGTERM
+	 * waits for it to exit.  SIGQUIT always exits immediately.  It's
+	 * somewhat debateable which is most appropriate here...
+	 */
+	pthread_kill(pthread_self(), SIGTERM);
+}
+
 static ssize_t
 _stp_write_retry(int fd, const void *buf, size_t count)
 {
@@ -291,6 +307,24 @@ _stp_write_retry(int fd, const void *buf, size_t count)
 	return count;
 }
 
+static int
+stap_strfloctime(char *buf, size_t max, const char *fmt, time_t t)
+{
+	struct tm tm;
+	size_t ret;
+	if (buf == NULL || fmt == NULL || max <= 1)
+		return -EINVAL;
+	localtime_r(&t, &tm);
+        /* NB: this following invocation is the reason for stapdyn's
+           being built with -Wno-format-nonliteral.  strftime parsing
+           does not have security implications AFAIK, but gcc still
+           wants to check them. */
+	ret = strftime(buf, max, fmt, &tm);
+	if (ret == 0)
+		return -EINVAL;
+	return (int)ret;
+}
+
 static void *
 _stp_dyninst_transport_thread_func(void *arg __attribute((unused)))
 {
@@ -301,7 +335,26 @@ _stp_dyninst_transport_thread_func(void *arg __attribute((unused)))
 	if (sess_data == NULL)
 		return NULL;
 
-	out_fd = STDOUT_FILENO; // TODO PR14791 allow a -o output file
+	if (strlen(stp_session_attributes()->outfile_name)) {
+		char buf[PATH_MAX];
+		int rc;
+
+		rc = stap_strfloctime(buf, PATH_MAX,
+				      stp_session_attributes()->outfile_name,
+				      time(NULL));
+		if (rc < 0) {
+			_stp_transport_err("Invalid FILE name format\n");
+			return NULL;
+		}
+		out_fd = open (buf, O_CREAT|O_TRUNC|O_WRONLY|O_CLOEXEC, 0666);
+		if (out_fd < 0) {
+			_stp_transport_err("ERROR: Couldn't open output file %s: %s\n",
+					   buf, strerror(rc));
+			return NULL;
+		}
+	}
+	else
+		out_fd = STDOUT_FILENO;
 	err_fd = STDERR_FILENO;
 	if (out_fd < 0 || err_fd < 0)
 		return NULL;
@@ -365,6 +418,11 @@ _stp_dyninst_transport_thread_func(void *arg __attribute((unused)))
 						 == 0) {
 						write_data = __stp_d_t_eliminate_duplicate_warnings(read_ptr, item->bytes);
 					}
+				}
+				/* "ERROR:" also should not be translated.  */
+				else if (strncmp(read_ptr, "ERROR:", 5) == 0) {
+					if (_stp_exit_status == 0)
+						_stp_exit_status = 1;
 				}
 
 				if (! write_data) {
@@ -440,10 +498,17 @@ _stp_dyninst_transport_thread_func(void *arg __attribute((unused)))
 					" read_offset %ld, write_offset %ld)\n",
 					data->read_offset, data->write_offset);
 				break;
+
 			case STP_DYN_EXIT:
 				_stp_transport_debug("STP_DYN_EXIT\n");
 				stopping = 1;
 				break;
+
+			case STP_DYN_REQUEST_EXIT:
+				_stp_transport_debug("STP_DYN_REQUEST_EXIT\n");
+				__stp_d_t_request_exit();
+				break;
+
 			default:
 				if (! (item->type & STP_DYN_OOB_DATA_MASK)) {
 					_stp_transport_err(
@@ -490,6 +555,11 @@ static int _stp_ctl_send(int type, void *data, unsigned len)
 static void _stp_dyninst_transport_signal_exit(void)
 {
 	__stp_dyninst_transport_queue_add(STP_DYN_EXIT, 0, 0, 0);
+}
+
+static void _stp_dyninst_transport_request_exit(void)
+{
+	__stp_dyninst_transport_queue_add(STP_DYN_REQUEST_EXIT, 0, 0, 0);
 }
 
 static int _stp_dyninst_transport_session_init(void)

@@ -30,7 +30,7 @@ function vm_fault_contains:long (value:long, test:long)
 	switch (STAP_ARG_test){
 	case 0: res = STAP_ARG_value & VM_FAULT_OOM; break;
 	case 1: res = STAP_ARG_value & VM_FAULT_SIGBUS; break;
-#if defined(VM_FAULT_MINOR) && VM_FAULT_MINOR != 0
+#if defined(VM_FAULT_MINOR) && VM_FAULT_MINOR == 0
 	case 2: /* VM_FAULT_MINOR infered by that flags off */
 		res = !((VM_FAULT_OOM | VM_FAULT_SIGBUS | VM_FAULT_MAJOR) & 
 				 STAP_ARG_value);
@@ -100,8 +100,15 @@ probe vm.pagefault.return =
  * node that the given address belongs to in a NUMA system.
  */
 function addr_to_node:long(addr:long) %{ /* pure */ 
-	int pfn = __pa(STAP_ARG_addr) >> PAGE_SHIFT;
 	int nid;
+	int pfn;
+        if (! virt_addr_valid((void*) (uintptr_t) STAP_ARG_addr)) {
+            snprintf (CONTEXT->error_buffer, sizeof(CONTEXT->error_buffer),
+                      "invalid kernel virtual address 0x%p", (void *) (uintptr_t) STAP_ARG_addr);
+            CONTEXT->last_error = CONTEXT->error_buffer;
+            goto out;
+        }
+        pfn = __pa(STAP_ARG_addr) >> PAGE_SHIFT;
 #ifdef for_each_online_node
 	for_each_online_node(nid)
 #else
@@ -153,7 +160,7 @@ probe vm.write_shared = kernel.function("do_wp_page") {
  *  The process attempting the write.
  *
  *  Fires when a write to a shared page requires a page copy.  This is
- *  always preceded by a vm.shared_write.
+ *  always preceded by a vm.write_shared.
  */
 probe vm.write_shared_copy =  kernel.function("cow_user_page") ?,
       kernel.function("copy_cow_page") ?

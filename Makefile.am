@@ -47,13 +47,24 @@ stap_SOURCES = main.cxx session.cxx \
 	tapset-perfmon.cxx tapset-mark.cxx tapset-itrace.cxx \
 	tapset-utrace.cxx task_finder.cxx dwflpp.cxx rpm_finder.cxx \
 	setupdwfl.cxx remote.cxx privilege.cxx cmdline.cxx \
-	tapset-dynprobe.cxx tapset-method.cxx
-stap_SOURCES += re2c-migrate/stapregex.cxx \
-	re2c-migrate/re2c-regex.cxx re2c-migrate/re2c-emit.cxx \
-	re2c-migrate/re2c-dfa.cxx re2c-migrate/re2c-globals.cxx
+	tapset-dynprobe.cxx tapset-method.cxx translator-output.cxx
+stap_SOURCES += stapregex.cxx stapregex-tree.cxx stapregex-parse.cxx \
+	stapregex-dfa.cxx
 noinst_HEADERS = sdt_types.h
 stap_LDADD = @stap_LIBS@ @sqlite3_LIBS@ @LIBINTL@ -lpthread
 stap_DEPENDENCIES =
+
+if HAVE_LIBVIRT
+if HAVE_LIBXML2
+bin_PROGRAMS += stapvirt
+stapvirt_SOURCES = stapvirt.c
+stapvirt_CFLAGS = $(AM_CFLAGS)
+stapvirt_CFLAGS += $(libvirt_CFLAGS) $(libxml2_CFLAGS)
+stapvirt_LDFLAGS = $(AM_LDFLAGS)
+stapvirt_LDADD = $(libvirt_LIBS) $(libxml2_LIBS)
+endif
+endif
+
 endif
 
 install: all
@@ -96,7 +107,7 @@ git_version.h:
 cscope:
 	cd $(srcdir) && \
 	(echo -q ; git ls-files '*.cxx' '*.c' '*.h' | grep -v '^testsuite' ) > cscope.files && \
-	cscope -b -q
+	cscope -b -q @DYNINST_CXXFLAGS@
 
 PHONIES =
 if BUILD_TRANSLATOR
@@ -310,7 +321,7 @@ if BUILD_SERVER
 	rm -f $(DESTDIR)$(localstatedir)/log/stap-server/log
 endif
 
-SUBDIRS = . java stapdyn staprun re2c-migrate doc man po
+SUBDIRS = . java stapdyn staprun doc man po
 # NB: the gcov target above uses this to enumarate linked binaries' build directories
 DIST_SUBDIRS = testsuite $(SUBDIRS)
 EXTRA_DIST = m4/ChangeLog

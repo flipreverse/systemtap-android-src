@@ -54,19 +54,6 @@ struct token
 std::ostream& operator << (std::ostream& o, const token& t);
 
 
-struct parse_error: public std::runtime_error
-{
-  const token* tok;
-  bool skip_some;
-  parse_error (const std::string& msg):
-    runtime_error (msg), tok (0), skip_some (true) {}
-  parse_error (const std::string& msg, const token* t):
-    runtime_error (msg), tok (t), skip_some (true) {}
-  parse_error (const std::string& msg, bool skip):
-    runtime_error (msg), tok (0), skip_some (skip) {}
-};
-
-
 typedef enum { ctx_library, ctx_local } macro_ctx;
 
 /* structs from session.h: */
@@ -86,10 +73,10 @@ struct macrodecl {
 };
 
 
-stapfile* parse (systemtap_session& s, std::istream& i, bool privileged);
-stapfile* parse (systemtap_session& s, const std::string& n, bool privileged);
+stapfile* parse (systemtap_session& s, std::istream& i, bool privileged, bool errs_as_warnings);
+stapfile* parse (systemtap_session& s, const std::string& n, bool privileged, bool errs_as_warnings);
 
-stapfile* parse_library_macros (systemtap_session& s, const std::string& n);
+stapfile* parse_library_macros (systemtap_session& s, const std::string& n, bool errs_as_warnings);
 
 #endif // PARSE_H
 

@@ -154,6 +154,15 @@
 #define pt_regs_store_register(pt_regs,regno,value) \
   (pt_regs->gpr[regno] = (value))
 
+#elif defined (__aarch64__)
+
+#undef pt_regs_fetch_register
+#undef pt_regs_store_register
+#define pt_regs_fetch_register(pt_regs,regno) \
+  ((long) pt_regs->regs[regno])
+#define pt_regs_store_register(pt_regs,regno,value) \
+  (pt_regs->regs[regno] = (value))
+
 #elif defined (__arm__)
 
 #undef pt_regs_fetch_register
@@ -178,6 +187,7 @@
 #if STP_SKIP_BADVARS
 #define DEREF_FAULT(addr) ({0; })
 #define STORE_DEREF_FAULT(addr) ({0; })
+#define CATCH_DEREF_FAULT() ({0; })
 #else
 #define DEREF_FAULT(addr) ({						    \
     snprintf(c->error_buffer, sizeof(c->error_buffer),			    \
@@ -192,7 +202,11 @@
     c->last_error = c->error_buffer;					    \
     goto deref_fault;							    \
     })
-#endif
 
+#define CATCH_DEREF_FAULT()				\
+  if (0) {						\
+deref_fault: ;						\
+  }
+#endif
 
 #endif /* _LOC2C_RUNTIME_H_ */

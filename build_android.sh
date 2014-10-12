@@ -1,11 +1,11 @@
 #!/bin/bash
 
-BUILD_PREFIX="/data/data/edu.udo.cs.ess.systemtap/stap/"
-FLAGS="-static -DANDROID"
+BUILD_PREFIX="/data/data/com.systemtap.android/stap/"
+FLAGS="-DANDROID"
 OUTPUT_DIR="android_binaries"
 STAPIO_BIN="staprun/stapio"
 STAPRUN_BIN="staprun/staprun"
-COMPILER_PREFIX_LIST=("arm-none-linux-gnueabi")
+COMPILER_PREFIX_LIST=("arm-linux-androideabi")
 
 #export PATH="/usr/local/CodeSourcery/Sourcery_G++_Lite/bin:$PATH"
 

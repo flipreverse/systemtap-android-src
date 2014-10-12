@@ -189,7 +189,7 @@ set restricted_probe_types [list \
   "module(string).statement(string)" \
   "perf.type(number).config(number)" \
   "perf.type(number).config(number).sample(number)" \
-  "perf.type(number).config(number).sample(number).counter(string)" \
+  "perf.type(number).config(number).counter(string)" \
   "perf.type(number).config(number).process" \
   "perf.type(number).config(number).process(string)" \
   "perf.type(number).config(number).process(string).counter(string)" \
@@ -329,8 +329,15 @@ proc test_unrestricted_probes { privilege } {
 	}
 	set use_alias [lindex $no_yes $selector]
 
-	#  .plt is only supported on x86
-	if {[regexp "\.plt" $probe_type] && ![regexp "^(x86_64|i.86)$" $::tcl_platform(machine)]} {
+	#  .plt is only supported on certain arches
+	if {[regexp "\.plt" $probe_type] && ! [plt_probes_p]} {
+	    untested "$test: $option $probe_type"
+	    set tested($probe_type) 1
+	    continue
+	}
+
+	# java support is optional
+	if {[regexp "^java" $probe_type] && ! [java_p]} {
 	    untested "$test: $option $probe_type"
 	    set tested($probe_type) 1
 	    continue
@@ -349,13 +356,21 @@ proc test_unrestricted_probes { privilege } {
 	    process.function(string).return -
 	    process.library(string).function(number).return -
 	    process.library(string).function(string).return -
-	    process(number).statement(number).absolute.return -
 	    process(string).function(number).return -
 	    process(string).function(string).return -
 	    process(string).library(string).function(number).return -
 	    process(string).library(string).function(string).return
 	    {
 		if {![uretprobes_p]} { setup_kfail URETPROBES *-*-* }
+	    }
+	    process(number).statement(number).absolute.return
+	    {
+		if {![uretprobes_p]} { setup_kfail URETPROBES *-*-* }
+		if {[inode_uprobes_p]} { setup_kfail INODE_UPROBES *-*-* }
+	    }
+	    process(number).statement(number).absolute
+	    {
+		if {[inode_uprobes_p]} { setup_kfail INODE_UPROBES *-*-* }
 	    }
 	}
 

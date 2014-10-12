@@ -39,9 +39,9 @@ expect {
 }
 
 # Kill both of the spawned processes
-catch {exec kill -INT -[exp_pid -i $firstid]}
+catch {exec kill -INT -- -[exp_pid -i $firstid]}
 catch {close -i $firstid}; catch {wait -i $firstid}
-catch {exec kill -INT -[exp_pid -i $secondid]}
+catch {exec kill -INT -- -[exp_pid -i $secondid]}
 catch {close -i $secondid}; catch {wait -i $secondid}
 
 if {$failed1 || $failed2} {
@@ -93,10 +93,10 @@ set secondid $spawn_id
 # Make sure the second staprun fails
 expect {
 	-timeout 60
-	-re {^Error inserting module .*: File exists\r\n} {
+	-re {^ERROR: Couldn't insert module .*: File exists\r\n} {
 		exp_continue
 	}
-	-re {^Rerun with staprun option '\-R' to rename this module.\r\n} {
+	-re {^ERROR: Rerun with staprun option '\-R' to rename this module.\r\n} {
 		exp_continue
 	}
 	-re {^[^\r\n]*\r\n} {
@@ -107,9 +107,9 @@ expect {
 }
 
 # Kill both of the spawned processes
-catch {exec kill -INT -[exp_pid -i $firstid]}
+catch {exec kill -INT -- -[exp_pid -i $firstid]}
 catch {close -i $firstid}; catch {wait -i $firstid}
-catch {exec kill -INT -[exp_pid -i $secondid]}
+catch {exec kill -INT -- -[exp_pid -i $secondid]}
 catch {close -i $secondid}; catch {wait -i $secondid}
 
 if {$failed1 || $failed2} {
@@ -148,9 +148,9 @@ expect {
 }
 
 # Kill both of the spawned processes
-catch {exec kill -INT -[exp_pid -i $firstid]}
+catch {exec kill -INT -- -[exp_pid -i $firstid]}
 catch {close -i $firstid}; catch {wait -i $firstid}
-catch {exec kill -INT -[exp_pid -i $secondid]}
+catch {exec kill -INT -- -[exp_pid -i $secondid]}
 catch {close -i $secondid}; catch {wait -i $secondid}
 
 if {$failed1 || $failed2} {

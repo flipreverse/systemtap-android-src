@@ -21,10 +21,8 @@
 
 /* The module-renaming facility only works with new enough
    elfutils: 0.142+. */
-#ifdef HAVE_LIBELF_H
 #include <libelf.h>
 #include <gelf.h>
-#endif
 
 #include <math.h>
 
@@ -115,7 +113,7 @@ int insert_module(
 	   point on to avoid TOCTOU problems. */
 	module_fd = open(module_realpath, O_RDONLY);
 	if (module_fd < 0) {
-		perr("Error opening '%s'", module_realpath);
+		perr("Couldn't open '%s'", module_realpath);
 		free(opts);
 		return -1;
 	}
@@ -200,7 +198,6 @@ int insert_module(
 	return 0;
 }
 
-#ifdef HAVE_ELF_GETSHDRSTRNDX
 static Elf_Scn *
 find_section_in_module(const void* module_file, const __off_t st_size, const char *section_name)
 {
@@ -239,12 +236,10 @@ find_section_in_module(const void* module_file, const __off_t st_size, const cha
   	}
 	return scn;
 }
-#endif /* HAVE_ELF_GETSHDRSTRNDX */
 
 int
 rename_module(void* module_file, const __off_t st_size)
 {
-#ifdef HAVE_ELF_GETSHDRSTRNDX
 	int length_to_replace;
 	char newname[MODULE_NAME_LEN];
 	char *p;
@@ -302,14 +297,6 @@ rename_module(void* module_file, const __off_t st_size)
 	}
 	_err("Could not find old name to replace!\n");
 	return -1;
-#else
-        /* Old or no elfutils?  Pretend to have renamed.  This means a
-           greater likelihood for module-name collisions, but so be
-           it. */
-        (void) module_file;
-        (void) st_size;
-        return 0; 
-#endif
 }
 
 
@@ -489,7 +476,7 @@ check_stap_module_path(const char *module_path, int module_fd)
 		 * checked the length of the resulting string.  */
 		strcat(staplib_dir_realpath, "/");
 	else {
-		err("ERROR: Path \"%s\" is too long.", staplib_dir_realpath);
+		err("Path \"%s\" is too long.", staplib_dir_realpath);
 		return -1;
 	}
 
@@ -505,7 +492,7 @@ check_stap_module_path(const char *module_path, int module_fd)
 	}
 	/* Make sure it is a directory. */
 	if (! S_ISDIR(sb.st_mode)) {
-		err("ERROR: Members of the \"stapusr\" and \"stapsys\" groups can only use unsigned modules within\n"
+		err("Members of the \"stapusr\" and \"stapsys\" groups can only use unsigned modules within\n"
 		    "  the \"%s\" directory.\n"
 		    "  That path must refer to a directory.\n",
 		    staplib_dir_path);
@@ -513,7 +500,7 @@ check_stap_module_path(const char *module_path, int module_fd)
 	}
 	/* Make sure it is owned by root. */
 	if (sb.st_uid != 0) {
-		err("ERROR: Members of the \"stapusr\" and \"stapsys\" groups can only use unsigned modules within\n"
+		err("Members of the \"stapusr\" and \"stapsys\" groups can only use unsigned modules within\n"
 		    "  the \"%s\" directory.\n"
 		    "  That directory should be owned by root.\n",
 		    staplib_dir_path);
@@ -521,7 +508,7 @@ check_stap_module_path(const char *module_path, int module_fd)
 	}
 	/* Make sure it isn't world writable. */
 	if (sb.st_mode & S_IWOTH) {
-		err("ERROR: Members of the \"stapusr\" and \"stapsys\" groups can only use unsigned modules within\n"
+		err("Members of the \"stapusr\" and \"stapsys\" groups can only use unsigned modules within\n"
 		    "  the \"%s\" directory.\n"
 		    "  That directory should not be world writable.\n",
 		    staplib_dir_path);
@@ -532,7 +519,7 @@ check_stap_module_path(const char *module_path, int module_fd)
 	 * module_path starts with staplib_dir_realpath. */
 	if (strncmp(staplib_dir_realpath, module_path,
 		    strlen(staplib_dir_realpath)) != 0) {
-		err("ERROR: Members of the \"stapusr\" and \"stapsys\" groups can only use unsigned modules within\n"
+		err("Members of the \"stapusr\" and \"stapsys\" groups can only use unsigned modules within\n"
 		    "  the \"%s\" directory.\n"
 		    "  Module \"%s\" does not exist within that directory.\n",
 		    staplib_dir_path, module_path);
@@ -541,17 +528,17 @@ check_stap_module_path(const char *module_path, int module_fd)
 
 	/* Validate the module permisions. */
 	if (fstat(module_fd, &sb) < 0) {
-		perr("Error getting information on the module\"%s\"", module_path);
+		perr("Couldn't get information on the module\"%s\"", module_path);
 		return -1;
 	}
 	/* Make sure it is owned by root. */
 	if (sb.st_uid != 0) {
-		err("ERROR: The module \"%s\" must be owned by root.\n", module_path);
+		err("The module \"%s\" must be owned by root.\n", module_path);
 		rc = -1;
 	}
 	/* Make sure it isn't world writable. */
 	if (sb.st_mode & S_IWOTH) {
-		err("ERROR: The module \"%s\" must not be world writable.\n", module_path);
+		err("The module \"%s\" must not be world writable.\n", module_path);
 		rc = -1;
 	}
 
@@ -587,22 +574,6 @@ static privilege_t get_module_required_credentials (
   const __off_t st_size __attribute__ ((unused))
 )
 {
-#ifndef HAVE_ELF_GETSHDRSTRNDX
-  /* Without the proper ELF support, we can't determine the credentials required to run this
-     module. However, we know that it has been correctly signed (we only check privilege
-     credentials for correctly signed modules). It is therefore either
-       a) a dual-privilege-level era module compiled with stapusr privileges enforced or,
-       b) a multi-privilege-level era module with built-in privilege level checking.
-     In either case, we can load it for stapusr level users and above. In case a, it requires
-     exactly that privilege level. In case b, the module will self check against the user's
-     actual privilege level.
-  */
-  if (verbose >= 1) {
-    err ("Unable to determine the privilege level required for the module %s. Assuming %s.\n",
-	 module_path, pr_name (pr_stapusr));
-  }
-  return pr_stapusr;
-#else
   Elf_Scn *scn = 0;
   Elf_Data *data = 0;
   GElf_Shdr shdr;
@@ -617,9 +588,9 @@ static privilege_t get_module_required_credentials (
   scn = find_section_in_module (module_file, st_size, STAP_PRIVILEGE_SECTION);
   if (! scn) {
     if (verbose >= 1) {
-      err ("Section name \"%s\" not found in module %s.\n", STAP_PRIVILEGE_SECTION,
+      eprintf ("Section name \"%s\" not found in module %s.\n", STAP_PRIVILEGE_SECTION,
 	   module_path);
-      err ("Assuming required privilege level of %s.\n", pr_name (pr_stapusr));
+      eprintf ("Assuming required privilege level of %s.\n", pr_name (pr_stapusr));
     }
     return pr_stapusr;
   }
@@ -630,9 +601,9 @@ static privilege_t get_module_required_credentials (
      Get the section header. */
   if (gelf_getshdr (scn, & shdr) == NULL) {
     if (verbose >= 1) {
-      err ("Error getting section header from section %s in module %s.\n", STAP_PRIVILEGE_SECTION,
+      eprintf ("Error getting section header from section %s in module %s.\n", STAP_PRIVILEGE_SECTION,
 	   module_path);
-      err ("Assuming required privilege level of %s.\n", pr_name (pr_highest));
+      eprintf ("Assuming required privilege level of %s.\n", pr_name (pr_highest));
     }
     return pr_highest;
   }
@@ -640,9 +611,9 @@ static privilege_t get_module_required_credentials (
   /* The section should have at least one data item. */
   if (shdr.sh_size < 1) {
     if (verbose >= 1) {
-      err ("Section header from section %s in module %s has no items\n", STAP_PRIVILEGE_SECTION,
+      eprintf ("Section header from section %s in module %s has no items\n", STAP_PRIVILEGE_SECTION,
 	   module_path);
-      err ("Assuming required privilege level of %s.\n", pr_name (pr_highest));
+      eprintf ("Assuming required privilege level of %s.\n", pr_name (pr_highest));
     }
     return pr_highest;
   }
@@ -650,9 +621,9 @@ static privilege_t get_module_required_credentials (
   /* The first data item contains the privilege requirement of the module. */
   if ((data = elf_getdata (scn, data)) == NULL) {
     if (verbose >= 1) {
-      err ("Error getting data from section %s in module %s\n", STAP_PRIVILEGE_SECTION,
+      eprintf ("Error getting data from section %s in module %s\n", STAP_PRIVILEGE_SECTION,
 	   module_path);
-      err ("Assuming required privilege level of %s.\n", pr_name (pr_highest));
+      eprintf ("Assuming required privilege level of %s.\n", pr_name (pr_highest));
     }
     return pr_highest;
   }
@@ -660,9 +631,9 @@ static privilege_t get_module_required_credentials (
   /* Make sure the data is the correct size. */
   if (data->d_size != sizeof (privilege)) {
     if (verbose >= 1) {
-      err ("Data in section %s is in module %s not the correct size\n", STAP_PRIVILEGE_SECTION,
+      eprintf ("Data in section %s is in module %s not the correct size\n", STAP_PRIVILEGE_SECTION,
 	   module_path);
-      err ("Assuming required privilege level of %s.\n", pr_name (pr_highest));
+      eprintf ("Assuming required privilege level of %s.\n", pr_name (pr_highest));
     }
     return pr_highest;
   }
@@ -678,7 +649,7 @@ static privilege_t get_module_required_credentials (
     break; /* ok */
   default:
     if (verbose >= 1) {
-      err ("Unknown privilege data, 0x%x in section %s in module %s\n",
+      eprintf ("Unknown privilege data, 0x%x in section %s in module %s\n",
 	   (int)privilege, STAP_PRIVILEGE_SECTION, module_path);
       err ("Assuming required privilege level of %s.\n", pr_name (pr_highest));
     }
@@ -687,7 +658,6 @@ static privilege_t get_module_required_credentials (
 
   /* ALl is ok. Return the extracted privilege data. */
   return privilege;
-#endif /* HAVE_ELF_GETSHDRSTRNDX */
 }
 
 /*
@@ -735,7 +705,7 @@ check_groups (
     }
 
     /* Our credentials are insufficient to load this module. */
-    err("ERROR: Your privilege credentials (%s) are insufficient to load the module %s (%s required)\n",
+    err("Your privilege credentials (%s) are insufficient to load the module %s (%s required)\n",
 	pr_name (user_credentials), module_path, pr_name (module_required_credentials));
 
     if (user_credentials == pr_none)
@@ -796,13 +766,13 @@ void assert_stap_module_permissions(
 		/* ... like overriding the real UID */
 		const char *env_id = getenv("SYSTEMTAP_REAL_UID");
 		if (env_id && setreuid(atoi(env_id), -1))
-			err("WARNING: couldn't set staprun UID to '%s': %s",
+			warn("Couldn't set staprun UID to '%s': %s",
 					env_id, strerror(errno));
 
 		/* ... or overriding the real GID */
 		env_id = getenv("SYSTEMTAP_REAL_GID");
 		if (env_id && setregid(atoi(env_id), -1))
-			err("WARNING: couldn't set staprun GID to '%s': %s",
+			warn("Couldn't set staprun GID to '%s': %s",
 					env_id, strerror(errno));
 
 		if (user_credentials)
@@ -819,7 +789,7 @@ void assert_stap_module_permissions(
 
 	/* Are we are an ordinary user?.  */
 	if (check_groups_rc == -2) {
-		err("ERROR: You are trying to run systemtap as a normal user.\n"
+		err("You are trying to run systemtap as a normal user.\n"
 		    "You should either be root, or be part of "
 		    "group \"stapusr\" and possibly the groups \"stapsys\" or \"stapdev\".\n");
 	}
@@ -871,7 +841,7 @@ void assert_uprobes_module_permissions(
 
 	/* Check permissions for group membership.  */
 	if (check_groups_rc == -2) {
-		err("ERROR: You are trying to load the module %s as a normal user.\n"
+		err("You are trying to load the module %s as a normal user.\n"
 		    "You should either be root, or be part of "
 		    "group \"stapusr\" and possibly the groups \"stapsys\" or \"stapdev\".\n",
 		    module_path);

@@ -14,6 +14,9 @@
 #include <set>
 #include <iomanip>
 #include <map>
+#include <algorithm>
+#include <limits>
+
 extern "C" {
 #if ENABLE_NLS
 #include <libintl.h>
@@ -40,6 +43,11 @@ extern "C" {
 #define _F(format, ...) autosprintf(_(format), __VA_ARGS__)
 #define _NF(format, format_plural, count, ...) \
         autosprintf(_N((format), (format_plural), (count)), __VA_ARGS__)
+#define _STRINGIFY_MORE(s) #s
+#define _STRINGIFY(s) _STRINGIFY_MORE(s)
+#define ERR_SRC (std::string(__FUNCTION__) + ":" + _STRINGIFY(__LINE__))
+#define SEMANTIC_ERROR(...) semantic_error(ERR_SRC, __VA_ARGS__)
+#define PARSE_ERROR(...) parse_error(ERR_SRC, __VA_ARGS__)
 
 const char *get_home_directory(void);
 size_t get_file_size(const std::string &path);
@@ -57,6 +65,7 @@ void tokenize(const std::string& str, std::vector<std::string>& tokens,
 void tokenize_full(const std::string& str, std::vector<std::string>& tokens,
 	      const std::string& delimiters);
 void tokenize_cxx(const std::string& str, std::vector<std::string>& tokens);
+std::vector<std::pair<const char*,int> > split_lines(const char *buf, size_t n);
 std::string find_executable(const std::string& name);
 std::string find_executable(const std::string& name,
 			    const std::string& sysroot,
@@ -235,12 +244,23 @@ class save_and_restore
     ~save_and_restore() { *ptr = previous_value; }
 };
 
+template <typename T>
+inline bool vector_has(std::vector<T>& v, T item)
+{
+  return std::find(v.begin(), v.end(), item) != v.end();
+}
 
 // Returns whether a string starts with the given prefix
 inline bool
 startswith(const std::string & s, const char * prefix)
 {
   return (s.compare(0, std::strlen(prefix), prefix) == 0);
+}
+
+inline bool
+startswith(const std::string & s, const std::string & prefix)
+{
+  return (s.compare(0, prefix.length(), prefix) == 0);
 }
 
 
@@ -268,6 +288,10 @@ struct stap_sigmasker {
         sigaddset (&mask, SIGTERM);
         sigprocmask (SIG_BLOCK, &mask, &old);
       }
+    stap_sigmasker(const sigset_t *mask)
+      {
+        sigprocmask (SIG_BLOCK, mask, &old);
+      }
     ~stap_sigmasker()
       {
         sigprocmask (SIG_SETMASK, &old, NULL);
@@ -288,6 +312,30 @@ resolve_path(const std::string& path)
   return result;
 }
 
+// Used in levenshtein
+template<typename T>
+class Array2D
+{
+  private:
+    T * data;
+  public:
+    const unsigned width;
+    const unsigned height;
+    T& operator() (unsigned x, unsigned y) { return data[y*width + x]; }
+    Array2D(const unsigned w, const unsigned h) : width(w), height(h) { data = new T[w*h]; }
+    ~Array2D() { delete [] data; }
+};
+
+// String sorter using the Levenshtein algorithm
+unsigned levenshtein(const std::string& a, const std::string& b);
+
+// Returns comma-separated list of set elements closest to the target string.
+// Print a maximum amount of 'max' elements, with a maximum levenshtein score
+// of 'threshold'.
+std::string levenshtein_suggest(const std::string& target,
+                                const std::set<std::string>& elems,
+                                unsigned max = std::numeric_limits<unsigned>::max(),
+                                unsigned threshold = std::numeric_limits<unsigned>::max());
 
 #ifndef HAVE_PPOLL
 // This is a poor-man's ppoll; see the implementation for more details...

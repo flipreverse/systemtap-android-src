@@ -50,6 +50,7 @@ expect {
 		pass "string function arguments -- $tag"
 	    }
 	    timeout {fail "string function arguments -- $tag"}
+	    eof {fail "string function arguments -- $tag"}
 	}
     }
     -re "semantic error:" {
@@ -58,6 +59,6 @@ expect {
     timeout {fail "all function arguments tests - timeout"}
     eof {fail "function arguments -- $tag: unexpected timeout"}
 }
-exec kill -INT -[exp_pid]
+exec kill -INT -- -[exp_pid]
 catch close
 wait

@@ -24,7 +24,7 @@ proc run_conv_test {filename} {
 	}
 	verbose -log "done exp $test $errs"
 	catch {close}; catch {wait}
-	if {$errs == 18} { pass $test } else { fail "$test ($errs)" }
+	if {$errs == 22} { pass $test } else { fail "$test ($errs)" }
 	verbose -log "done $test $errs"
     }
 }
@@ -44,8 +44,7 @@ if {! [catch {exec stap -l "kernel.trace(\"sched_switch\")"} dummy]} {
 run_conv_test $srcdir/$subdir/conversions_profile.stp
 
 # Test memory accesses from perf probes (if we've got perf probes).
-set path "/proc/kallsyms"
-if {! [catch {exec grep -q perf_event_create_kernel_counter $path} dummy]} {
+if {[perf_probes_p]} {
     run_conv_test $srcdir/$subdir/conversions_perf.stp
 } else {
     untested "conversions_perf.stp"

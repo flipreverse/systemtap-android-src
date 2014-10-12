@@ -88,12 +88,12 @@ static int run_as(int exec_p, uid_t uid, gid_t gid, const char *path, char *cons
 
 	if (verbose >= 2) {
 		int i = 0;
-		err(exec_p ? "execing: ": "spawning: ");
+		eprintf(exec_p ? "execing: ": "spawning: ");
 		while (argv[i]) {
-			err("%s ", argv[i]);
+			eprintf("%s ", argv[i]);
 			i++;
 		}
-		err("\n");
+		eprintf("\n");
 	}
 
         if (exec_p)
@@ -175,25 +175,45 @@ static int enable_uprobes(void)
             (rc == -EEXIST)) /* Someone else might have loaded it */
 		return 0;
 
-        err("Error inserting module '%s': %s\n", runtimeko, moderror(errno));
+        err("Couldn't insert module '%s': %s\n", runtimeko, moderror(errno));
 	return 1; /* failure */
 }
 
 static int insert_stap_module(privilege_t *user_credentials)
 {
 	char special_options[128];
+        int rc, fips_mode_fd;
+        char fips_mode = '0';
+        char *misc = "";
 
 	/* Add the _stp_bufsize option.  */
 	if (snprintf_chk(special_options, sizeof (special_options),
 			 "_stp_bufsize=%d", buffer_size))
 		return -1;
 
-	stap_module_inserted = insert_module(modpath, special_options,
-					     modoptions,
-					     assert_stap_module_permissions,
-					     user_credentials);
+        fips_mode_fd = open("/proc/sys/crypto/fips_enabled", O_RDONLY);
+        if (fips_mode_fd >= 0) {
+                char c;
+                rc = read(fips_mode_fd, &c, 1);
+                if (rc == 1) fips_mode = c;
+                close (fips_mode_fd);
+        }
+
+        /* In FIPS mode, a kernel may panic if given an improperly-signed module.
+           Right now, we have no way of signing them with the kernel build-time keys,
+           so we punt.  See also SecureBoot. */
+        if ((fips_mode != '0') && !getenv("STAP_FIPS_OVERRIDE")) {
+                errno = EPERM;
+                stap_module_inserted = -1;
+                misc = "in FIPS mode ";
+        } else {
+        	stap_module_inserted = insert_module(modpath, special_options,
+                                                     modoptions,
+                                                     assert_stap_module_permissions,
+                                                     user_credentials);
+        }
         if (stap_module_inserted != 0)
-                err("Error inserting module '%s': %s\n", modpath, moderror(errno));
+                err("Couldn't insert module %s'%s': %s\n", misc, modpath, moderror(errno));
 	return stap_module_inserted;
 }
 
@@ -242,7 +262,7 @@ static int remove_module(const char *name, int verb)
            the opens. */
         ret = init_ctl_channel (name, 0);
         if (ret < 0) {
-                err("Error, '%s' is not a zombie systemtap module.\n", name);
+                err("'%s' is not a zombie systemtap module.\n", name);
                 return ret;
         }
         close_ctl_channel ();
@@ -255,7 +275,7 @@ static int remove_module(const char *name, int verb)
                    diagnostic, but without an error.  Might it be
                    possible for the same module to be started up just
                    as we're shutting down?  */
-		err("Error removing module '%s': %s.\n", name, strerror(errno));
+		err("Couldn't remove module '%s': %s.\n", name, strerror(errno));
 		return 1;
 	}
 
@@ -333,12 +353,8 @@ int init_staprun(void)
                 disable_kprobes_optimization();
 
 		if (insert_stap_module(& user_credentials) < 0) {
-#ifdef HAVE_ELF_GETSHDRSTRNDX
 			if(!rename_mod && errno == EEXIST)
 				err("Rerun with staprun option '-R' to rename this module.\n");
-#endif
-                        /* Without a working rename_module(), we shan't
-                           advise people to use -R. */
 			return -1;
 		}
 		rc = init_ctl_channel (modname, 0);
@@ -398,7 +414,7 @@ int main(int argc, char **argv)
            The -F option is only for stapio, but the overzealous quest
            for commonality doesn't let us express that nicer. */
         if (relay_basedir_fd >= 0) {
-                err(_("ERROR: relay basedir -F option is invalid for staprun\n"));
+                err(_("Relay basedir -F option is invalid for staprun\n"));
                 exit(1);
         }
         /* NB: later on, some of our own code may set relay_basedir_fd, for
@@ -416,7 +432,7 @@ int main(int argc, char **argv)
 
 	if (optind < argc) {
 		if (attach_mod) {
-			err("ERROR: Cannot have module options with attach (-A).\n");
+			err("Cannot have module options with attach (-A).\n");
 			usage(argv[0]);
 		} else {
 			unsigned start_idx = 0;
@@ -427,12 +443,12 @@ int main(int argc, char **argv)
 	}
 
 	if (modpath == NULL || *modpath == '\0') {
-		err("ERROR: Need a module name or path to load.\n");
+		err("Need a module name or path to load.\n");
 		usage(argv[0]);
 	}
 
 	if (geteuid() != 0) {
-		err("ERROR: The effective user ID of staprun must be set to the root user.\n"
+		err("The effective user ID of staprun must be set to the root user.\n"
 		    "  Check permissions on staprun and ensure it is a setuid root program.\n");
 		exit(1);
 	}

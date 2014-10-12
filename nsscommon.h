@@ -43,6 +43,8 @@ void nssCleanup (const char *db_path);
 void nsscommon_error (const char *msg, INIT(int logit, 1));
 void nssError (void);
 
+PRInt32 PR_Read_Complete (PRFileDesc *fd, void *buf, PRInt32 requestedBytes);
+
 #if defined(c_plusplus) || defined(__cplusplus)
 }
 #endif
@@ -54,6 +56,7 @@ void nssError (void);
 const char *server_cert_nickname ();
 std::string server_cert_db_path ();
 std::string local_client_cert_db_path ();
+std::string add_cert_db_prefix (const std::string &db_path);
 
 void nsscommon_error (const std::string &msg, int logit = 1);
 

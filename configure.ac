@@ -1,7 +1,7 @@
 dnl configure.ac --- autoconf input file for systemtap
 dnl Process this file with autoconf to produce a configure script.
 
-AC_INIT([systemtap], 2.3, systemtap@sourceware.org, systemtap)
+AC_INIT([systemtap], 2.5, systemtap@sourceware.org, systemtap)
 dnl                  ^^^ see also NEWS, systemtap.spec, testsuite/configure.ac
 dnl                      doc/SystemTap_Beginners_Guide/en-US/Book_Info.xml
 
@@ -16,7 +16,7 @@ AM_MAINTAINER_MODE
 m4_ifdef([AM_SILENT_RULES],[AM_SILENT_RULES([yes])])
 
 AC_USE_SYSTEM_EXTENSIONS
-AM_PROG_MKDIR_P
+AC_PROG_MKDIR_P
 AC_SUBST(MKDIR_P)
 AC_PROG_LN_S
 AC_PROG_CC
@@ -33,7 +33,7 @@ AC_SUBST(CFLAGS)
 AC_SUBST(CXXFLAGS)
 AC_SYS_LARGEFILE
 AM_GNU_GETTEXT(external)
-AM_GNU_GETTEXT_VERSION(0.17)
+AM_GNU_GETTEXT_VERSION([0.18.2])
 AC_CHECK_FUNCS(ppoll)
 AC_CHECK_FUNCS(openat)
 
@@ -153,7 +153,7 @@ sqlite3_LIBS=
 AS_IF([test "x$enable_sqlite" != xno],
   [AC_CHECK_LIB([sqlite3], [sqlite3_open],
     [AC_SUBST([sqlite3_LIBS], [-lsqlite3])
-     AC_DEFINE([HAVE_LIBSQLITE3], [1], [Define to 1 if you have the `sqlite3' library (-lsqlite3).])],
+     AC_DEFINE([HAVE_LIBSQLITE3], [1], [Define to 1 if you have the 'sqlite3' library (-lsqlite3).])],
     [if test "x$enable_sqlite" != xcheck; then
       AC_MSG_FAILURE([--enable-sqlite was given, but test for sqlite failed])
      fi])])
@@ -196,6 +196,8 @@ AC_ARG_ENABLE([docs],
     [enable building documentation (default on if latex etc. found).]),
   [enable_docs=$enableval],
   [enable_docs="check"])
+AC_CHECK_PROG(have_xvfb, xvfb-run, yes, no)
+AM_CONDITIONAL([HAVE_XVFB], [test "$have_xvfb" == "yes"])
 AC_CHECK_PROG(have_latex, latex, yes, no)
 AC_CHECK_PROG(have_dvips, dvips, yes, no)
 AC_CHECK_PROG(have_ps2pdf, ps2pdf, yes, no)
@@ -453,14 +455,11 @@ AC_MSG_NOTICE([stap will link $stap_LIBS])
 
 # staprun has more modest libelf needs
 if test $build_elfutils = no; then
-  AC_CHECK_HEADERS([libelf.h])
-
   save_LIBS="$LIBS"
   dnl this will only succeed with elfutils 0.142+
-  AC_CHECK_LIB(elf,elf_getshdrstrndx,[
-    AC_DEFINE([HAVE_ELF_GETSHDRSTRNDX],[1],[Define to 1 if libelf has elf_getshdrstrndx])
-    staprun_LIBS="$staprun_LIBS -lelf"
-  ])
+  AC_CHECK_LIB(elf,elf_getshdrstrndx,[],[
+    AC_MSG_FAILURE([libelf too old, need 0.142+])])
+  staprun_LIBS="$staprun_LIBS -lelf"
   LIBS="$save_LIBS"
 else
   # We built our own and staprun_LDFLAGS points at the install.
@@ -523,6 +522,20 @@ if test "$with_dyninst" != "no"; then
 fi
 AM_CONDITIONAL([HAVE_DYNINST], [test "${have_dyninst}" = "yes"])
 
+dnl Check for the libvirt and libxml2 devel packages
+
+dnl We require libvirt >= 1.0.2 because stapvirt relies on the
+dnl virDomainOpenChannel function, which was implemented in 1.0.2.
+PKG_CHECK_MODULES([libvirt], [libvirt >= 1.0.2], [
+   have_libvirt=yes
+   AC_DEFINE([HAVE_LIBVIRT],[1],[Define to 1 if libvirt development libraries are installed])
+   ], [have_libvirt=no])
+AM_CONDITIONAL([HAVE_LIBVIRT], [test "${have_libvirt}" = "yes"])
+PKG_CHECK_MODULES([libxml2], [libxml-2.0], [
+   have_libxml2=yes
+   AC_DEFINE([HAVE_LIBXML2],[1],[Define to 1 if libxml2 development libraries are installed])
+   ], [have_libxml2=no])
+AM_CONDITIONAL([HAVE_LIBXML2], [test "${have_libxml2}" = "yes"])
 
 AC_CACHE_CHECK([for assembler .section "?" flags support], stap_cv_sectionq, [
 old_CFLAGS="$CFLAGS"
@@ -584,6 +597,7 @@ if test $build_elfutils = yes -a $enable_translator = yes; then
 				--libdir="${here}/lib-elfutils" \
 				--exec-prefix="$exec_prefix" \
 				--prefix="$prefix" \
+				--enable-dwz \
 				${need_maintainer_option} \
 				CFLAGS="${CFLAGS/-Wall/} $gnu89_inline_flag -fexceptions" \
 				LDFLAGS="$LDFLAGS $elfutils_rpath" &&
@@ -678,7 +692,9 @@ AC_CONFIG_FILES(java/Makefile)
 AC_CONFIG_FILES([java/stapbm], [chmod +x java/stapbm])
 AC_CONFIG_FILES(staprun/Makefile)
 AC_CONFIG_FILES([staprun/run-staprun], [chmod +x staprun/run-staprun])
-AC_CONFIG_FILES(re2c-migrate/Makefile)
+AC_CONFIG_FILES([staprun/guest/stapshd], [chmod +x staprun/guest/stapshd])
+AC_CONFIG_FILES([staprun/guest/stapsh-daemon], [chmod +x staprun/guest/stapsh-daemon])
+AC_CONFIG_FILES([staprun/guest/stapsh@.service])
 
 # Setup "shadow" directory doc/beginners that has everything setup for
 # publican in one directory (through directory links if necessary).

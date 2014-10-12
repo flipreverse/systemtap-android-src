@@ -58,6 +58,17 @@ server_cert_nickname ()
 }
 
 string
+add_cert_db_prefix (const string &db_path) {
+#if (NSS_VMAJOR > 3) || (NSS_VMAJOR == 3 && NSS_VMINOR >= 12)
+  // Use the dbm prefix, if a prefix is not already specified,
+  // since we're using the old database format.
+  if (db_path.find (':') == string::npos)
+    return string("dbm:") + db_path;
+#endif
+  return db_path;
+}
+
+string
 server_cert_db_path ()
 {
   string data_path;
@@ -165,6 +176,8 @@ SECStatus
 nssInit (const char *db_path, int readWrite, int issueMessage)
 {
   SECStatus secStatus;
+  string full_db_path = add_cert_db_prefix (db_path);
+  db_path = full_db_path.c_str();
   if (readWrite)
     secStatus = NSS_InitReadWrite (db_path);
   else
@@ -193,6 +206,8 @@ nssCleanup (const char *db_path)
     {
       if (db_path)
 	{
+	  string full_db_path = add_cert_db_prefix (db_path);
+	  db_path = full_db_path.c_str();
 	  nsscommon_error (_F("WARNING: Attempt to shutdown NSS for database %s, which was never initialized", db_path));
 	}
       return;
@@ -203,7 +218,11 @@ nssCleanup (const char *db_path)
   if (NSS_Shutdown () != SECSuccess)
     {
       if (db_path)
-	nsscommon_error (_F("Unable to shutdown NSS for database %s", db_path));
+	{
+	  string full_db_path = add_cert_db_prefix (db_path);
+	  db_path = full_db_path.c_str();
+	  nsscommon_error (_F("Unable to shutdown NSS for database %s", db_path));
+	}
       else
 	nsscommon_error (_("Unable to shutdown NSS"));
       nssError ();
@@ -1280,6 +1299,8 @@ void sign_file (
 
   for (;;)
     {
+      // No need for PR_Read_Complete here, since we're already managing multiple
+      // reads to a fixed size buffer.
       numBytes = PR_Read (local_file_fd, buffer, sizeof (buffer));
       if (numBytes == 0)
 	break;	/* EOF */
@@ -1337,6 +1358,30 @@ void sign_file (
   CERT_DestroyCertificate (cert);
   if(local_file_fd != NULL)
     PR_Close (local_file_fd);
+}
+
+// PR_Read() is not guaranteed to read all of the requested data in one call.
+// Iterate until all of the requested data has been read.
+// Return the same values as PR_Read() would.
+PRInt32 PR_Read_Complete (PRFileDesc *fd, void *buf, PRInt32 requestedBytes)
+{
+  // Read until EOF or until the expected number of bytes has been read.
+  // PR_Read wants (void*), but we need (char *) to do address arithmetic.
+  char *buffer = (char *)buf;
+  PRInt32 totalBytes;
+  PRInt32 bytesRead;
+  for (totalBytes = 0; totalBytes < requestedBytes; totalBytes += bytesRead)
+    {
+      // Now read the data.
+      bytesRead = PR_Read (fd, (void *)(buffer + totalBytes), requestedBytes - totalBytes);
+      if (bytesRead == 0)
+	break;	// EOF
+      if (bytesRead < 0)
+	return bytesRead; // Error
+    }
+
+  // Return the number of bytes we managed to read.
+  return totalBytes;
 }
 
 /* vim: set sw=2 ts=8 cino=>4,n-2,{2,^-2,t0,(0,u0,w1,M1 : */

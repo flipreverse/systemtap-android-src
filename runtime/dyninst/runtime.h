@@ -12,6 +12,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdarg.h>
@@ -370,6 +371,12 @@ static int stp_dyninst_session_init_finished(void)
 void stp_dyninst_session_exit(void)
 {
     systemtap_module_exit();
+}
+
+static int _stp_exit_status = 0;
+int stp_dyninst_exit_status(void)
+{
+    return _stp_exit_status;
 }
 
 __attribute__((destructor))

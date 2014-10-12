@@ -359,6 +359,7 @@ compile_pass (systemtap_session& s)
   output_exportconf(s, o, "path_lookup", "STAPCONF_PATH_LOOKUP");
   output_exportconf(s, o, "kern_path_parent", "STAPCONF_KERN_PATH_PARENT");
   output_exportconf(s, o, "vfs_path_lookup", "STAPCONF_VFS_PATH_LOOKUP");
+  output_exportconf(s, o, "kern_path", "STAPCONF_KERN_PATH");
   output_exportconf(s, o, "proc_create_data", "STAPCONF_PROC_CREATE_DATA");
   output_exportconf(s, o, "PDE_DATA", "STAPCONF_PDE_DATA");
   output_autoconf(s, o, "autoconf-module-sect-attrs.c", "STAPCONF_MODULE_SECT_ATTRS", NULL);
@@ -368,6 +369,7 @@ compile_pass (systemtap_session& s)
   output_autoconf(s, o, "autoconf-vm-area-pte.c", "STAPCONF_VM_AREA_PTE", NULL);
   output_autoconf(s, o, "autoconf-relay-umode_t.c", "STAPCONF_RELAY_UMODE_T", NULL);
   output_autoconf(s, o, "autoconf-fs_supers-hlist.c", "STAPCONF_FS_SUPERS_HLIST", NULL);
+  output_autoconf(s, o, "autoconf-compat_sigaction.c", "STAPCONF_COMPAT_SIGACTION", NULL);
 
   // used by tapset/timestamp_monotonic.stp
   output_exportconf(s, o, "cpu_clock", "STAPCONF_CPU_CLOCK");
@@ -395,6 +397,11 @@ compile_pass (systemtap_session& s)
 
   output_autoconf(s, o, "autoconf-pagefault_disable.c", "STAPCONF_PAGEFAULT_DISABLE", NULL);
   output_exportconf(s, o, "kallsyms_lookup_name", "STAPCONF_KALLSYMS");
+  output_autoconf(s, o, "autoconf-uidgid.c", "STAPCONF_LINUX_UIDGID_H", NULL);
+  output_exportconf(s, o, "sigset_from_compat", "STAPCONF_SIGSET_FROM_COMPAT_EXPORTED");
+  output_exportconf(s, o, "vzalloc", "STAPCONF_VZALLOC");
+  output_exportconf(s, o, "vzalloc_node", "STAPCONF_VZALLOC_NODE");
+  output_exportconf(s, o, "vmalloc_node", "STAPCONF_VMALLOC_NODE");
 
   o << module_cflags << " += -include $(STAPCONF_HEADER)" << endl;
 
@@ -423,9 +430,9 @@ compile_pass (systemtap_session& s)
 
   // o << "CFLAGS += -fno-unit-at-a-time" << endl;
 
-  // 256 bytes should be enough for anybody
+  // 256^W512 bytes should be enough for anybody
   // XXX this doesn't validate varargs, per gcc bug #41633
-  o << "EXTRA_CFLAGS += $(call cc-option,-Wframe-larger-than=256)" << endl;
+  o << "EXTRA_CFLAGS += $(call cc-option,-Wframe-larger-than=512)" << endl;
 
   // Assumes linux 2.6 kbuild
   o << "EXTRA_CFLAGS += -Wno-unused" << (s.omit_werror ? "" : " -Werror") << endl;
@@ -665,6 +672,21 @@ make_dyninst_run_command (systemtap_session& s, const string& remotedir,
       cmd.push_back(lex_cast(s.target_pid));
     }
 
+  if (!s.output_file.empty())
+    {
+      cmd.push_back("-o");
+      cmd.push_back(s.output_file);
+    }
+
+  if (s.color_mode != s.color_auto)
+    {
+      cmd.push_back("-C");
+      if (s.color_mode == s.color_always)
+        cmd.push_back("always");
+      else
+        cmd.push_back("never");
+    }
+
   cmd.push_back((remotedir.empty() ? s.tmpdir : remotedir)
 		+ "/" + s.module_filename());
 
@@ -745,6 +767,15 @@ make_run_command (systemtap_session& s, const string& remotedir,
     {
       staprun_cmd.push_back("-S");
       staprun_cmd.push_back(s.size_option);
+    }
+
+  if (s.color_mode != s.color_auto)
+    {
+      staprun_cmd.push_back("-C");
+      if (s.color_mode == s.color_always)
+        staprun_cmd.push_back("always");
+      else
+        staprun_cmd.push_back("never");
     }
 
   staprun_cmd.push_back((remotedir.empty() ? s.tmpdir : remotedir)
