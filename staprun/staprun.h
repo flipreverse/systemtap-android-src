@@ -260,7 +260,7 @@ extern char *modpath;
 extern char *modoptions[MAXMODOPTIONS];
 extern int target_pid;
 extern char *target_cmd;
-xtern char *pidfile_name;
+extern char *pidfile_name;
 extern int target_namespaces_pid;
 extern char *outfile_name;
 extern int rename_mod;
