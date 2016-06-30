@@ -13,7 +13,8 @@
 // the function symbol of an address.
 // </tapsetdescription>
 
-function __ustack_raw (n:long) %{ /* pragma:unwind */ /* pure */ /* myproc-unprivileged */
+@__private30 function __ustack_raw:long (n:long) %{ /* pragma:unwind */ /* pure */
+         /* myproc-unprivileged */ /* pragma:uprobes */
          /* basic sanity check for bounds: */
          if (unlikely(STAP_ARG_n < 0 || STAP_ARG_n >= MAXBACKTRACE))
                   STAP_RETVALUE = 0;
@@ -171,3 +172,45 @@ function sprint_usyms (callers:string) {
          }
          return __foo
 }
+
+/**
+ * sfunction usymfileline - Return the file name and line number of an address.
+ * @addr: The address to translate.
+ *
+ * Description: Returns the file name and the (approximate) line number of the
+ * given address, if known. If the file name or the line number cannot be
+ * found, the hex string representation of the address will be returned.
+ */
+function usymfileline:string (addr:long) %{
+/* pure */ /* myproc-unprivileged */ /* pragma:symbols */ /* pragma:vma */ /* pragma:lines */
+  _stp_snprint_addr(STAP_RETVALUE, MAXSTRINGLEN, STAP_ARG_addr,
+                    _STP_SYM_LINENUMBER + _STP_SYM_FILENAME, current);
+%}
+
+/**
+ * sfunction usymfile - Return the file name of a given address.
+ * @addr: The address to translate.
+ *
+ * Description: Returns the file name of the  given address, if known. If the
+ * file name cannot be found, the hex string representation of the address
+ * will be returned.
+ */
+function usymfile:string (addr:long) %{
+/* pure */ /* myproc-unprivileged */ /* pragma:symbols */ /* pragma:vma */ /* pragma:lines */
+  _stp_snprint_addr(STAP_RETVALUE, MAXSTRINGLEN, STAP_ARG_addr,
+                    _STP_SYM_FILENAME, current);
+%}
+
+/**
+ * sfunction usymline - Return the line number of an address.
+ * @addr: The address to translate.
+ *
+ * Description: Returns the (approximate) line number of the given address, if
+ * known. If the line number cannot be found, the hex string representation of
+ * the address will be returned.
+ */
+function usymline:string (addr:long) %{
+/* pure */ /* myproc-unprivileged */ /* pragma:symbols */ /* pragma:vma */ /* pragma:lines */
+  _stp_snprint_addr(STAP_RETVALUE, MAXSTRINGLEN, STAP_ARG_addr,
+                    _STP_SYM_LINENUMBER, current);
+%}

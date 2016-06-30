@@ -1,6 +1,6 @@
 // scsi tapset
 // Copyright (C) 2005, 2006, 2009 IBM Corp.
-// Copyright (C) 2010 Red Hat
+// Copyright (C) 2014 Red Hat
 //
 // This file is part of systemtap, and is free software.  You can
 // redistribute it and/or modify it under the terms of the GNU General
@@ -56,11 +56,11 @@ function describe_device_state:string(state:long)
   * @req_addr: The current struct request pointer, as a number
   */
 probe scsi.ioentry.scsilib =
-      module("scsi_mod").function("scsi_prep_fn")!, kernel.function("scsi_prep_fn") { }
+      module("scsi_mod").function("scsi_prep_fn")!, kernel.function("scsi_prep_fn")? { }
 probe scsi.ioentry.sd =
-      module("sd_mod").function("sd_prep_fn")!, kernel.function("sd_prep_fn") { }
+      module("sd_mod").function("sd_prep_fn")!, kernel.function("sd_prep_fn")? { }
 probe scsi.ioentry.sr =
-      module("sr_mod").function("sr_prep_fn")!, kernel.function("sr_prep_fn") { }
+      module("sr_mod").function("sr_prep_fn")!, kernel.function("sr_prep_fn")? { }
 
 probe scsi.ioentry = scsi.ioentry.* ?
 {
@@ -93,8 +93,8 @@ probe scsi.ioentry = scsi.ioentry.* ?
  * @req_addr: The current struct request pointer, as a number
  */
 probe scsi.iodispatching
-	= module("scsi_mod").function("scsi_dispatch_cmd@drivers/scsi/scsi.c")!,
-	  kernel.function("scsi_dispatch_cmd@drivers/scsi/scsi.c")?
+	= module("scsi_mod").function("scsi_dispatch_cmd")!,
+	  kernel.function("scsi_dispatch_cmd")?
 {
 	host_no = $cmd->device->host->host_no
 	channel = $cmd->device->channel
@@ -126,15 +126,19 @@ probe scsi.iodispatching
  * @scsi_timer_pending: 1 if a timer is pending on this request
  */
 probe scsi.iodone
-	= module("scsi_mod").function("scsi_done@drivers/scsi/scsi.c")!,
-	  kernel.function("scsi_done@drivers/scsi/scsi.c")?
+	= kernel.trace("scsi_dispatch_cmd_done")!,
+	  module("scsi_mod").function("scsi_done")!,
+	  kernel.function("scsi_done")?
 
 {
-	host_no = $cmd->device->host->host_no
-	channel = $cmd->device->channel
-	lun = $cmd->device->lun
-	dev_id = $cmd->device->id
-	device_state = $cmd->device->sdev_state
+	# Why is the @cast() needed here? When the probe alias uses
+	# the "scsi_dispatch_cmd_done" tracepoint, the type info isn't
+	# in scope. 
+	host_no = @cast($cmd->device, "scsi_device", "kernel:scsi_mod")->host->host_no
+	channel = @cast($cmd->device, "scsi_device", "kernel:scsi_mod")->channel
+	lun = @cast($cmd->device, "scsi_device", "kernel:scsi_mod")->lun
+	dev_id = @cast($cmd->device, "scsi_device", "kernel:scsi_mod")->id
+	device_state = @cast($cmd->device, "scsi_device", "kernel:scsi_mod")->sdev_state
 	device_state_str = describe_device_state(device_state)
 	data_direction = $cmd->sc_data_direction
 	data_direction_str = describe_data_direction(data_direction)
@@ -158,8 +162,8 @@ probe scsi.iodone
  */
 // mid-layer processes the completed IO
 probe scsi.iocompleted
-	= module("scsi_mod").function("scsi_io_completion@drivers/scsi/scsi_lib.c")!,
-	  kernel.function("scsi_io_completion@drivers/scsi/scsi_lib.c")?
+	= module("scsi_mod").function("scsi_io_completion")!,
+	  kernel.function("scsi_io_completion")?
 {
 	host_no = $cmd->device->host->host_no
 	channel = $cmd->device->channel
@@ -211,8 +215,8 @@ function get_devstate_from_req:long(var:long)
  * @retries: Number of times to retry request
  */
 probe scsi.ioexecute
-	= module("scsi_mod").function("scsi_execute@drivers/scsi/scsi_lib.c")!,
-	  kernel.function("scsi_execute@drivers/scsi/scsi_lib.c")?
+	= module("scsi_mod").function("scsi_execute")!,
+	  kernel.function("scsi_execute")?
 {
 	host_no = $sdev->host->host_no
 	channel = $sdev->channel
@@ -240,8 +244,8 @@ probe scsi.ioexecute
  * @state_str: The new state of the device, as a string
  */
 probe scsi.set_state
-	= module("scsi_mod").function("scsi_device_set_state@drivers/scsi/scsi_lib.c")!,
-	  kernel.function("scsi_device_set_state@drivers/scsi/scsi_lib.c")?
+	= module("scsi_mod").function("scsi_device_set_state")!,
+	  kernel.function("scsi_device_set_state")?
 {
 	state = $state
 	state_str = describe_device_state(state)

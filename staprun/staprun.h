@@ -7,7 +7,7 @@
  * Public License (GPL); either version 2, or (at your option) any
  * later version.
  *
- * Copyright (C) 2005-2008 Red Hat Inc.
+ * Copyright (C) 2005-2016 Red Hat Inc.
  */
 #define _FILE_OFFSET_BITS 64
 
@@ -216,12 +216,27 @@ void stop_symbol_thread(void);
 /* common.c functions */
 int stap_strfloctime(char *buf, size_t max, const char *fmt, time_t t);
 void parse_args(int argc, char **argv);
-void usage(char *prog);
+void usage(char *prog, int rc);
 void parse_modpath(const char *);
 void setup_signals(void);
 int set_clexec(int fd);
 void create_pidfile(const char *pidfile_name);
 void delete_pidfile(const char *pidfile_name);
+int open_cloexec(const char *pathname, int flags, mode_t mode);
+#ifdef HAVE_OPENAT
+int openat_cloexec(int dirfd, const char *pathname, int flags, mode_t mode);
+#endif
+int pipe_cloexec(int pipefd[2]);
+void closefrom(int lowfd);
+
+/* monitor.c function */
+void monitor_winch(int signum);
+void monitor_setup(void);
+void monitor_cleanup(void);
+void monitor_render(void);
+void monitor_input(void);
+void monitor_exited(void);
+void monitor_remember_output_line(const char* buf, const size_t bytes);
 
 /*
  * variables
@@ -230,6 +245,9 @@ extern int control_channel;
 extern int ncpus;
 extern int initialized;
 extern int kernel_ptr_size;
+extern int monitor_pfd[2];
+extern int monitor_set;
+extern int monitor_end;
 
 /* flags */
 extern int verbose;
@@ -242,7 +260,8 @@ extern char *modpath;
 extern char *modoptions[MAXMODOPTIONS];
 extern int target_pid;
 extern char *target_cmd;
-extern char *pidfile_name;
+xtern char *pidfile_name;
+extern int target_namespaces_pid;
 extern char *outfile_name;
 extern int rename_mod;
 extern int attach_mod;
@@ -257,6 +276,8 @@ extern int remote_id;
 extern const char *remote_uri;
 extern int relay_basedir_fd;
 extern int color_errors;
+extern int monitor;
+extern int monitor_interval;
 
 typedef enum {color_never, color_auto, color_always} color_modes;
 extern color_modes color_mode;

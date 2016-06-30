@@ -14,8 +14,8 @@ AM_CPPFLAGS = -DBINDIR='"$(bindir)"' \
 	      -DLOCALEDIR='"$(localedir)"' \
 	      -I$(srcdir)/includes -I$(builddir)/includes/sys
 
-AM_CFLAGS = -D_GNU_SOURCE -fexceptions -Wall -Werror -Wunused -Wformat=2 -W
-AM_CXXFLAGS = -Wall -Werror
+AM_CFLAGS = -D_GNU_SOURCE -fexceptions -Wall -Wextra -Werror -Wunused -Wformat=2 -W
+AM_CXXFLAGS = -Wall -Wextra -Werror
 
 bin_SCRIPTS = stap-report
 pkglibexec_SCRIPTS = stap-env
@@ -47,22 +47,25 @@ stap_SOURCES = main.cxx session.cxx \
 	tapset-perfmon.cxx tapset-mark.cxx tapset-itrace.cxx \
 	tapset-utrace.cxx task_finder.cxx dwflpp.cxx rpm_finder.cxx \
 	setupdwfl.cxx remote.cxx privilege.cxx cmdline.cxx \
-	tapset-dynprobe.cxx tapset-method.cxx translator-output.cxx
-stap_SOURCES += stapregex.cxx stapregex-tree.cxx stapregex-parse.cxx \
-	stapregex-dfa.cxx
+	tapset-dynprobe.cxx tapset-method.cxx translator-output.cxx \
+        stapregex.cxx stapregex-tree.cxx stapregex-parse.cxx \
+	stapregex-dfa.cxx stringtable.cxx
 noinst_HEADERS = sdt_types.h
 stap_LDADD = @stap_LIBS@ @sqlite3_LIBS@ @LIBINTL@ -lpthread
 stap_DEPENDENCIES =
 
-if HAVE_LIBVIRT
-if HAVE_LIBXML2
+if HAVE_LIBREADLINE
+stap_SOURCES += interactive.cxx
+stap_LDADD += @READLINE_LIBS@
+endif
+
+if BUILD_VIRT
 bin_PROGRAMS += stapvirt
 stapvirt_SOURCES = stapvirt.c
 stapvirt_CFLAGS = $(AM_CFLAGS)
 stapvirt_CFLAGS += $(libvirt_CFLAGS) $(libxml2_CFLAGS)
 stapvirt_LDFLAGS = $(AM_LDFLAGS)
 stapvirt_LDADD = $(libvirt_LIBS) $(libxml2_LIBS)
-endif
 endif
 
 endif
@@ -112,7 +115,7 @@ cscope:
 PHONIES =
 if BUILD_TRANSLATOR
 stap_CFLAGS = $(AM_CFLAGS) @PIECFLAGS@
-stap_CXXFLAGS = $(AM_CXXFLAGS) @PIECXXFLAGS@
+stap_CXXFLAGS = $(AM_CXXFLAGS) @PIECXXFLAGS@ @cxx11@
 stap_CPPFLAGS = $(AM_CPPFLAGS) -DSTAP_SDT_V2
 stap_LDFLAGS = $(AM_LDFLAGS) @PIELDFLAGS@
 
@@ -367,6 +370,24 @@ update-po:
 	| grep -v staprun/config.h \
 	| sort > $(srcdir)/po/POTFILES.in
 	$(MAKE) -C po update-po
+	@echo
+	@echo if systemtam.pot is shown as modified ...
+	@echo
+	(cd $(srcdir)/po; git status *.pot)
+	@echo
+	@echo ... then check in with zanata ...
+	@echo
+	@echo % cd $(srcdir)
+	@echo % zanata-cli -B push -s po -t po
+	@echo % zanata-cli -B pull -s po -t po
+	@echo
+	@echo if the .po files are shown as modified ...
+	@echo
+	(cd $(srcdir)/po; git status *.po)
+	@echo
+	@echo ... regenerate just once ...
+	@echo
+	@echo % $(MAKE) -C `pwd` update-po
 
 
 # Any extra flags, such as:
@@ -390,6 +411,11 @@ dist-gzip:
 
 rpm: dist-gzip
 	if [ `id -u` = 0 ]; then echo NOTE: do not run this as root; exit 1; fi
+	if [ ! -w `rpm --eval %_topdir` ]; then \
+	  echo WARNING: you do not have access to `rpm --eval %_topdir`; \
+	  echo WARNING: you may receive a permission denied error; \
+	  echo WARNING: consider adding \'%_topdir $(HOME)/rpmbuild\' to $(HOME)/.rpmmacros; \
+	fi
 	mkdir -p `rpm --eval %_specdir`
 	mkdir -p `rpm --eval %_srcrpmdir`
 	mkdir -p `rpm --eval %_rpmdir`

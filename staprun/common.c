@@ -7,7 +7,7 @@
  * Public License (GPL); either version 2, or (at your option) any
  * later version.
  *
- * Copyright (C) 2007-2013 Red Hat Inc.
+ * Copyright (C) 2007-2015 Red Hat Inc.
  */
 
 #include "staprun.h"
@@ -16,13 +16,22 @@
 #include <sys/utsname.h>
 #include <assert.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <limits.h>
 #include "../git_version.h"
 #include "../version.h"
+
+#ifndef OPEN_MAX
+#define OPEN_MAX 256
+#endif
 
 /* variables needed by parse_args() */
 int verbose;
 int suppress_warnings;
 int target_pid;
+int target_namespaces_pid;
 unsigned int buffer_size;
 unsigned int reader_timeout_ms;
 char *target_cmd;
@@ -42,6 +51,8 @@ const char *remote_uri;
 int relay_basedir_fd;
 int color_errors;
 color_modes color_mode;
+int monitor;
+int monitor_interval;
 
 /* module variables */
 char *modname = NULL;
@@ -65,22 +76,6 @@ static char *get_abspath(char *path)
 	 * the length earlier to make sure the string would fit. */
 	strcpy(&path_buf[len + 1], path);
 	return path_buf;
-}
-
-int stap_strfloctime(char *buf, size_t max, const char *fmt, time_t t)
-{
-	struct tm tm;
-	size_t ret;
-	if (buf == NULL || fmt == NULL || max <= 1)
-		return -EINVAL;
-	localtime_r(&t, &tm);
-        /* NB: this following invocation is the reason for staprun's being built
-           with -Wno-format-nonliteral.  strftime parsing does not have security
-           implications AFAIK, but gcc still wants to check them.  */
-	ret = strftime(buf, max, fmt, &tm);
-	if (ret == 0)
-		return -EINVAL;
-	return (int)ret;
 }
 
 int make_outfile_name(char *buf, int max, int fnum, int cpu, time_t t, int bulk)
@@ -122,6 +117,7 @@ void parse_args(int argc, char **argv)
 	verbose = 0;
 	suppress_warnings = 0;
 	target_pid = 0;
+	target_namespaces_pid = 0;
 	buffer_size = 0;
         reader_timeout_ms = 0;
 	target_cmd = NULL;
@@ -135,6 +131,8 @@ void parse_args(int argc, char **argv)
 	daemon_mode = 0;
 	fsize_max = 0;
 	fnum_max = 0;
+	monitor = 0;
+        monitor_interval = 1;
         remote_id = -1;
         remote_uri = NULL;
         relay_basedir_fd = -1;
@@ -142,7 +140,7 @@ void parse_args(int argc, char **argv)
         color_errors = isatty(STDERR_FILENO)
                 && strcmp(getenv("TERM") ?: "notdumb", "dumb");
 
-	while ((c = getopt(argc, argv, "ALu::vb:t:dc:o:x:S:DwRr:VT:M:C:"
+	while ((c = getopt(argc, argv, "ALu::vhb:t:dc:o:x:N:S:DwRr:VT:M:C:U:"
 #ifdef HAVE_OPENAT
                            "F:"
 #endif
@@ -163,13 +161,21 @@ void parse_args(int argc, char **argv)
 			buffer_size = (unsigned)atoi(optarg);
 			if (buffer_size < 1 || buffer_size > 4095) {
 				err(_("Invalid buffer size '%d' (should be 1-4095).\n"), buffer_size);
-				usage(argv[0]);
+				usage(argv[0],1);
 			}
 			break;
 		case 't':
 		case 'x':
 			target_pid = atoi(optarg);
 			break;
+    case 'N':
+      target_namespaces_pid = atoi(optarg);
+      // error out if it's obviously and invalid pid
+      if (target_namespaces_pid < 1) {
+        err(_("Invalid target namespaces pid %d (should be > 0).\n"), target_namespaces_pid);
+				usage(argv[0],1);
+      }
+      break;
 		case 'd':
 			/* delete module */
 			delete_mod = 1;
@@ -177,7 +183,7 @@ void parse_args(int argc, char **argv)
 		case 'c':
 			target_cmd = optarg;
 			break;
-		case 'M':
+		case 'U':
 			pidfile_name = optarg;
 			break;
 		case 'o':
@@ -199,7 +205,7 @@ void parse_args(int argc, char **argv)
 			relay_basedir_fd = atoi(optarg);
 			if (relay_basedir_fd < 0) {
 				err(_("Invalid file descriptor option '%s'.\n"), optarg);
-				usage(argv[0]);
+				usage(argv[0],1);
 			}
 			break;
 		case 'S':
@@ -210,7 +216,7 @@ void parse_args(int argc, char **argv)
 				fnum_max = (int)strtoul(&s[1], &s, 10);
 			if (s[0] != '\0') {
 				err(_("Invalid file size option '%s'.\n"), optarg);
-				usage(argv[0]);
+				usage(argv[0],1);
 			}
 			break;
 		case 'r':
@@ -222,21 +228,24 @@ void parse_args(int argc, char **argv)
                         
                         if (remote_id < 0 || remote_uri == 0 || remote_uri[0] == '\0') {
                                 err(_("Cannot process remote id option '%s'.\n"), optarg);
-				usage(argv[0]);
+				usage(argv[0],1);
                         }
 			break;
 		case 'V':
-                        eprintf(_("Systemtap module loader/runner (version %s, %s)\n"
-                              "Copyright (C) 2005-2013 Red Hat, Inc. and others\n"
+                        printf(_("Systemtap module loader/runner (version %s, %s)\n"
+                              "Copyright (C) 2005-2015 Red Hat, Inc. and others\n"
                               "This is free software; see the source for copying conditions.\n"),
                             VERSION, STAP_EXTENDED_VERSION);
-                        _exit(1);
+                        _exit(0);
+                        break;
+                case 'h':
+                        usage(argv[0],0);
                         break;
                 case 'T':
                         reader_timeout_ms = (unsigned)atoi(optarg);
                         if (reader_timeout_ms < 1) {
                                 err(_("Invalid reader timeout value '%d' (should be >= 1).\n"), reader_timeout_ms);
-                                usage(argv[0]);
+                                usage(argv[0],1);
                         }
                         break;
 		case 'C':
@@ -249,14 +258,21 @@ void parse_args(int argc, char **argv)
 				color_mode = color_always;
 			else {
 				err(_("Invalid option '%s' for -C."), optarg);
-				usage(argv[0]);
+				usage(argv[0],1);
 			}
 			color_errors = color_mode == color_always
 				|| (color_mode == color_auto && isatty(STDERR_FILENO)
 						&& strcmp(getenv("TERM") ?: "notdumb", "dumb"));
 			break;
+		case 'M':
+			monitor = 1;
+			monitor_interval = atoi(optarg);
+			if (monitor_interval < 1) {
+				err(_("Invalid monitor interval\n"));
+			}
+			break;
 		default:
-			usage(argv[0]);
+			usage(argv[0],1);
 		}
 	}
 	if (outfile_name) {
@@ -265,79 +281,82 @@ void parse_args(int argc, char **argv)
 		outfile_name = get_abspath(outfile_name);
 		if (outfile_name == NULL) {
 			err(_("File name is too long.\n"));
-			usage(argv[0]);
+			usage(argv[0],1);
 		}
-		ret = stap_strfloctime(tmp, PATH_MAX - 18, /* = _cpuNNN.SSSSSSSSSS */
+		ret = stap_strfloctime(tmp, PATH_MAX - 21,
+                                       /* = _cpuNNNNNN.SSSSSSSSSS */
 				       outfile_name, time(NULL));
 		if (ret < 0) {
 			err(_("Filename format is invalid or too long.\n"));
-			usage(argv[0]);
+			usage(argv[0],1);
 		}
 	}
 	if (attach_mod && load_only) {
 		err(_("You can't specify the '-A' and '-L' options together.\n"));
-		usage(argv[0]);
+		usage(argv[0],1);
 	}
 
 	if (attach_mod && buffer_size) {
 		err(_("You can't specify the '-A' and '-b' options together.  The '-b'\n"
 		    "buffer size option only has an effect when the module is inserted.\n"));
-		usage(argv[0]);
+		usage(argv[0],1);
 	}
 
 	if (attach_mod && target_cmd) {
 		err(_("You can't specify the '-A' and '-c' options together.  The '-c cmd'\n"
 		    "option used to start a command only has an effect when the module\n"
 		    "is inserted.\n"));
-		usage(argv[0]);
+		usage(argv[0],1);
 	}
 
 	if (attach_mod && target_pid) {
 		err(_("You can't specify the '-A' and '-x' options together.  The '-x pid'\n"
 		    "option only has an effect when the module is inserted.\n"));
-		usage(argv[0]);
+		usage(argv[0],1);
 	}
 
 	if (target_cmd && target_pid) {
 		err(_("You can't specify the '-c' and '-x' options together.\n"));
-		usage(argv[0]);
+		usage(argv[0],1);
 	}
 
 	if (daemon_mode && load_only) {
 		err(_("You can't specify the '-D' and '-L' options together.\n"));
-		usage(argv[0]);
+		usage(argv[0],1);
 	}
 	if (daemon_mode && delete_mod) {
 		err(_("You can't specify the '-D' and '-d' options together.\n"));
-		usage(argv[0]);
+		usage(argv[0],1);
 	}
 	if (daemon_mode && target_cmd) {
 		err(_("You can't specify the '-D' and '-c' options together.\n"));
-		usage(argv[0]);
+		usage(argv[0],1);
 	}
 	if (daemon_mode && outfile_name == NULL) {
 		err(_("You have to specify output FILE with '-D' option.\n"));
-		usage(argv[0]);
+		usage(argv[0],1);
 	}
 	if (outfile_name == NULL && fsize_max != 0) {
 		err(_("You have to specify output FILE with '-S' option.\n"));
-		usage(argv[0]);
+		usage(argv[0],1);
 	}
 }
 
-void usage(char *prog)
+void usage(char *prog, int rc)
 {
-	eprintf(_("\n%s [-v] [-w] [-V] [-u] [-c cmd ] [-x pid] [-u user] [-A|-L|-d] [-C WHEN]\n"
-                "\t[-b bufsize] [-R] [-r N:URI] [-o FILE [-D] [-S size[,N]]] MODULE [module-options]\n"), prog);
-	eprintf(_("-v              Increase verbosity.\n"
+	printf(_("\n%s [-v] [-w] [-V] [-h] [-u] [-c cmd ] [-x pid] [-u user] [-A|-L|-d] [-C WHEN]\n"
+                "\t[-b bufsize] [-R] [-r N:URI] [-o FILE [-D] [-S size[,N]]] [-U PID_FILE] MODULE [module-options]\n"), prog);
+	printf(_("-v              Increase verbosity.\n"
 	"-V              Print version number and exit.\n"
+	"-h              Print this help text and exit.\n"
 	"-w              Suppress warnings.\n"
 	"-u              Load uprobes.ko\n"
 	"-c cmd          Command \'cmd\' will be run and staprun will\n"
 	"                exit when it does.  The '_stp_target' variable\n"
 	"                will contain the pid for the command.\n"
 	"-x pid          Sets the '_stp_target' variable to pid.\n"
-	"-M PIDFILE		 Create a pid file while running\n"
+	"-U PIDFILE	 Create a pid file while running\n"
+  	"-N pid          Sets the '_stp_namespaces_pid' variable to pid.\n"
 	"-o FILE         Send output to FILE. This supports strftime(3)\n"
 	"                formats for FILE.\n"
 	"-b buffer size  The systemtap module specifies a buffer size.\n"
@@ -349,7 +368,10 @@ void usage(char *prog)
 	"-A              Attach to loaded systemtap module.\n"
 	"-C WHEN         Enable colored errors. WHEN must be either 'auto',\n"
 	"                'never', or 'always'. Set to 'auto' by default.\n"
-	"-d              Delete a module.  Only detached or unused modules\n"
+#ifdef HAVE_MONITOR_LIBS                 
+	"-M INTERVAL     Enable monitor mode.\n"
+#endif
+        "-d              Delete a module.  Only detached or unused modules\n"
 	"                the user has permission to access will be deleted. Use \"*\"\n"
 	"                (quoted) to delete all unused modules.\n"
         "-R              Have staprun create a new name for the module before\n"
@@ -377,11 +399,11 @@ void usage(char *prog)
                 struct utsname utsbuf;
                 int rc = uname (& utsbuf);
                 if (! rc)
-                        eprintf("/lib/modules/%s/systemtap\n", utsbuf.release);
+                        printf("/lib/modules/%s/systemtap\n", utsbuf.release);
                 else
-                        eprintf("/lib/modules/`uname -r`/systemtap\n");
+                        printf("/lib/modules/`uname -r`/systemtap\n");
         }
-	exit(1);
+	exit(rc);
 }
 
 /*
@@ -556,6 +578,75 @@ err:
 	return -1;
 }
 
+/*
+ * In multithreaded programs, using fcntl() to set F_CLOEXEC
+ * (close-on-exec) on a file descriptor is subject to a race condition
+ * that another thread may call fork() and exec() between the time the
+ * file is opened and fcntl() is called.
+ *
+ * So, when possible (since Linux 2.6.23), we use the O_CLOEXEC flag
+ * when calling open() and openat() to avoid this race condition. When
+ * O_CLOEXEC isn't available, the best we can do is call fcntl()
+ * immediately after open() is called.
+ *
+ * The same logic applies to openat() and pipe().
+ */
+
+int open_cloexec(const char *pathname, int flags, mode_t mode)
+{
+#ifdef O_CLOEXEC
+	return open(pathname, flags | O_CLOEXEC, mode);
+#else
+	int fd = open(pathname, flags, mode);
+	if (fd >= 0) {
+		if (set_clexec(fd) < 0) {
+			close(fd);
+			fd = -1;
+		}
+	}
+	return fd;
+#endif
+}
+
+#ifdef HAVE_OPENAT
+int openat_cloexec(int dirfd, const char *pathname, int flags, mode_t mode)
+{
+#ifdef O_CLOEXEC
+	return openat(dirfd, pathname, flags | O_CLOEXEC, mode);
+#else
+	int fd = openat(dirfd, pathname, flags, mode);
+	if (fd >= 0) {
+		if (set_clexec(fd) < 0) {
+			close(fd);
+			fd = -1;
+		}
+	}
+	return fd;
+#endif
+}
+#endif
+
+int pipe_cloexec(int pipefd[2])
+{
+#ifdef O_CLOEXEC
+	return pipe2(pipefd, O_CLOEXEC);
+#else
+	int rc = pipe(pipefd);
+	if (rc == 0) {
+		if (set_clexec(pipefd[0]) < 0 || set_clexec(pipefd[1] < 0)) {
+			goto err;
+		}
+	}
+	return rc;
+
+err:
+	close(pipefd[0]);
+	close(pipefd[1]);
+	pipefd[0] = -1;
+	pipefd[1] = -1;
+	return -1;
+#endif
+}
 
 /**
  *      send_request - send request to kernel over control channel
@@ -642,8 +733,10 @@ char *parse_stap_color(const char *type)
 	int done = 0;
 
 	key = getenv("SYSTEMTAP_COLORS");
-	if (key == NULL || *key == '\0')
+	if (key == NULL)
 		key = "error=01;31:warning=00;33:source=00;34:caret=01:token=01";
+	else if (*key == '\0')
+		return NULL; // disable colors if set but empty
 
 	while (!done) {
 		if (!(col = strchr(key, ':'))) {
@@ -692,5 +785,43 @@ void delete_pidfile(const char *pidfile_name)
 	if (unlink(pidfile_name) < 0)
 	{
 		err("Could not delete pidfile:%s\n",strerror(errno));
+	}
+}
+
+void
+closefrom(int lowfd)
+{
+	long fd, maxfd;
+	char *endp;
+	struct dirent *dent;
+	DIR *dirp;
+
+	/* Check for a /proc/self/fd directory. */
+	if ((dirp = opendir("/proc/self/fd"))) {
+		int dir_fd = dirfd(dirp);
+		while ((dent = readdir(dirp)) != NULL) {
+			fd = strtol(dent->d_name, &endp, 10);
+			if (dent->d_name != endp && *endp == '\0'
+			    && fd >= 0 && fd < INT_MAX && fd >= lowfd
+			    && fd != dir_fd)
+				(void) close((int)fd);
+		}
+		(void) closedir(dirp);
+	}
+	else {
+		/*
+		 * Here we fall back on sysconf(). Why? It is possible
+		 * /proc isn't mounted, we're out of file descriptors,
+		 * etc., which could cause the opendir() to fail. Also
+		 * note thet it is possible to open a file descriptor
+		 * and then drop the rlimit such that it is below the
+		 * open fd.
+		 */
+		maxfd = sysconf(_SC_OPEN_MAX);
+		if (maxfd < 0)
+			maxfd = OPEN_MAX;
+
+		for (fd = lowfd; fd < maxfd; fd++)
+			(void) close((int) fd);
 	}
 }

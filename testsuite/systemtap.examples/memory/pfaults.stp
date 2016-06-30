@@ -7,17 +7,15 @@ probe begin { time_offset = gettimeofday_us() }
 
 probe vm.pagefault {
   t = gettimeofday_us()
-  p = pid()
-  fault_entry_time[p] = t
-  fault_address[p] = address
-  fault_access[p] = write_access ? "w" : "r"
+  fault_entry_time[tid()] = t
+  fault_address[tid()] = address
+  fault_access[tid()] = write_access ? "w" : "r"
 }
 
 probe vm.pagefault.return {
   t=gettimeofday_us()
-  p = pid()
-  if (!(p in fault_entry_time)) next
-  e = t - fault_entry_time[p]
+  if (!(tid() in fault_entry_time)) next
+  e = t - fault_entry_time[id]
   if (vm_fault_contains(fault_type,VM_FAULT_MINOR)) {
     ftype="minor"
   } else if (vm_fault_contains(fault_type,VM_FAULT_MAJOR)) {
@@ -26,10 +24,10 @@ probe vm.pagefault.return {
     next #only want to deal with minor and major page faults
   }
 
-  printf("%d:%d:%p:%s:%s:%d\n",
-	t - time_offset, p, fault_address[p], fault_access[p], ftype, e)
+  printf("%d:%d:%id:%s:%s:%d\n",
+	t - time_offset, tid(), fault_address[tid()], fault_access[tid()], ftype, e)
   #free up memory
-  delete fault_entry_time[p]
-  delete fault_address[p]
-  delete fault_access[p]
+  delete fault_entry_time[tid()]
+  delete fault_address[tid()]
+  delete fault_access[tid()]
 }

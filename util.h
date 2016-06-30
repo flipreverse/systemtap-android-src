@@ -29,7 +29,19 @@ extern "C" {
 #include <poll.h>
 }
 
+// NB: GCC didn't add C++11 final/override until 4.7, but until then it also
+// only had __cplusplus=1 regardless of -std (GCC PR1773).  So checking new
+// __cplusplus is probably good enough here; otherwise we should autoconf it.
+#if __cplusplus >= 201103L
+#define cxx_final final
+#define cxx_override override
+#else
+#define cxx_final
+#define cxx_override
+#endif
+
 #include "privilege.h"
+#include "stringtable.h"
 
 #if ENABLE_NLS
 #define _(string) gettext(string)
@@ -45,7 +57,7 @@ extern "C" {
         autosprintf(_N((format), (format_plural), (count)), __VA_ARGS__)
 #define _STRINGIFY_MORE(s) #s
 #define _STRINGIFY(s) _STRINGIFY_MORE(s)
-#define ERR_SRC (std::string(__FUNCTION__) + ":" + _STRINGIFY(__LINE__))
+#define ERR_SRC (std::string(__FILE__) + ":" + _STRINGIFY(__LINE__))
 #define SEMANTIC_ERROR(...) semantic_error(ERR_SRC, __VA_ARGS__)
 #define PARSE_ERROR(...) parse_error(ERR_SRC, __VA_ARGS__)
 
@@ -61,9 +73,9 @@ extern "C" gid_t get_gid (const char *group_name);
 bool in_group_id (gid_t target_gid);
 std::string getmemusage ();
 void tokenize(const std::string& str, std::vector<std::string>& tokens,
-	      const std::string& delimiters);
+	      const std::string& delimiters = " ");
 void tokenize_full(const std::string& str, std::vector<std::string>& tokens,
-	      const std::string& delimiters);
+	      const std::string& delimiters = " ");
 void tokenize_cxx(const std::string& str, std::vector<std::string>& tokens);
 std::vector<std::pair<const char*,int> > split_lines(const char *buf, size_t n);
 std::string find_executable(const std::string& name);
@@ -71,8 +83,15 @@ std::string find_executable(const std::string& name,
 			    const std::string& sysroot,
 			    const std::map<std::string,std::string>& sysenv,
 			    const std::string& env_path = "PATH");
+bool is_fully_resolved(const std::string& name,
+                       const std::string& sysroot,
+                       const std::map<std::string,std::string>& sysenv,
+                       const std::string& env_path = "PATH");
 const std::string cmdstr_quoted(const std::string& cmd);
+const std::string detox_path(const std::string& str);
 const std::string cmdstr_join(const std::vector<std::string>& cmds);
+const std::string join(const std::vector<std::string>& cmds,
+		       const std::string& delim);
 int stap_waitpid(int verbose, pid_t pid);
 pid_t stap_spawn(int verbose, const std::vector<std::string>& args);
 pid_t stap_spawn(int verbose, const std::vector<std::string>& args,
@@ -86,18 +105,22 @@ inline int stap_system(int verbose, const std::vector<std::string>& args,
                        bool null_out=false, bool null_err=false)
 { return stap_system(verbose, args.front(), args, null_out, null_err); }
 int stap_system_read(int verbose, const std::vector<std::string>& args, std::ostream& out);
+std::pair<bool,int> stap_fork_read(int verbose, std::ostream& out);
 int kill_stap_spawn(int sig);
 void assert_regexp_match (const std::string& name, const std::string& value, const std::string& re);
 int regexp_match (const std::string& value, const std::string& re, std::vector<std::string>& matches);
 bool contains_glob_chars (const std::string &str);
 std::string escape_glob_chars (const std::string& str);
 std::string unescape_glob_chars (const std::string& str);
+bool identifier_string_needs_escape (const std::string& str);
+std::string escaped_indentifier_string (const std::string& str);
 std::string kernel_release_from_build_tree (const std::string &kernel_build_tree, int verbose = 0);
 std::string normalize_machine(const std::string& machine);
 int elf_class_from_normalized_machine(const std::string& machine);
 std::string autosprintf(const char* format, ...) __attribute__ ((format (printf, 1, 2)));
 const std::set<std::string>& localization_variables();
 std::string get_self_path();
+bool is_valid_pid (pid_t pid, std::string& err_msg);
 
 // stringification generics
 
@@ -263,7 +286,6 @@ startswith(const std::string & s, const std::string & prefix)
   return (s.compare(0, prefix.length(), prefix) == 0);
 }
 
-
 // Returns whether a string ends with the given suffix
 inline bool
 endswith(const std::string & s, const char * suffix)
@@ -334,6 +356,11 @@ unsigned levenshtein(const std::string& a, const std::string& b);
 // of 'threshold'.
 std::string levenshtein_suggest(const std::string& target,
                                 const std::set<std::string>& elems,
+                                unsigned max = std::numeric_limits<unsigned>::max(),
+                                unsigned threshold = std::numeric_limits<unsigned>::max());
+
+std::string levenshtein_suggest(const std::string& target,
+                                const std::set<interned_string>& elems,
                                 unsigned max = std::numeric_limits<unsigned>::max(),
                                 unsigned threshold = std::numeric_limits<unsigned>::max());
 

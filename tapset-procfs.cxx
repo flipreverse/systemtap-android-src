@@ -1,5 +1,5 @@
 // tapset for procfs
-// Copyright (C) 2005-2010 Red Hat Inc.
+// Copyright (C) 2005-2014 Red Hat Inc.
 // Copyright (C) 2005-2007 Intel Corporation.
 //
 // This file is part of systemtap, and is free software.  You can
@@ -79,11 +79,10 @@ public:
 
 struct procfs_var_expanding_visitor: public var_expanding_visitor
 {
-  procfs_var_expanding_visitor(systemtap_session& s, const string& pn,
+  procfs_var_expanding_visitor(systemtap_session& s,
                                string path, bool write_probe);
 
   systemtap_session& sess;
-  string probe_name;
   string path;
   bool write_probe;
   bool target_symbol_seen;
@@ -99,7 +98,7 @@ procfs_derived_probe::procfs_derived_probe (systemtap_session &s, probe* p,
     maxsize_val(m), umask(umask) 
 {
   // Expand local variables in the probe body
-  procfs_var_expanding_visitor v (s, name, path, write); 
+  procfs_var_expanding_visitor v (s, path, write); 
   v.replace (this->body);
   target_symbol_seen = v.target_symbol_seen;
 }
@@ -126,6 +125,7 @@ procfs_derived_probe::join_group (systemtap_session& s)
       s.embeds.push_back(ec);
     }
   s.procfs_derived_probes->enroll (this);
+  this->group = s.procfs_derived_probes;
 }
 
 
@@ -278,6 +278,7 @@ procfs_derived_probe_group::emit_module_decls (systemtap_session& s)
 
       s.op->newline() << "pdata.buffer = spp->buffer;";
       s.op->newline() << "pdata.bufsize = spp->bufsize;";
+      s.op->newline() << "pdata.count = spp->count;";
       s.op->newline() << "if (c->ips.procfs_data == NULL)";
       s.op->newline(1) << "c->ips.procfs_data = &pdata;";
       s.op->newline(-1) << "else {";
@@ -286,7 +287,6 @@ procfs_derived_probe_group::emit_module_decls (systemtap_session& s)
       s.op->newline(1) << "atomic_set (session_state(), STAP_SESSION_ERROR);";
       s.op->newline() << "_stp_exit ();";
       s.op->newline(-1) << "}";
-      s.op->newline() << "atomic_dec (& c->busy);";
       s.op->newline() << "goto probe_epilogue;";
       s.op->newline(-1) << "}";
 
@@ -298,7 +298,7 @@ procfs_derived_probe_group::emit_module_decls (systemtap_session& s)
       s.op->newline() << "spp->needs_fill = 0;";
       s.op->newline() << "spp->count = strlen(spp->buffer);";
 
-      common_probe_entryfn_epilogue (s, true);
+      common_probe_entryfn_epilogue (s, true, otf_safe_context(s));
 
       s.op->newline() << "if (spp->needs_fill) {";
       s.op->newline(1) << "spp->needs_fill = 0;";
@@ -344,7 +344,6 @@ procfs_derived_probe_group::emit_module_decls (systemtap_session& s)
       s.op->newline(1) << "atomic_set (session_state(), STAP_SESSION_ERROR);";
       s.op->newline() << "_stp_exit ();";
       s.op->newline(-1) << "}";
-      s.op->newline() << "atomic_dec (& c->busy);";
       s.op->newline() << "goto probe_epilogue;";
       s.op->newline(-1) << "}";
 
@@ -356,7 +355,7 @@ procfs_derived_probe_group::emit_module_decls (systemtap_session& s)
       s.op->newline(1) << "retval = count;";
       s.op->newline(-1) << "}";
 
-      common_probe_entryfn_epilogue (s, true);
+      common_probe_entryfn_epilogue (s, true, otf_safe_context(s));
     }
 
   s.op->newline() << "return retval;";
@@ -410,10 +409,9 @@ procfs_derived_probe_group::emit_module_exit (systemtap_session& s)
 
 
 procfs_var_expanding_visitor::procfs_var_expanding_visitor (systemtap_session& s,
-							    const string& pn,
 							    string path,
 							    bool write_probe):
-  sess (s), probe_name (pn), path (path), write_probe (write_probe),
+  sess (s), path (path), write_probe (write_probe),
   target_symbol_seen (false)
 {
   // procfs probes can also handle '.='.
@@ -453,31 +451,39 @@ procfs_var_expanding_visitor::visit_target_symbol (target_symbol* e)
       embeddedcode *ec = new embeddedcode;
       ec->tok = e->tok;
 
-      string fname;
+      string fname = "__private_" + detox_path(string(e->tok->location.file->name));
       string locvalue = "CONTEXT->ips.procfs_data";
 
       if (! lvalue)
         {
-          fname = "_procfs_value_get";
-          ec->code = string("    struct _stp_procfs_data *data = (struct _stp_procfs_data *)(") + locvalue + string("); /* pure */\n")
+          fname += "_procfs_value_get";
+          ec->code = string("    struct _stp_procfs_data *data = (struct _stp_procfs_data *)(") + locvalue + string("); /* pure */ /* stable */\n")
 
-            + string("    _stp_copy_from_user(STAP_RETVALUE, data->buffer, data->count);\n")
-            + string("    STAP_RETVALUE[data->count] = '\\0';\n");
+            + string("    if (!_stp_copy_from_user(STAP_RETVALUE, data->buffer, data->count))\n")
+            + string("      STAP_RETVALUE[data->count] = '\\0';\n")
+	    + string("    else\n")
+            + string("      STAP_RETVALUE[0] = '\\0';\n");
         }
       else					// lvalue
         {
           if (*op == "=")
             {
-              fname = "_procfs_value_set";
+              fname += "_procfs_value_set";
               ec->code = string("struct _stp_procfs_data *data = (struct _stp_procfs_data *)(") + locvalue + string(");\n")
                 + string("    strlcpy(data->buffer, STAP_ARG_value, data->bufsize);\n")
+                + string("    if (strlen(STAP_ARG_value) > data->bufsize-1)\n")
+                + string("      STAP_ERROR(\"buffer size exceeded, consider .maxsize(%lu).\", "
+                                            "(unsigned long)(strlen(STAP_ARG_value) + 1));\n")
                 + string("    data->count = strlen(data->buffer);\n");
             }
           else if (*op == ".=")
             {
-              fname = "_procfs_value_append";
+              fname += "_procfs_value_append";
               ec->code = string("struct _stp_procfs_data *data = (struct _stp_procfs_data *)(") + locvalue + string(");\n")
                 + string("    strlcat(data->buffer, STAP_ARG_value, data->bufsize);\n")
+                + string("    if (data->count + strlen(STAP_ARG_value) > data->bufsize-1)\n")
+                + string("      STAP_ERROR(\"buffer size exceeded, consider .maxsize(%lu).\", "
+                                            "(unsigned long)(data->count + strlen(STAP_ARG_value) + 1));\n")
                 + string("    data->count = strlen(data->buffer);\n");
             }
           else
@@ -489,7 +495,7 @@ procfs_var_expanding_visitor::visit_target_symbol (target_symbol* e)
         }
       fname += lex_cast(++tick);
 
-      fdecl->name = fname;
+      fdecl->unmangled_name = fdecl->name = fname;
       fdecl->body = ec;
       fdecl->type = pe_string;
 
@@ -512,13 +518,7 @@ procfs_var_expanding_visitor::visit_target_symbol (target_symbol* e)
       n->function = fname;
 
       if (lvalue)
-        {
-          // Provide the functioncall to our parent, so that it can be
-          // used to substitute for the assignment node immediately above
-          // us.
-          assert(!target_symbol_setter_functioncalls.empty());
-          *(target_symbol_setter_functioncalls.top()) = n;
-        }
+        provide_lvalue_call (n);
 
       provide (n);
     }
@@ -548,7 +548,7 @@ procfs_builder::build(systemtap_session & sess,
                       literal_map_t const & parameters,
                       vector<derived_probe *> & finished_results)
 {
-  string path;
+  interned_string path;
   bool has_procfs = get_param(parameters, TOK_PROCFS, path);
   bool has_read = (parameters.find(TOK_READ) != parameters.end());
   bool has_write = (parameters.find(TOK_WRITE) != parameters.end());
@@ -586,7 +586,7 @@ procfs_builder::build(systemtap_session & sess,
   else
     {
       string::size_type start_pos, end_pos;
-      string component;
+      interned_string component;
       start_pos = 0;
       while ((end_pos = path.find('/', start_pos)) != string::npos)
         {

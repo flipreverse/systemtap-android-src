@@ -1,6 +1,6 @@
 /*  -*- linux-c -*-
  * Stack tracing functions
- * Copyright (C) 2005-2009, 2011 Red Hat Inc.
+ * Copyright (C) 2005-2009, 2014 Red Hat Inc.
  * Copyright (C) 2005 Intel Corporation.
  *
  * This file is part of systemtap, and is free software.  You can
@@ -161,10 +161,6 @@ static void _stp_stack_print_fallback(unsigned long s, int v, int l, int k) {
 
 #endif /* defined(STAPCONF_KERNEL_STACKTRACE) || defined(STAPCONF_KERNEL_STACKTRACE_NO_BP) */
 
-// Without KPROBES very little works atm.
-// But this file is unconditionally imported, while these two functions are only
-// used through context-unwind.stp.
-#if defined (CONFIG_KPROBES)
 
 /** Gets user space registers when available, also sets context
  * full_uregs_p if appropriate.  Should be used instead of accessing
@@ -207,8 +203,8 @@ static struct pt_regs *_stp_get_uregs(struct context *c)
 		 probe location. */
 	      levels = MAXBACKTRACE;
 	      arch_unw_init_frame_info(info, c->kregs, 0);
-	      dbug_unwind(1, "Trying to recover... searching for 0x%lx\n",
-			  REG_IP(c->uregs));
+	      dbug_unwind(1, "Trying to recover... searching for 0x%llx\n",
+			  (unsigned long long) REG_IP(c->uregs));
 
 	      /* Mark the kernel unwind cache as invalid
 		 (uwcache_kernel.depth is no longer consistent with
@@ -234,8 +230,8 @@ static struct pt_regs *_stp_get_uregs(struct context *c)
 	    {
 	      levels--;
 	      ret = unwind(&c->uwcontext_kernel, 0);
-	      dbug_unwind(1, "unwind levels: %d, ret: %d, pc=0x%lx\n",
-			  levels, ret, UNW_PC(info));
+	      dbug_unwind(1, "unwind levels: %d, ret: %d, pc=0x%llx\n",
+			  levels, ret, (unsigned long long) UNW_PC(info));
 	    }
 
 	  /* Have we arrived where we think user space currently is? */
@@ -246,8 +242,9 @@ static struct pt_regs *_stp_get_uregs(struct context *c)
 	      UNW_SP(info) = REG_SP(c->uregs); /* Fix up user stack */
 	      c->uregs = &info->regs;
 	      c->full_uregs_p = 1;
-	      dbug_unwind(1, "recovered with pc=0x%lx sp=0x%lx\n",
-			  UNW_PC(info), UNW_SP(info));
+	      dbug_unwind(1, "recovered with pc=0x%llx sp=0x%llx\n",
+			  (unsigned long long) UNW_PC(info),
+			  (unsigned long long) UNW_SP(info));
 	    }
 	  else
 	    dbug_unwind(1, "failed to recover user reg state\n");
@@ -279,7 +276,12 @@ static unsigned long _stp_stack_unwind_one_kernel(struct context *c, unsigned de
 			 * dump_trace() fallback should call
 			 * _stp_stack_kernel_print() and do their own
 			 * tokenization of the result. */
+#if defined (__i386__) || defined (__x86_64__)
+		        arch_unw_init_frame_info(&c->uwcontext_kernel.info, NULL, 0);
+		        return UNW_PC(&c->uwcontext_kernel.info);
+#else
 			return 0;
+#endif
 		} else if (c->probe_type == stp_probe_type_kretprobe
 			   && c->ips.krp.pi) {
 			return (unsigned long)_stp_ret_addr_r(c->ips.krp.pi);
@@ -290,9 +292,7 @@ static unsigned long _stp_stack_unwind_one_kernel(struct context *c, unsigned de
 
 #ifdef STP_USE_DWARF_UNWINDER
 	/* Otherwise, use the DWARF unwinder to unwind one step. */
-	if (! c->kregs) {
-		return 0;
-	}
+
 	regs = c->kregs;
 
 	info = &c->uwcontext_kernel.info;
@@ -313,7 +313,9 @@ static unsigned long _stp_stack_unwind_one_kernel(struct context *c, unsigned de
 	}
 
 	ret = unwind(&c->uwcontext_kernel, 0);
-	dbug_unwind(1, "ret=%d PC=%lx SP=%lx\n", ret, UNW_PC(info), UNW_SP(info));
+	dbug_unwind(1, "ret=%d PC=%llx SP=%llx\n", ret,
+		    (unsigned long long) UNW_PC(info),
+		    (unsigned long long) UNW_SP(info));
 
 	/* check if unwind hit an error */
 	if (ret || ! _stp_valid_pc_addr(UNW_PC(info), NULL)) {
@@ -371,6 +373,29 @@ static void _stp_stack_kernel_print(struct context *c, int sym_flags)
 	unsigned n, remaining;
 	unsigned long l;
 
+	/* print the current address */
+	if (c->probe_type == stp_probe_type_kretprobe && c->ips.krp.pi
+	    && (sym_flags & _STP_SYM_FULL) == _STP_SYM_FULL) {
+		_stp_print("Returning from: ");
+		_stp_print_addr((unsigned long)_stp_probe_addr_r(c->ips.krp.pi),
+				sym_flags, NULL);
+		_stp_print("Returning to  : ");
+	}
+	_stp_print_addr(_stp_stack_kernel_get(c, 0), sym_flags, NULL);
+
+#ifdef STP_USE_DWARF_UNWINDER
+	for (n = 1; n < MAXBACKTRACE; n++) {
+		l = _stp_stack_kernel_get(c, n);
+		if (l == 0) {
+			remaining = MAXBACKTRACE - n;
+			_stp_stack_print_fallback(UNW_SP(&c->uwcontext_kernel.info),
+						  sym_flags, remaining, 0);
+			break;
+		} else {
+			_stp_print_addr(l, sym_flags, NULL);
+		}
+	}
+#else
 	if (! c->kregs) {
 		/* This is a fatal block for _stp_stack_kernel_get,
 		 * but when printing a backtrace we can use this
@@ -401,32 +426,9 @@ static void _stp_stack_kernel_print(struct context *c, int sym_flags)
 #endif
 		return;
 	}
-
-	/* print the current address */
-	if (c->probe_type == stp_probe_type_kretprobe && c->ips.krp.pi
-	    && (sym_flags & _STP_SYM_FULL) == _STP_SYM_FULL) {
-		_stp_print("Returning from: ");
-		_stp_print_addr((unsigned long)_stp_probe_addr_r(c->ips.krp.pi),
-				sym_flags, NULL);
-		_stp_print("Returning to  : ");
-	}
-	_stp_print_addr(_stp_stack_kernel_get(c, 0), sym_flags, NULL);
-
-#ifdef STP_USE_DWARF_UNWINDER
-	for (n = 1; n < MAXBACKTRACE; n++) {
-		l = _stp_stack_kernel_get(c, n);
-		if (l == 0) {
-			remaining = MAXBACKTRACE - n;
-			_stp_stack_print_fallback(UNW_SP(&c->uwcontext_kernel.info),
-						  sym_flags, remaining, 0);
-			break;
-		} else {
-			_stp_print_addr(l, sym_flags, NULL);
-		}
-	}
-#else
-	/* Arch specific fallback for kernel backtraces. */
-	__stp_stack_print(regs, sym_flags, MAXBACKTRACE);
+	else
+		/* Arch specific fallback for kernel backtraces. */
+		__stp_stack_print(c->kregs, sym_flags, MAXBACKTRACE);
 #endif
 }
 
@@ -497,7 +499,8 @@ static unsigned long _stp_stack_unwind_one_user(struct context *c, unsigned dept
 			UNW_PC(info) = maybe_pc;
 	}
 #endif
-	dbug_unwind(1, "ret=%d PC=%lx SP=%lx\n", ret, UNW_PC(info), UNW_SP(info));
+	dbug_unwind(1, "ret=%d PC=%llx SP=%llx\n", ret,
+		    (unsigned long long) UNW_PC(info), (unsigned long long) UNW_SP(info));
 
 	/* check if unwind hit an error */
 	if (ret || ! _stp_valid_pc_addr(UNW_PC(info), current)) {
@@ -637,7 +640,5 @@ static void _stp_stack_user_sprint(char *str, int size, struct context* c,
 	strlcpy(str, pb->buf, size < (int)pb->len ? size : (int)pb->len);
 	pb->len = 0;
 }
-
-#endif /* CONFIG_KPROBES */
 
 #endif /* _STACK_C_ */

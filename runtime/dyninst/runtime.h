@@ -109,6 +109,9 @@ static int stp_pthread_cond_init_shared(pthread_cond_t *cond);
 #define preempt_disable() 0
 #define preempt_enable_no_resched() 0
 
+/* stapdyn doesn't deal with mixed-architectures yet.  */
+#define _stp_is_compat_task() 0
+
 static int _stp_sched_getcpu(void)
 {
     /* We prefer sched_getcpu directly, of course.  It wasn't added until glibc
@@ -271,6 +274,8 @@ err_attr:
 	return rc;
 }
 
+static inline void stp_synchronize_sched(void) { }
+
 /*
  * For stapdyn to work in a multiprocess environment, the module must be
  * prepared to be loaded multiple times in different processes.  Thus, we have
@@ -302,13 +307,7 @@ static void stp_dyninst_ctor(void)
 {
     int rc = 0;
 
-    _stp_mem_fd = open("/proc/self/mem", O_RDWR /*| O_LARGEFILE*/);
-    if (_stp_mem_fd != -1) {
-        fcntl(_stp_mem_fd, F_SETFD, FD_CLOEXEC);
-    }
-    else {
-        rc = -errno;
-    }
+    rc = _stp_copy_init();
 
     if (rc == 0)
         rc = _stp_runtime_contexts_init();
@@ -384,10 +383,7 @@ static void stp_dyninst_dtor(void)
 {
     _stp_print_cleanup();
     _stp_shm_destroy();
-
-    if (_stp_mem_fd != -1) {
-	close (_stp_mem_fd);
-    }
+    _stp_copy_destroy();
 }
 
 #endif /* _STAPDYN_RUNTIME_H_ */

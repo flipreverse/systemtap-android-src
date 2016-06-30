@@ -2,7 +2,7 @@
  * transport.c - stp transport functions
  *
  * Copyright (C) IBM Corporation, 2005
- * Copyright (C) Red Hat Inc, 2005-2011
+ * Copyright (C) Red Hat Inc, 2005-2014
  * Copyright (C) Intel Corporation, 2006
  *
  * This file is part of systemtap, and is free software.  You can
@@ -27,6 +27,7 @@ static int _stp_exit_flag = 0;
 static uid_t _stp_uid = 0;
 static gid_t _stp_gid = 0;
 static int _stp_pid = 0;
+static int _stp_namespaces_pid = 0;
 static int _stp_remote_id = -1;
 static char _stp_remote_uri[MAXSTRINGLEN];
 
@@ -36,7 +37,8 @@ static pid_t _stp_target = 0;
 static int _stp_probes_started = 0;
 
 /* _stp_transport_mutext guards _stp_start_called and _stp_exit_called.
-   We only want to do the startup and exit sequences once.  */
+   We only want to do the startup and exit sequences once.  Note that
+   these indicate the respective process starting, not their conclusion. */
 static int _stp_start_called = 0;
 static int _stp_exit_called = 0;
 static DEFINE_MUTEX(_stp_transport_mutex);
@@ -85,8 +87,14 @@ static int _stp_module_notifier (struct notifier_block * nb,
                                  unsigned long val, void *data);
 static struct notifier_block _stp_module_notifier_nb = {
         .notifier_call = _stp_module_notifier,
-        .priority = 1 /* As per kernel/trace/trace_kprobe.c, 
-                         invoked after kprobe module callback. */
+        // We used to have this set to 1 before since that is also what
+        // kernel/trace/trace_kprobe.c does as well. The idea was that we should
+        // be notified _after_ the kprobe infrastruture itself is notified.
+        // However, that was the exact opposite of what was happening (we were
+        // called _before_ kprobes). In the end, we do not have a hard
+        // requirement as to being called before or after kprobes itself, so
+        // just leave the default of 0. (See also PR16861).
+        .priority = 0
 };
 
 #if STP_TRANSPORT_VERSION == 2
@@ -104,14 +112,25 @@ static struct timer_list _stp_ctl_work_timer;
  *	_stp_handle_start - handle STP_START
  */
 
+// PR17232: This might be called more than once, but not concurrently
+// or reentrantly with itself, or with _stp_cleanup_and_exit.  (The
+// latter case is not obvious: _stp_cleanup_and_exit could be called
+// from the mutex-protected ctl message handler, so that's fine; or
+// it could be called from the module cleanup function, by which time
+// we know there is no ctl connection and thus no messages.  So again
+// no concurrency.
+
 static void _stp_handle_start(struct _stp_msg_start *st)
 {
 	int handle_startup;
+#if defined(CONFIG_USER_NS)
+	struct pid *_upid = NULL;
+	struct task_struct *_utask = NULL;
+#endif
 
-	mutex_lock(&_stp_transport_mutex);
+        // protect against excessive or premature startup
 	handle_startup = (! _stp_start_called && ! _stp_exit_called);
 	_stp_start_called = 1;
-	mutex_unlock(&_stp_transport_mutex);
 	
 	if (handle_startup) {
 		dbug_trans(1, "stp_handle_start\n");
@@ -134,17 +153,45 @@ static void _stp_handle_start(struct _stp_msg_start *st)
 #endif
 
 		_stp_target = st->target;
+
+#if defined(CONFIG_USER_NS)
+                rcu_read_lock();
+                _upid = find_vpid(_stp_target);
+                if (_upid)
+                {
+                    _utask = pid_task(_upid, PIDTYPE_PID);
+                    if (_utask)
+                    {
+                        #ifdef DEBUG_UPROBES
+                        _stp_dbug(__FUNCTION__,__LINE__, "translating vpid %d to pid %d\n", _stp_target, _utask->pid);
+                        #endif
+                        _stp_target = _utask->pid;
+                    }
+                }
+
+                #ifdef DEBUG_UPROBES
+                if (!_upid || !_utask)
+                    _stp_dbug(__FUNCTION__,__LINE__, "cannot map pid %d to host namespace pid\n", _stp_target);
+                #endif
+
+                rcu_read_unlock();
+#endif
+
 		st->res = systemtap_module_init();
-		if (st->res == 0)
+		if (st->res == 0) {
 			_stp_probes_started = 1;
 
-                /* Register the module notifier. */
-                if (!_stp_module_notifier_active) {
-                        int rc = register_module_notifier(& _stp_module_notifier_nb);
-                        if (rc == 0)
-                                _stp_module_notifier_active = 1;
-                        else
-                                _stp_warn ("Cannot register module notifier (%d)\n", rc);
+                        /* Register the module notifier ... */
+                        /* NB: but not if the module_init stuff
+                           failed: something nasty has happened, and
+                           we want no further probing started.  PR16766 */
+                        if (!_stp_module_notifier_active) {
+                                int rc = register_module_notifier(& _stp_module_notifier_nb);
+                                if (rc == 0)
+                                        _stp_module_notifier_active = 1;
+                                else
+                                        _stp_warn ("Cannot register module notifier (%d)\n", rc);
+                        }
                 }
 
 		/* Called from the user context in response to a proc
@@ -159,44 +206,33 @@ static void _stp_handle_start(struct _stp_msg_start *st)
 	}
 }
 
-/* common cleanup code. */
-/* This is called from the kernel thread when an exit was requested */
-/* by staprun or the exit() function. */
+
+// _stp_cleanup_and_exit: handle STP_EXIT and cleanup_module
+//
 /* We need to call it both times because we want to clean up properly */
 /* when someone does /sbin/rmmod on a loaded systemtap module. */
 static void _stp_cleanup_and_exit(int send_exit)
 {
 	int handle_exit;
-	int start_finished;
 
-	mutex_lock(&_stp_transport_mutex);
+        // protect against excessive or premature cleanup
 	handle_exit = (_stp_start_called && ! _stp_exit_called);
 	_stp_exit_called = 1;
-	mutex_unlock(&_stp_transport_mutex);
 
-	/* Note, we can be sure that the startup sequence has finished
-           if handle_exit is true because it depends on _stp_start_called
-	   being set to true. _stp_start_called can only be set to true
-	   in _stp_handle_start() in response to a _STP_START message on
-	   the control channel. Only one writer can have the control
-	   channel open at a time, so the whole startup sequence in
-	   _stp_handle_start() has to be completed before another message
-	   can be send.  _stp_cleanup_and_exit() can only be called through
-	   either a _STP_EXIT message, which cannot arrive while _STP_START
-	   is still being handled, or when the module is unloaded. The
-	   module can only be unloaded when there are no more users that
-	   keep the control channel open.  */
 	if (handle_exit) {
 		int failures;
 
+                dbug_trans(1, "cleanup_and_exit (%d)\n", send_exit);
+
 	        /* Unregister the module notifier. */
 	        if (_stp_module_notifier_active) {
+                        int rc = unregister_module_notifier(& _stp_module_notifier_nb);
+                        if (rc)
+                                _stp_warn("module_notifier unregister error %d", rc);
 	                _stp_module_notifier_active = 0;
-	                (void) unregister_module_notifier(& _stp_module_notifier_nb);
-	                /* -ENOENT is possible, if we were not already registered */
+                        stp_synchronize_sched(); // paranoia: try to ensure no further calls in progress
 	        }
 
-                dbug_trans(1, "cleanup_and_exit (%d)\n", send_exit);
 		_stp_exit_flag = 1;
 
 		if (_stp_probes_started) {
@@ -230,11 +266,16 @@ static void _stp_cleanup_and_exit(int send_exit)
 	}
 }
 
+
+// Coming from script type sources, e.g. the exit() tapset function:
+// consists of sending a message to staprun/stapio, and definitely
+// NOT calling _stp_cleanup_and_exit(), since that function requires
+// a more user context to run from.
 static void _stp_request_exit(void)
 {
 	static int called = 0;
 	if (!called) {
-		/* we only want to do this once */
+		/* we only want to do this once; XXX: why? what's the harm? */
 		called = 1;
 		dbug_trans(1, "ctl_send STP_REQUEST_EXIT\n");
 		/* Called from the timer when _stp_exit_flag has been
@@ -251,6 +292,7 @@ static void _stp_detach(void)
 {
 	dbug_trans(1, "detach\n");
 	_stp_pid = 0;
+  _stp_namespaces_pid = 0;
 
 	if (!_stp_exit_flag)
 		_stp_transport_data_fs_overwrite(1);
@@ -269,6 +311,8 @@ static void _stp_attach(void)
 {
 	dbug_trans(1, "attach\n");
 	_stp_pid = current->pid;
+  if (_stp_namespaces_pid < 1)
+    _stp_namespaces_pid = _stp_pid;
 	_stp_transport_data_fs_overwrite(0);
 	init_timer(&_stp_ctl_work_timer);
 	_stp_ctl_work_timer.expires = jiffies + STP_CTL_TIMER_INTERVAL;
@@ -292,11 +336,18 @@ static void _stp_ctl_work_callback(unsigned long val)
 {
 	int do_io = 0;
 	unsigned long flags;
+	struct context* __restrict__ c = NULL;
+
+	/* Prevent probe reentrancy while grabbing probe-used locks.  */
+	c = _stp_runtime_entryfn_get_context();
 
 	spin_lock_irqsave(&_stp_ctl_ready_lock, flags);
 	if (!list_empty(&_stp_ctl_ready_q))
 		do_io = 1;
 	spin_unlock_irqrestore(&_stp_ctl_ready_lock, flags);
+
+	_stp_runtime_entryfn_put_context(c);
+
 	if (do_io)
 		wake_up_interruptible(&_stp_ctl_wq);
 
@@ -337,7 +388,7 @@ static int _stp_transport_init(void)
 	_stp_uid = current->uid;
 	_stp_gid = current->gid;
 #else
-#ifdef CONFIG_UIDGID_STRICT_TYPE_CHECKS
+#if defined(CONFIG_USER_NS) || (LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0))
 	_stp_uid = from_kuid_munged(current_user_ns(), current_uid());
 	_stp_gid = from_kgid_munged(current_user_ns(), current_gid());
 #else
@@ -387,13 +438,6 @@ static int _stp_transport_init(void)
 #endif
 #endif
 
-
-#ifdef RELAY_GUEST
-	/* Guest scripts use relay only for reporting warnings and errors */
-	_stp_subbuf_size = 65536;
-	_stp_nsubbufs = 2;
-#endif
-
 	if (_stp_bufsize) {
 		unsigned size = _stp_bufsize * 1024 * 1024;
 		_stp_subbuf_size = 65536;
@@ -415,6 +459,10 @@ static int _stp_transport_init(void)
 	/* create print buffers */
 	if (_stp_print_init() < 0)
 		goto err2;
+
+	/* set _stp_module_self dynamic info */
+	if (_stp_module_update_self() < 0)
+		goto err3;
 
 	/* start transport */
 	_stp_transport_data_fs_start();
@@ -685,6 +733,12 @@ static void _stp_handle_remote_id (struct _stp_msg_remote_id* rem)
 {
   _stp_remote_id = (int64_t) rem->remote_id;
   strlcpy(_stp_remote_uri, rem->remote_uri, min(STP_REMOTE_URI_LEN,MAXSTRINGLEN));
+}
+
+static void _stp_handle_namespaces_pid (struct _stp_msg_ns_pid *nspid)
+{
+  if (nspid->target > 0)
+    _stp_namespaces_pid = (int) nspid->target;
 }
 
 

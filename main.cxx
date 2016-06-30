@@ -1,5 +1,5 @@
 // systemtap translator/driver
-// Copyright (C) 2005-2013 Red Hat Inc.
+// Copyright (C) 2005-2016 Red Hat Inc.
 // Copyright (C) 2005 IBM Corp.
 // Copyright (C) 2006 Intel Corporation.
 //
@@ -25,6 +25,9 @@
 #include "remote.h"
 #include "tapsets.h"
 #include "setupdwfl.h"
+#ifdef HAVE_LIBREADLINE
+#include "interactive.h"
+#endif
 
 #if ENABLE_NLS
 #include <libintl.h>
@@ -65,7 +68,8 @@ uniq_list(list<string>& l)
 static void
 printscript(systemtap_session& s, ostream& o)
 {
-  if (s.listing_mode)
+  if (s.dump_mode == systemtap_session::dump_matched_probes ||
+      s.dump_mode == systemtap_session::dump_matched_probes_vars)
     {
       // We go through some heroic measures to produce clean output.
       // Record the alias and probe pointer as <name, set<derived_probe *> >
@@ -77,9 +81,10 @@ printscript(systemtap_session& s, ostream& o)
           assert_no_interrupts();
 
           derived_probe* p = s.probes[i];
+          vector<probe*> chain;
+          p->collect_derivation_chain (chain);
+
           if (s.verbose > 2) {
-            vector<probe*> chain;
-            p->collect_derivation_chain (chain);
             p->printsig(cerr); cerr << endl;
             cerr << "chain[" << chain.size() << "]:" << endl;
             for (unsigned j=0; j<chain.size(); j++)
@@ -105,11 +110,15 @@ printscript(systemtap_session& s, ostream& o)
                   }
               }
           }
-          
-          stringstream tmps;
-          const probe_point *a = p->script_location();
-          a->print(tmps);
-          string pp = tmps.str();
+
+          const string& pp = lex_cast(*p->script_location());
+
+          // PR16730: We should only list probes that can be traced back to the
+          // user's spec, not any auxiliary probes in the tapsets.
+          // Also, do not want to the probes that are from the additional
+          // scripts (-E SCRIPT) to be listed.
+          if (!s.is_primary_probe(p))
+            continue;
 
           // Now duplicate-eliminate.  An alias may have expanded to
           // several actual derived probe points, but we only want to
@@ -123,7 +132,7 @@ printscript(systemtap_session& s, ostream& o)
           o << it->first; // probe name or alias
 
           // Print the locals and arguments for -L mode only
-          if (s.listing_mode_vars)
+          if (s.dump_mode == systemtap_session::dump_matched_probes_vars)
             {
               map<string,unsigned> var_count; // format <"name:type",count>
               map<string,unsigned> arg_count;
@@ -246,7 +255,7 @@ printscript(systemtap_session& s, ostream& o)
 int pending_interrupts;
 
 extern "C"
-void handle_interrupt (int sig)
+void handle_interrupt (int)
 {
   // This might be nice, but we don't know our current verbosity...
   // clog << _F("Received signal %d", sig) << endl << flush;
@@ -336,9 +345,9 @@ run_sdt_benchmark(systemtap_session& s)
   gettimeofday (&tv_after, NULL);
   if (s.verbose > 0)
     clog << _F("Completed SDT benchmark in %ldusr/%ldsys/%ldreal ms.",
-               (tms_after.tms_utime - tms_before.tms_utime) * 1000 / _sc_clk_tck,
-               (tms_after.tms_stime - tms_before.tms_stime) * 1000 / _sc_clk_tck,
-               ((tv_after.tv_sec - tv_before.tv_sec) * 1000 +
+               (long)(tms_after.tms_utime - tms_before.tms_utime) * 1000 / _sc_clk_tck,
+               (long)(tms_after.tms_stime - tms_before.tms_stime) * 1000 / _sc_clk_tck,
+               (long)((tv_after.tv_sec - tv_before.tv_sec) * 1000 +
                 ((long)tv_after.tv_usec - (long)tv_before.tv_usec) / 1000))
          << endl;
 
@@ -347,7 +356,7 @@ run_sdt_benchmark(systemtap_session& s)
 
 
 // Compilation passes 0 through 4
-static int
+int
 passes_0_4 (systemtap_session &s)
 {
   int rc = 0;
@@ -368,19 +377,15 @@ passes_0_4 (systemtap_session &s)
     {
 #if HAVE_NSS
       compile_server_client client (s);
-      int rc = client.passes_0_4 ();
-      // Need to give a user a better diagnostic, if she didn't
-      // even ask for a server
-      if (rc && s.automatic_server_mode) {
-        cerr << _("Note: --use-server --unprivileged was selected because of stapusr membership.") << endl;
-      }
-      return rc;
+      return client.passes_0_4 ();
 #else
-      s.print_warning("Without NSS, using a compile-server is not supported by this version of systemtap");
+      s.print_warning(_("Without NSS, using a compile-server is not supported by this version of systemtap"));
+
       // This cannot be an attempt to use a server after a local compile failed
       // since --use-server-on-error is locked to 'no' if we don't have
       // NSS.
       assert (! s.try_server ());
+      s.print_warning(_("Ignoring --use-server"));
 #endif
     }
 
@@ -405,14 +410,16 @@ passes_0_4 (systemtap_session &s)
     }
 
   // Now that no further changes to s.kernel_build_tree can occur, let's use it.
-  if ((rc = s.parse_kernel_config ()) != 0
-      || (rc = s.parse_kernel_exports ()) != 0
-      || (rc = s.parse_kernel_functions ()) != 0)
-    {
-      // Try again with a server
-      s.set_try_server ();
-      return rc;
-    }
+  if (s.runtime_mode == systemtap_session::kernel_runtime) {
+    if ((rc = s.parse_kernel_config ()) != 0
+        || (rc = s.parse_kernel_exports ()) != 0
+        || (rc = s.parse_kernel_functions ()) != 0)
+      {
+        // Try again with a server
+        s.set_try_server ();
+        return rc;
+      }
+  }
 
   // Create the name of the C source file within the temporary
   // directory.  Note the _src prefix, explained in
@@ -429,272 +436,356 @@ passes_0_4 (systemtap_session &s)
   // PASS 1a: PARSING LIBRARY SCRIPTS
   PROBE1(stap, pass1a__start, &s);
 
-  // We need to handle the library scripts first because this pass
-  // gathers information on .stpm files that might be needed to
-  // parse the user script.
-
-  // We need to first ascertain the status of the user script, though.
-  struct stat user_file_stat;
-  int user_file_stat_rc = -1;
-
-  if (s.script_file == "-")
+  if (! s.pass_1a_complete)
     {
-      user_file_stat_rc = fstat (STDIN_FILENO, & user_file_stat);
-    }
-  else if (s.script_file != "")
-    {
-      user_file_stat_rc = stat (s.script_file.c_str(), & user_file_stat);
-    }
-  // otherwise, rc is 0 for a command line script
+      // We need to handle the library scripts first because this pass
+      // gathers information on .stpm files that might be needed to
+      // parse the user script.
 
-  vector<string> version_suffixes;
-  if (s.runtime_mode == systemtap_session::kernel_runtime)
-    {
-      // Construct kernel-versioning search path
-      string kvr = s.kernel_release;
+      // We need to first ascertain the status of the user script, though.
+      struct stat user_file_stat;
+      int user_file_stat_rc = -1;
 
-      // add full kernel-version-release (2.6.NN-FOOBAR)
-      version_suffixes.push_back ("/" + kvr);
-
-      // add kernel version (2.6.NN)
-      if (kvr != s.kernel_base_release)
+      if (s.script_file == "-")
         {
-          kvr = s.kernel_base_release;
-          version_suffixes.push_back ("/" + kvr);
-        }
-
-      // add kernel family (2.6)
-      string::size_type dot1_index = kvr.find ('.');
-      string::size_type dot2_index = kvr.rfind ('.');
-      while (dot2_index > dot1_index && dot2_index != string::npos)
+	  user_file_stat_rc = fstat (STDIN_FILENO, & user_file_stat);
+	}
+      else if (s.script_file != "")
         {
-          kvr.erase(dot2_index);
-          version_suffixes.push_back ("/" + kvr);
-          dot2_index = kvr.rfind ('.');
-        }
-    }
+	  user_file_stat_rc = stat (s.script_file.c_str(), & user_file_stat);
+	}
+      // otherwise, rc is 0 for a command line script
 
-  // add empty string as last element
-  version_suffixes.push_back ("");
-
-  // Add arch variants of every path, just before each
-  const string& arch = s.architecture;
-  for (unsigned i=0; i<version_suffixes.size(); i+=2)
-    version_suffixes.insert(version_suffixes.begin() + i,
-                            version_suffixes[i] + "/" + arch);
-
-  // Add runtime variants of every path, before everything else
-  string runtime_prefix;
-  if (s.runtime_mode == systemtap_session::kernel_runtime)
-    runtime_prefix = "/linux";
-  else if (s.runtime_mode == systemtap_session::dyninst_runtime)
-    runtime_prefix = "/dyninst";
-  if (!runtime_prefix.empty())
-    for (unsigned i=0; i<version_suffixes.size(); i+=2)
-      version_suffixes.insert(version_suffixes.begin() + i/2,
-                              runtime_prefix + version_suffixes[i]);
-
-  // First, parse .stpm files on the include path. We need to have the
-  // resulting macro definitions available for parsing library files,
-  // but since .stpm files can consist only of '@define' constructs,
-  // we can parse each one without reference to the others.
-  set<pair<dev_t, ino_t> > seen_library_macro_files;
-  set<string> seen_library_macro_files_names;
-
-  for (unsigned i=0; i<s.include_path.size(); i++)
-    {
-      // now iterate upon it
-      for (unsigned k=0; k<version_suffixes.size(); k++)
+      vector<string> version_suffixes;
+      if (s.runtime_mode == systemtap_session::kernel_runtime)
         {
-          glob_t globbuf;
-          string dir = s.include_path[i] + version_suffixes[k] + "/*.stpm";
-          int r = glob(dir.c_str (), 0, NULL, & globbuf);
-          if (r == GLOB_NOSPACE || r == GLOB_ABORTED)
-            rc ++;
-          // GLOB_NOMATCH is acceptable
+	  // Construct kernel-versioning search path
+	  string kvr = s.kernel_release;
 
-          unsigned prev_s_library_files = s.library_files.size();
+	  // add full kernel-version-release (2.6.NN-FOOBAR)
+	  version_suffixes.push_back ("/" + kvr);
 
-          for (unsigned j=0; j<globbuf.gl_pathc; j++)
-            {
-              assert_no_interrupts();
+	  // add kernel version (2.6.NN)
+	  if (kvr != s.kernel_base_release)
+	    {
+	      kvr = s.kernel_base_release;
+	      version_suffixes.push_back ("/" + kvr);
+	    }
 
-              struct stat tapset_file_stat;
-              int stat_rc = stat (globbuf.gl_pathv[j], & tapset_file_stat);
-              if (stat_rc == 0 && user_file_stat_rc == 0 &&
-                  user_file_stat.st_dev == tapset_file_stat.st_dev &&
-                  user_file_stat.st_ino == tapset_file_stat.st_ino)
-                {
-                  cerr
-                  << _F("usage error: macro tapset file '%s' cannot be run directly as a session script.",
-                        globbuf.gl_pathv[j]) << endl;
-                  rc ++;
-                }
+	  // add kernel family (2.6)
+	  string::size_type dot1_index = kvr.find ('.');
+	  string::size_type dot2_index = kvr.rfind ('.');
+	  while (dot2_index > dot1_index && dot2_index != string::npos)
+	    {
+	      kvr.erase(dot2_index);
+	      version_suffixes.push_back ("/" + kvr);
+	      dot2_index = kvr.rfind ('.');
+	    }
+	}
 
-              // PR11949: duplicate-eliminate tapset files
-              if (stat_rc == 0)
-                {
-                  pair<dev_t,ino_t> here = make_pair(tapset_file_stat.st_dev,
-                                                     tapset_file_stat.st_ino);
-                  if (seen_library_macro_files.find(here) != seen_library_macro_files.end()) {
-                    if (s.verbose>2)
-                      clog << _F("Skipping tapset \"%s\", duplicate inode.", globbuf.gl_pathv[j]) << endl;
-                    continue; 
-                  }
-                  seen_library_macro_files.insert (here);
-                }
+      // add empty string as last element
+      version_suffixes.push_back ("");
 
-              // PR12443: duplicate-eliminate harder
-              string full_path = globbuf.gl_pathv[j];
-              string tapset_base = s.include_path[i]; // not dir; it has arch suffixes too
-              if (full_path.size() > tapset_base.size()) {
-                string tail_part = full_path.substr(tapset_base.size());
-                if (seen_library_macro_files_names.find (tail_part) != seen_library_macro_files_names.end()) {
-                  if (s.verbose>2)
-                      clog << _F("Skipping tapset \"%s\", duplicate name.", globbuf.gl_pathv[j]) << endl;
-                  continue;
-                }
-                seen_library_macro_files_names.insert (tail_part);
-              }
+      // Add arch variants of every path, just before each
+      const string& arch = s.architecture;
+      for (unsigned i=0; i<version_suffixes.size(); i+=2)
+	version_suffixes.insert(version_suffixes.begin() + i,
+				version_suffixes[i] + "/" + arch);
 
-              if (s.verbose>2)
-                clog << _F("Processing tapset \"%s\"", globbuf.gl_pathv[j]) << endl;
+      // Add runtime variants of every path, before everything else
+      string runtime_prefix;
+      if (s.runtime_mode == systemtap_session::kernel_runtime)
+	runtime_prefix = "/linux";
+      else if (s.runtime_mode == systemtap_session::dyninst_runtime)
+	runtime_prefix = "/dyninst";
+      if (!runtime_prefix.empty())
+	for (unsigned i=0; i<version_suffixes.size(); i+=2)
+	    version_suffixes.insert(version_suffixes.begin() + i/2,
+				    runtime_prefix + version_suffixes[i]);
 
-              stapfile* f = parse_library_macros (s, globbuf.gl_pathv[j],
-                                                  true /* errs_as_warnings */);
-              if (f == 0)
-                s.print_warning(_F("macro tapset \"%s\" has errors, and will be skipped.", string(globbuf.gl_pathv[j]).c_str()));
-              else
-                s.library_files.push_back (f);
-            }
+      // First, parse .stpm files on the include path. We need to have the
+      // resulting macro definitions available for parsing library files,
+      // but since .stpm files can consist only of '@define' constructs,
+      // we can parse each one without reference to the others.
+      set<pair<dev_t, ino_t> > seen_library_macro_files;
+      set<string> seen_library_macro_files_names;
 
-          unsigned next_s_library_files = s.library_files.size();
-          if (s.verbose>1 && globbuf.gl_pathc > 0)
-            //TRANSLATORS: Searching through directories, 'processed' means 'examined so far'
-            clog << _F("Searched for library macro files: \"%s\", found: %zu, processed: %u",
-                       dir.c_str(), globbuf.gl_pathc,
-                       (next_s_library_files-prev_s_library_files)) << endl;
-
-          globfree (&globbuf);
-        }
-    }
-
-  // Next, gather and parse the library files.
-  set<pair<dev_t, ino_t> > seen_library_files;
-  set<string> seen_library_files_names;
-
-  for (unsigned i=0; i<s.include_path.size(); i++)
-    {
-      // now iterate upon it
-      for (unsigned k=0; k<version_suffixes.size(); k++)
+      for (unsigned i=0; i<s.include_path.size(); i++)
         {
-          glob_t globbuf;
-          string dir = s.include_path[i] + version_suffixes[k] + "/*.stp";
-          int r = glob(dir.c_str (), 0, NULL, & globbuf);
-          if (r == GLOB_NOSPACE || r == GLOB_ABORTED)
-	    rc ++;
-	  // GLOB_NOMATCH is acceptable
+	  // now iterate upon it
+	  for (unsigned k=0; k<version_suffixes.size(); k++)
+	    {
+	      glob_t globbuf;
+	      string dir = s.include_path[i] + version_suffixes[k] + "/*.stpm";
+	      int r = glob(dir.c_str (), 0, NULL, & globbuf);
+	      if (r == GLOB_NOSPACE || r == GLOB_ABORTED)
+		rc ++;
+	      // GLOB_NOMATCH is acceptable
 
-          unsigned prev_s_library_files = s.library_files.size();
+	      unsigned prev_s_library_files = s.library_files.size();
 
-          for (unsigned j=0; j<globbuf.gl_pathc; j++)
-            {
-              assert_no_interrupts();
+	      for (unsigned j=0; j<globbuf.gl_pathc; j++)
+	        {
+		  assert_no_interrupts();
 
-              struct stat tapset_file_stat;
-              int stat_rc = stat (globbuf.gl_pathv[j], & tapset_file_stat);
-              if (stat_rc == 0 && user_file_stat_rc == 0 &&
-                  user_file_stat.st_dev == tapset_file_stat.st_dev &&
-                  user_file_stat.st_ino == tapset_file_stat.st_ino)
-                {
-                  cerr 
-                  << _F("usage error: tapset file '%s' cannot be run directly as a session script.",
-                        globbuf.gl_pathv[j]) << endl;
-                  rc ++;
-                }
+		  struct stat tapset_file_stat;
+		  int stat_rc = stat (globbuf.gl_pathv[j], & tapset_file_stat);
+		  if (stat_rc == 0 && user_file_stat_rc == 0 &&
+		      user_file_stat.st_dev == tapset_file_stat.st_dev &&
+		      user_file_stat.st_ino == tapset_file_stat.st_ino)
+		    {
+		      cerr
+			  << _F("usage error: macro tapset file '%s' cannot be run directly as a session script.",
+				globbuf.gl_pathv[j]) << endl;
+		      rc ++;
+		    }
 
-              // PR11949: duplicate-eliminate tapset files
-              if (stat_rc == 0)
-                {
-                  pair<dev_t,ino_t> here = make_pair(tapset_file_stat.st_dev,
-                                                     tapset_file_stat.st_ino);
-                  if (seen_library_files.find(here) != seen_library_files.end()) {
-                    if (s.verbose>2)
-                      clog << _F("Skipping tapset \"%s\", duplicate inode.", globbuf.gl_pathv[j]) << endl;
-                    continue; 
-                  }
-                  seen_library_files.insert (here);
-                }
+		  // PR11949: duplicate-eliminate tapset files
+		  if (stat_rc == 0)
+		    {
+		      pair<dev_t,ino_t> here = make_pair(tapset_file_stat.st_dev,
+							 tapset_file_stat.st_ino);
+		      if (seen_library_macro_files.find(here) != seen_library_macro_files.end())
+		        {
+			  if (s.verbose>2)
+			    clog << _F("Skipping tapset \"%s\", duplicate inode.", globbuf.gl_pathv[j]) << endl;
+			  continue; 
+			}
+		      seen_library_macro_files.insert (here);
+		    }
 
-              // PR12443: duplicate-eliminate harder
-              string full_path = globbuf.gl_pathv[j];
-              string tapset_base = s.include_path[i]; // not dir; it has arch suffixes too
-              if (full_path.size() > tapset_base.size()) {
-                string tail_part = full_path.substr(tapset_base.size());
-                if (seen_library_files_names.find (tail_part) != seen_library_files_names.end()) {
-                  if (s.verbose>2)
-                      clog << _F("Skipping tapset \"%s\", duplicate name.", globbuf.gl_pathv[j]) << endl;
-                  continue;
-                }
-                seen_library_files_names.insert (tail_part);
-              }
+		  // PR12443: duplicate-eliminate harder
+		  string full_path = globbuf.gl_pathv[j];
+		  string tapset_base = s.include_path[i]; // not dir; it has arch suffixes too
+		  if (full_path.size() > tapset_base.size())
+		    {
+		      string tail_part = full_path.substr(tapset_base.size());
+		      if (seen_library_macro_files_names.find (tail_part) != seen_library_macro_files_names.end())
+		        {
+			  if (s.verbose>2)
+			    clog << _F("Skipping tapset \"%s\", duplicate name.", globbuf.gl_pathv[j]) << endl;
+			  continue;
+			}
+		      seen_library_macro_files_names.insert (tail_part);
+		    }
 
-              if (s.verbose>2)
-                clog << _F("Processing tapset \"%s\"", globbuf.gl_pathv[j]) << endl;
+		  if (s.verbose>2)
+		    clog << _F("Processing tapset \"%s\"", globbuf.gl_pathv[j]) << endl;
 
-              // NB: we don't need to restrict privilege only for /usr/share/systemtap, i.e., 
-              // excluding user-specified $XDG_DATA_DIRS.  That's because stapdev gets
-              // root-equivalent privileges anyway; stapsys and stapusr use a remote compilation
-              // with a trusted environment, where client-side $XDG_DATA_DIRS are not passed.
+		  stapfile* f = parse_library_macros (s, globbuf.gl_pathv[j]);
+		  if (f == 0)
+		    s.print_warning(_F("macro tapset \"%s\" has errors, and will be skipped.", string(globbuf.gl_pathv[j]).c_str()));
+		  else
+		    s.library_files.push_back (f);
+		}
 
-              stapfile* f = parse (s, globbuf.gl_pathv[j],
-                                    true /* privileged */,
-                                    true /* errs_as_warnings */);
-              if (f == 0)
-                s.print_warning(_F("tapset \"%s\" has errors, and will be skipped", string(globbuf.gl_pathv[j]).c_str()));
-              else
-                s.library_files.push_back (f);
-            }
+	      unsigned next_s_library_files = s.library_files.size();
+	      if (s.verbose>1 && globbuf.gl_pathc > 0)
+		  //TRANSLATORS: Searching through directories, 'processed' means 'examined so far'
+		clog << _F("Searched for library macro files: \"%s\", found: %zu, processed: %u",
+			   dir.c_str(), globbuf.gl_pathc,
+			   (next_s_library_files-prev_s_library_files)) << endl;
 
-          unsigned next_s_library_files = s.library_files.size();
-          if (s.verbose>1 && globbuf.gl_pathc > 0)
-            //TRANSLATORS: Searching through directories, 'processed' means 'examined so far'
-            clog << _F("Searched: \"%s\", found: %zu, processed: %u",
-                       dir.c_str(), globbuf.gl_pathc,
-                       (next_s_library_files-prev_s_library_files)) << endl;
+	      globfree (&globbuf);
+	    }
+	}
 
-          globfree (& globbuf);
-        }
-    }
-  if (s.num_errors())
-    rc ++;
+      // Next, gather and parse the library files.
+      set<pair<dev_t, ino_t> > seen_library_files;
+      set<string> seen_library_files_names;
+
+      for (unsigned i=0; i<s.include_path.size(); i++)
+        {
+	  unsigned tapset_flags = pf_guru | pf_squash_errors;
+
+	  // The first path is special, as it's the builtin tapset.
+	  // Allow all features no matter what s.compatible says.
+	  if (i == 0)
+	    tapset_flags |= pf_no_compatible;
+
+	  // now iterate upon it
+	  for (unsigned k=0; k<version_suffixes.size(); k++)
+	    {
+	      glob_t globbuf;
+	      string dir = s.include_path[i] + version_suffixes[k] + "/*.stp";
+	      int r = glob(dir.c_str (), 0, NULL, & globbuf);
+	      if (r == GLOB_NOSPACE || r == GLOB_ABORTED)
+		  rc ++;
+	      // GLOB_NOMATCH is acceptable
+
+	      unsigned prev_s_library_files = s.library_files.size();
+
+	      for (unsigned j=0; j<globbuf.gl_pathc; j++)
+	        {
+		  assert_no_interrupts();
+
+		  struct stat tapset_file_stat;
+		  int stat_rc = stat (globbuf.gl_pathv[j], & tapset_file_stat);
+		  if (stat_rc == 0 && user_file_stat_rc == 0 &&
+		      user_file_stat.st_dev == tapset_file_stat.st_dev &&
+		      user_file_stat.st_ino == tapset_file_stat.st_ino)
+		    {
+		      cerr 
+			  << _F("usage error: tapset file '%s' cannot be run directly as a session script.",
+				globbuf.gl_pathv[j]) << endl;
+		      rc ++;
+		    }
+
+		  // PR11949: duplicate-eliminate tapset files
+		  if (stat_rc == 0)
+		    {
+		      pair<dev_t,ino_t> here = make_pair(tapset_file_stat.st_dev,
+							 tapset_file_stat.st_ino);
+		      if (seen_library_files.find(here) != seen_library_files.end())
+		        {
+			  if (s.verbose>2)
+			    clog << _F("Skipping tapset \"%s\", duplicate inode.", globbuf.gl_pathv[j]) << endl;
+			  continue; 
+			}
+		      seen_library_files.insert (here);
+		    }
+
+		  // PR12443: duplicate-eliminate harder
+		  string full_path = globbuf.gl_pathv[j];
+		  string tapset_base = s.include_path[i]; // not dir; it has arch suffixes too
+		  if (full_path.size() > tapset_base.size())
+		    {
+		      string tail_part = full_path.substr(tapset_base.size());
+		      if (seen_library_files_names.find (tail_part) != seen_library_files_names.end())
+		        {
+			  if (s.verbose>2)
+			    clog << _F("Skipping tapset \"%s\", duplicate name.", globbuf.gl_pathv[j]) << endl;
+			  continue;
+			}
+		      seen_library_files_names.insert (tail_part);
+		    }
+
+		  if (s.verbose>2)
+		    clog << _F("Processing tapset \"%s\"", globbuf.gl_pathv[j]) << endl;
+
+		  // NB: we don't need to restrict privilege only for
+		  // /usr/share/systemtap, i.e., excluding
+		  // user-specified $XDG_DATA_DIRS.  That's because
+		  // stapdev gets root-equivalent privileges anyway;
+		  // stapsys and stapusr use a remote compilation with
+		  // a trusted environment, where client-side
+		  // $XDG_DATA_DIRS are not passed.
+
+		  stapfile* f = parse (s, globbuf.gl_pathv[j], tapset_flags);
+		  if (f == 0)
+		    s.print_warning(_F("tapset \"%s\" has errors, and will be skipped", string(globbuf.gl_pathv[j]).c_str()));
+		  else
+		    s.library_files.push_back (f);
+		}
+
+	      unsigned next_s_library_files = s.library_files.size();
+	      if (s.verbose>1 && globbuf.gl_pathc > 0)
+		  //TRANSLATORS: Searching through directories, 'processed' means 'examined so far'
+		clog << _F("Searched: \"%s\", found: %zu, processed: %u",
+			   dir.c_str(), globbuf.gl_pathc,
+			   (next_s_library_files-prev_s_library_files)) << endl;
+
+	      globfree (& globbuf);
+	    }
+	}
+      if (s.num_errors())
+	rc ++;
+
+      // Now that we've made it through pass 1a, remember this so we
+      // don't have to do this again in interactive mode. This doesn't
+      // effect non-interactive mode.
+      s.pass_1a_complete = true;
+  }
 
   // PASS 1b: PARSING USER SCRIPT
   PROBE1(stap, pass1b__start, &s);
 
-  if (s.script_file == "-")
+  // Only try to parse a user script if the user provided one, or if we have to
+  // make one (as is the case for listing mode). Otherwise, s.user_script
+  // remains NULL.
+  if (!s.script_file.empty() ||
+      !s.cmdline_script.empty() ||
+      s.dump_mode == systemtap_session::dump_matched_probes ||
+      s.dump_mode == systemtap_session::dump_matched_probes_vars)
     {
-      s.user_file = parse (s, cin, s.guru_mode, false /* errs_as_warnings */);
-    }
-  else if (s.script_file != "")
-    {
-      s.user_file = parse (s, s.script_file, s.guru_mode, false /* errs_as_warnings */);
-    }
-  else
-    {
-      istringstream ii (s.cmdline_script);
-      s.user_file = parse (s, ii, s.guru_mode, false /* errs_as_warnings */);
-    }
-  if (s.user_file == 0)
-    {
-      // Syntax errors already printed.
-      rc ++;
+      unsigned user_flags = s.guru_mode ? pf_guru : 0;
+      user_flags |= pf_user_file;
+      if (s.script_file == "-")
+        {
+          s.user_files.push_back (parse (s, "<input>", cin, user_flags));
+        }
+      else if (s.script_file != "")
+        {
+          s.user_files.push_back (parse (s, s.script_file, user_flags));
+        }
+      else if (s.cmdline_script != "")
+        {
+          istringstream ii (s.cmdline_script);
+          s.user_files.push_back(parse (s, "<input>", ii, user_flags));
+        }
+      else // listing mode
+        {
+          istringstream ii ("probe " + s.dump_matched_pattern + " {}");
+          s.user_files.push_back (parse (s, "<input>", ii, user_flags));
+        }
+
+      // parses the additional script(s) (-E script). does so even if in listing
+      // mode, incase there is something special in the additional script(s),
+      // like a macro or alias. give them a unique name to differentiate the
+      // scripts that were inputted.
+      unsigned count = 1;
+      for (vector<string>::iterator script = s.additional_scripts.begin(); script != s.additional_scripts.end(); script++)
+        {
+          string input_name = "<input" + lex_cast(count) + ">";
+          istringstream ii (*script);
+          s.user_files.push_back(parse (s, input_name, ii, user_flags));
+          count ++;
+        }
+
+      for(vector<stapfile*>::iterator it = s.user_files.begin(); it != s.user_files.end(); it++)
+        {
+          if (!(*it))
+            {
+              // Syntax errors already printed.
+              rc ++;
+            }
+        }
     }
 
-  if (rc == 0 && s.last_pass == 1)
+  // Dump a list of probe aliases picked up, if requested
+  if (s.dump_mode == systemtap_session::dump_probe_aliases)
+    {
+      set<string> aliases;
+      vector<stapfile*>::const_iterator file;
+      for (file  = s.library_files.begin();
+           file != s.library_files.end(); ++file)
+        {
+          vector<probe_alias*>::const_iterator alias;
+          for (alias  = (*file)->aliases.begin();
+               alias != (*file)->aliases.end(); ++alias)
+            {
+              stringstream ss;
+              (*alias)->printsig(ss);
+              string str = ss.str();
+              if (!s.verbose && startswith(str, "_"))
+                continue;
+              aliases.insert(str);
+            }
+        }
+
+      set<string>::iterator alias;
+      for (alias  = aliases.begin();
+           alias != aliases.end(); ++alias)
+        {
+          cout << *alias << endl;
+        }
+    }
+  // Dump the parse tree if this is the last pass
+  else if (rc == 0 && s.last_pass == 1)
     {
       cout << _("# parse tree dump") << endl;
-      s.user_file->print (cout);
+      for (vector<stapfile*>::iterator it = s.user_files.begin(); it != s.user_files.end(); it++)
+        (*it)->print (cout);
       cout << endl;
       if (s.verbose)
         for (unsigned i=0; i<s.library_files.size(); i++)
@@ -710,7 +801,7 @@ passes_0_4 (systemtap_session &s)
   struct timeval tv_after;
   gettimeofday (&tv_after, NULL);
 
-#define TIMESPRINT "in " << \
+#define TIMESPRINT _("in ") << \
            (tms_after.tms_cutime + tms_after.tms_utime \
             - tms_before.tms_cutime - tms_before.tms_utime) * 1000 / (_sc_clk_tck) << "usr/" \
         << (tms_after.tms_cstime + tms_after.tms_stime \
@@ -722,21 +813,23 @@ passes_0_4 (systemtap_session &s)
   if (s.verbose)
     {
       // XXX also include a count of helper macro files loaded (.stpm)?
-      clog << "Pass 1: parsed user script and "
-           << s.library_files.size()
-           << " library script(s) "
+      int n = int(s.library_files.size());
+      clog << _("Pass 1: parsed user script and ")
+           << _NF("%d library script ", "%d library scripts ", n, n)
            << getmemusage()
            << TIMESPRINT
            << endl;
     }
 
-  if (rc && !s.listing_mode)
+  if (rc && !s.dump_mode)
     cerr << _("Pass 1: parse failed.  [man error::pass1]") << endl;
 
   PROBE1(stap, pass1__end, &s);
 
   assert_no_interrupts();
-  if (rc || s.last_pass == 1) return rc;
+  if (rc || s.last_pass == 1 ||
+      s.dump_mode == systemtap_session::dump_probe_aliases)
+    return rc;
 
   times (& tms_before);
   gettimeofday (&tv_before, NULL);
@@ -747,31 +840,62 @@ passes_0_4 (systemtap_session &s)
   rc = semantic_pass (s);
 
   // Dump a list of known probe point types, if requested.
-  if (s.dump_probe_types)
+  if (s.dump_mode == systemtap_session::dump_probe_types)
     s.pattern_root->dump (s);
-
-  if (s.listing_mode || (rc == 0 && s.last_pass == 2))
+  // Dump a list of functions we picked up, if requested.
+  else if (s.dump_mode == systemtap_session::dump_functions)
+    {
+      map<string,functiondecl*>::const_iterator func;
+      for (func  = s.functions.begin();
+           func != s.functions.end(); ++func)
+        {
+          functiondecl& curfunc = *func->second;
+          if (curfunc.synthetic)
+            continue;
+          if (!startswith(curfunc.name, "__global_"))
+            continue;
+          if (!s.verbose && startswith(curfunc.name, "__global__"))
+            continue;
+          curfunc.printsigtags(cout, s.verbose>0 /* all_tags */ );
+          cout << endl;
+        }
+    }
+  // Dump the whole script if requested, or if we stop at 2
+  else if (s.dump_mode == systemtap_session::dump_matched_probes ||
+           s.dump_mode == systemtap_session::dump_matched_probes_vars ||
+           (rc == 0 && s.last_pass == 2))
     printscript(s, cout);
 
   times (& tms_after);
   gettimeofday (&tv_after, NULL);
 
-  if (s.verbose) clog << "Pass 2: analyzed script: "
-                      << s.probes.size() << " probe(s), "
-                      << s.functions.size() << " function(s), "
-                      << s.embeds.size() << " embed(s), "
-                      << s.globals.size() << " global(s) "
-                      << getmemusage()
-                      << TIMESPRINT
-                      << endl;
+  if (s.verbose) {
+    int np = s.probes.size();
+    int nf = s.functions.size();
+    int ne = s.embeds.size();
+    int ng = s.globals.size();
+    clog << _("Pass 2: analyzed script: ")
+         << _NF("%d probe, ", "%d probes, ", np, np)
+         << _NF("%d function, ", "%d functions, ", nf, nf)
+         << _NF("%d embed, ", "%d embeds, ", ne, ne)
+         << _NF("%d global ", "%d globals ", ng, ng)
+         << getmemusage()
+         << TIMESPRINT
+         << endl;
+  }
 
-  if (rc && !s.listing_mode && !s.try_server ())
+  missing_rpm_list_print(s, "-debuginfo");
+
+  if (rc && !s.dump_mode && !s.try_server ())
     cerr << _("Pass 2: analysis failed.  [man error::pass2]") << endl;
 
   PROBE1(stap, pass2__end, &s);
 
   assert_no_interrupts();
-  if (rc || s.listing_mode || s.last_pass == 2) return rc;
+  // NB: none of the dump modes need to go beyond pass-2. If this changes, break
+  // into individual modes here.
+  if (rc || s.last_pass == 2 || s.dump_mode)
+    return rc;
 
   rc = prepare_translate_pass (s);
   assert_no_interrupts();
@@ -830,7 +954,7 @@ passes_0_4 (systemtap_session &s)
   gettimeofday (&tv_after, NULL);
 
   if (s.verbose) 
-    clog << "Pass 3: translated to C into \""
+    clog << _("Pass 3: translated to C into \"")
          << s.translated_source
          << "\" "
          << getmemusage()
@@ -866,7 +990,7 @@ passes_0_4 (systemtap_session &s)
   times (& tms_after);
   gettimeofday (&tv_after, NULL);
 
-  if (s.verbose) clog << "Pass 4: compiled C into \""
+  if (s.verbose) clog << _("Pass 4: compiled C into \"")
                       << s.module_filename()
                       << "\" "
                       << TIMESPRINT
@@ -895,6 +1019,14 @@ passes_0_4 (systemtap_session &s)
 	  string module_dest_path = s.module_filename();
 	  copy_file(module_src_path, module_dest_path, s.verbose > 1);
 	}
+
+      // Copy uprobes module to the current directory.
+      if (s.save_uprobes && !s.uprobes_path.empty() && !pending_interrupts)
+        {
+          rc = create_dir("uprobes");
+          if (! rc)
+            copy_file(s.uprobes_path, "uprobes/uprobes.ko", s.verbose > 1);
+        }
     }
 
   PROBE1(stap, pass4__end, &s);
@@ -902,7 +1034,7 @@ passes_0_4 (systemtap_session &s)
   return rc;
 }
 
-static int
+int
 pass_5 (systemtap_session &s, vector<remote*> targets)
 {
   // PASS 5: RUN
@@ -922,7 +1054,7 @@ pass_5 (systemtap_session &s, vector<remote*> targets)
   unsigned _sc_clk_tck = sysconf (_SC_CLK_TCK);
   struct timeval tv_after;
   gettimeofday (&tv_after, NULL);
-  if (s.verbose) clog << "Pass 5: run completed "
+  if (s.verbose) clog << _("Pass 5: run completed ")
                       << TIMESPRINT
                       << endl;
 
@@ -1014,6 +1146,8 @@ main (int argc, char * const argv [])
         linecount ++;
         if (rc) break;
       }
+    rcf.close();
+
     int extended_argc = words.we_wordc + argc;
     char **extended_argv = (char**) calloc (extended_argc + 1, sizeof(char*));
     if (rc || !extended_argv)
@@ -1032,6 +1166,9 @@ main (int argc, char * const argv [])
     rc = s.parse_cmdline (extended_argc, extended_argv);
     if (rc != 0)
       return rc;
+
+    // Create the temp dir.
+    s.create_tmp_dir();
 
     if (words.we_wordc > 0 && s.verbose > 1)
       clog << _F("Extra options in %s: %d\n", rc_file.c_str(), (int)words.we_wordc);
@@ -1079,49 +1216,60 @@ main (int argc, char * const argv [])
     set<systemtap_session*> sessions;
     for (unsigned i = 0; i < targets.size(); ++i)
       sessions.insert(targets[i]->get_session());
-    for (set<systemtap_session*>::iterator it = sessions.begin();
-         rc == 0 && !pending_interrupts && it != sessions.end(); ++it)
+
+    // FIXME: For now, only attempt local interactive use.
+    if (s.interactive_mode && fake_remote)
       {
-        systemtap_session& ss = **it;
-        if (ss.verbose > 1)
-          clog << _F("Session arch: %s release: %s",
-                     ss.architecture.c_str(), ss.kernel_release.c_str()) << endl;
+#ifdef HAVE_LIBREADLINE
+	rc = interactive_mode (s, targets);
+#endif
+      }
+    else
+      {
+	for (set<systemtap_session*>::iterator it = sessions.begin();
+	     rc == 0 && !pending_interrupts && it != sessions.end(); ++it)
+	  {
+	    systemtap_session& ss = **it;
+            if (ss.verbose > 1)
+	      clog << _F("Session arch: %s release: %s",
+			 ss.architecture.c_str(), ss.kernel_release.c_str())
+		   << endl;
 
 #if HAVE_NSS
-        // If requested, query server status. This is independent of other tasks.
-        query_server_status (ss);
+	    // If requested, query server status. This is independent
+	    // of other tasks.
+	    query_server_status (ss);
 
-        // If requested, manage trust of servers. This is independent of other tasks.
-        manage_server_trust (ss);
+	    // If requested, manage trust of servers. This is
+	    // independent of other tasks.
+	    manage_server_trust (ss);
 #endif
 
-        // Run the passes only if a script has been specified. The requirement for
-        // a script has already been checked in systemtap_session::check_options.
-        // Run the passes also if a dump of supported probe types has been requested via a server.
-        if (ss.have_script || (ss.dump_probe_types && ! s.specified_servers.empty ()))
-          {
-            // Run passes 0-4 for each unique session,
-            // either locally or using a compile-server.
-            ss.init_try_server ();
-            if ((rc = passes_0_4 (ss)))
-              {
-                // Compilation failed.
-                // Try again using a server if appropriate.
-                if (ss.try_server ())
-                  rc = passes_0_4_again_with_server (ss);
-              }
-          }
-        else if (ss.dump_probe_types)
-          {
-            // Dump a list of known probe point types, if requested.
-            register_standard_tapsets(ss);
-            ss.pattern_root->dump (ss);
-          }
-      }
+	    // Run the passes only if a script has been specified or
+	    // if we're dumping something. The requirement for a
+	    // script has already been checked in
+	    // systemtap_session::check_options.
+	    if (ss.have_script || ss.dump_mode)
+	      {
+		// Run passes 0-4 for each unique session, either
+		// locally or using a compile-server.
+		ss.init_try_server ();
+		if ((rc = passes_0_4 (ss)))
+		  {
+		    // Compilation failed.
+		    // Try again using a server if appropriate.
+		    if (ss.try_server ())
+		      rc = passes_0_4_again_with_server (ss);
+		  }
+		if (rc || s.perpass_verbose[0] >= 1)
+		  s.explain_auto_options ();
+	      }
+	  }
 
-    // Run pass 5, if requested
-    if (rc == 0 && s.have_script && s.last_pass >= 5 && ! pending_interrupts)
-      rc = pass_5 (s, targets);
+	// Run pass 5, if requested
+	if (rc == 0 && s.have_script && s.last_pass >= 5 && ! pending_interrupts)
+	  rc = pass_5 (s, targets);
+      }
 
     // Pass 6. Cleanup
     for (unsigned i = 0; i < targets.size(); ++i)
@@ -1139,8 +1287,8 @@ main (int argc, char * const argv [])
       // Exiting for any quiet reason.
       return e.rc;
   }
-  catch (const runtime_error &e) {
-      // Some other uncaught runtime_error exception.
+  catch (const exception &e) {
+      // Some other uncaught exception.
       cerr << e.what() << endl;
       return EXIT_FAILURE;
   }

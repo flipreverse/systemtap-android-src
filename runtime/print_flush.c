@@ -16,15 +16,14 @@
  * @note Preemption must be disabled to use this.
  */
 
-static DEFINE_SPINLOCK(_stp_print_lock);
+static STP_DEFINE_SPINLOCK(_stp_print_lock);
 
-void EXPORT_FN(stp_print_flush)(_stp_pbuf *pb)
+void stp_print_flush(_stp_pbuf *pb)
 {
 	size_t len = pb->len;
 	void *entry = NULL;
 
 	/* check to see if there is anything in the buffer */
-	dbug_trans(1, "len = %zu\n", len);
 	if (likely(len == 0))
 		return;
 
@@ -32,6 +31,8 @@ void EXPORT_FN(stp_print_flush)(_stp_pbuf *pb)
 
 	if (unlikely(_stp_transport_get_state() != STP_TRANSPORT_RUNNING))
 		return;
+
+	dbug_trans(1, "len = %zu\n", len);
 
 #ifdef STP_BULKMODE
 #ifdef NO_PERCPU_HEADERS
@@ -107,10 +108,29 @@ void EXPORT_FN(stp_print_flush)(_stp_pbuf *pb)
 #else  /* STP_TRANSPORT_VERSION != 1 */
 	{
 		unsigned long flags;
+		struct context* __restrict__ c = NULL;
 		char *bufp = pb->buf;
 
+		/* Prevent probe reentrancy on _stp_print_lock.
+		 *
+		 * Since stp_print_flush may be called from probe context, we
+		 * have to make sure that its lock, _stp_print_lock, can't
+		 * possibly be held outside probe context too.  We ensure this
+		 * by grabbing the context here, so any probe triggered by this
+		 * region will appear reentrant and be skipped rather than
+		 * deadlock.  Failure to get_context just means we're already
+		 * in a probe, which is fine.
+		 *
+		 * (see also _stp_ctl_send for a similar situation)
+                 *
+                 * A better solution would be to replace this
+                 * concurrency-control-laden effort with a lockless
+                 * algorithm.
+		 */
+		c = _stp_runtime_entryfn_get_context();
+
 		dbug_trans(1, "calling _stp_data_write...\n");
-		spin_lock_irqsave(&_stp_print_lock, flags);
+		stp_spin_lock_irqsave(&_stp_print_lock, flags);
 		while (len > 0) {
 			size_t bytes_reserved;
 
@@ -127,7 +147,8 @@ void EXPORT_FN(stp_print_flush)(_stp_pbuf *pb)
 			    break;
 			}
 		}
-		spin_unlock_irqrestore(&_stp_print_lock, flags);
+		stp_spin_unlock_irqrestore(&_stp_print_lock, flags);
+		_stp_runtime_entryfn_put_context(c);
 	}
 #endif /* STP_TRANSPORT_VERSION != 1 */
 #endif /* !STP_BULKMODE */

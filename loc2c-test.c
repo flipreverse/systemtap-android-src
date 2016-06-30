@@ -117,6 +117,7 @@ handle_fields (struct obstack *pool,
 	case DW_TAG_typedef:
 	case DW_TAG_const_type:
 	case DW_TAG_volatile_type:
+	case DW_TAG_restrict_type:
 	  /* Just iterate on the referent type.  */
 	  break;
 
@@ -208,7 +209,7 @@ handle_fields (struct obstack *pool,
 	default:
 	  error (2, 0, _("%s: unexpected type tag %#x"),
 		 dwarf_diename (die) ?: "<anonymous type>",
-		 dwarf_tag (die));
+		 (unsigned)dwarf_tag (die));
 	  break;
 	}
 
@@ -231,7 +232,8 @@ handle_fields (struct obstack *pool,
       typetag = dwarf_tag (typedie);
       if (typetag != DW_TAG_typedef &&
 	  typetag != DW_TAG_const_type &&
-	  typetag != DW_TAG_volatile_type)
+	  typetag != DW_TAG_volatile_type &&
+	  typetag != DW_TAG_restrict_type)
 	break;
       if (dwarf_attr_integrate (typedie, DW_AT_type, &attr_mem) == NULL)
 	error (2, 0, _("cannot get type of field: %s"), dwarf_errmsg (-1));
@@ -418,8 +420,12 @@ print_type (Dwarf_Die *typedie, char space)
 	    print_type (die, space);
 	    printf (" volatile");
 	    break;
+	  case DW_TAG_restrict_type:
+	    print_type (die, space);
+	    printf (" restrict");
+	    break;
 	  default:
-	    printf ("%c<unknown %#x>", space, tag);
+	    printf ("%c<unknown %#x>", space, (unsigned)tag);
 	    break;
 	  }
 	}
@@ -427,7 +433,7 @@ print_type (Dwarf_Die *typedie, char space)
 }
 
 static void
-print_vars (unsigned int indent, Dwarf_Die *die)
+print_vars (int indent, Dwarf_Die *die)
 {
   Dwarf_Die child;
   Dwarf_Attribute attr_mem;
@@ -611,7 +617,7 @@ In the fifth form, the access is a store rather than a fetch."
 
   if (++argi == argc)
     {
-      unsigned int indent = 0;
+      int indent = 0;
       while (n-- > 0)
 	{
 	  Dwarf_Die *const die = &scopes[n];
@@ -620,7 +626,7 @@ In the fifth form, the access is a store rather than a fetch."
 	  printf ("%*s[%6" PRIx64 "] %s (%#x)", indent, "",
 		  dwarf_dieoffset (die),
 		  dwarf_diename (die) ?: "<unnamed>",
-		  dwarf_tag (die));
+		  (unsigned)dwarf_tag (die));
 
 	  Dwarf_Addr lowpc, highpc;
 	  if (dwarf_lowpc (die, &lowpc) == 0

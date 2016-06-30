@@ -19,6 +19,9 @@
 /* Define to 1 if you have the <boost/shared_ptr.hpp> header file. */
 #undef HAVE_BOOST_SHARED_PTR_HPP
 
+/* Define to 1 if you have the <boost/utility/string_ref.hpp> header file. */
+#undef HAVE_BOOST_UTILITY_STRING_REF_HPP
+
 /* Define to 1 if you have the <BPatch_object.h> header file. */
 #undef HAVE_BPATCH_OBJECT_H
 
@@ -40,6 +43,9 @@
 /* Define to 1 if Dyninst is enabled */
 #undef HAVE_DYNINST
 
+/* Define to 1 if F_SETPIPE_SZ is available. */
+#undef HAVE_F_SETPIPE_SZ
+
 /* Define if the GNU gettext() function is already present or preinstalled. */
 #undef HAVE_GETTEXT
 
@@ -59,6 +65,9 @@
 /* Define to 1 if you have the `elf' library (-lelf). */
 #undef HAVE_LIBELF
 
+/* Define if you have the readline library (-lreadline). */
+#undef HAVE_LIBREADLINE
+
 /* have librpm */
 #undef HAVE_LIBRPM
 
@@ -76,6 +85,9 @@
 
 /* Define to 1 if you have the <memory.h> header file. */
 #undef HAVE_MEMORY_H
+
+/* Define to 1 if json-c and ncurses libraries are installed */
+#undef HAVE_MONITOR_LIBS
 
 /* Define to 1 if you have the nss libraries. */
 #undef HAVE_NSS
@@ -115,9 +127,6 @@
 
 /* Define to 1 if you have the <unistd.h> header file. */
 #undef HAVE_UNISTD_H
-
-/* Define to 1 if your C compiler doesn't accept -c and -o together. */
-#undef NO_MINUS_C_MINUS_O
 
 /* Name of package */
 #undef PACKAGE

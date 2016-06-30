@@ -386,6 +386,8 @@ static long _stp_returnval(struct pt_regs *regs) {
 		return regs->u_regs[UREG_RETPC];
 #elif defined (__s390x__)
 		return regs->gprs[2];
+#elif defined (__aarch64__)
+		return regs->regs[0];
 #elif defined (__arm__)
 		return regs->ARM_r0;
 #else
@@ -407,7 +409,7 @@ static long _stp_returnval(struct pt_regs *regs) {
  * available. This is only a guess of the actual return value and can be
  * totally wrong. Normally only used in dwarfless probes.
  */
-function returnval:long () %{ /* pure */
+function returnval:long () %{ /* pure */ /* stable */
 	struct pt_regs *regs;
 	regs = (CONTEXT->user_mode_p ? CONTEXT->uregs : CONTEXT->kregs);
 	STAP_RETVALUE = _stp_returnval(regs);

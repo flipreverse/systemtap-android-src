@@ -1,4 +1,451 @@
-* What's new in version 2.5
+* What's new in version 3.0
+
+- The new experimental "interactive" mode, specified by "stap -i",
+  drops you into a command-line prompt where you can build up a script,
+  run it, edit it, run it again, etc. Type "help" for a list of commands.
+
+- New experimental --monitor[=INTERVAL] option similar to unix "top". This
+  allows users to see statistics about the running module(uptime, module name,
+  invoker uid, memory sizes, global variables, and the current probe list
+  along with their statistics).
+
+  An interface is also provided to allow control over the running
+  module(resetting global variables, sorting the list of probes, deactivating
+  and reactivating probes).
+
+- The performance of associative arrays have been dramatically
+  improved, especially for densely filled tables and for multiple
+  indexes.  The hash tables behind these arrays is now sized as a
+  function of the array maximum size with an optional MAPHASHBIAS
+  space/time tradeoff knob.
+
+- Add macros @prints to print a scalar aggregate variable, @prints[1-9]
+  to print an array aggregate (of given index-arity), formatted similarly
+  to the automatic printing of written-only global variables.
+
+  global a, b
+  probe oneshot { a <<< 1; b[tid()] <<< 2 }
+  probe end { @prints(a); @prints1(b) }
+
+- Functions may now be overloaded during module runtime using the "next"
+  statement in script functions and STAP_NEXT macro for embedded-C functions.
+  They may also be overloaded by number of parameters during compile time.
+  For example,
+
+  Runtime overloading:
+    function f() { if (condition) next; print("first function") }
+    function f() %{ STAP_NEXT; print("second function") %}
+    function f() { print("third function") }
+
+  For the given functions above, a functioncall f(), will execute the body of the
+  third function if condition evaluates to true and print "third function".
+  Note that the second function is unconditionally nexted.
+
+  Parameter overloading:
+    function g() { print("first function") }
+    function g(x) { print("second function") }
+    g() -> "first function"
+    g(1) -> "second function"
+
+  Note that runtime overloading does not occur in the above example as the number
+  of parameters of the functions differ. The use of a next statement inside a function
+  while no more overloads remain will trigger a runtime exception. The function
+  candidates are selected at compile time and is determined by the number of arguments
+  provided for the functioncall.
+
+- Add Czech version of manual pages.
+
+- The stap compile server will log the stap client's options that are passed
+  to the server. The options that get logged on the server will include the
+  script name or the -e script, depending on which is used by the client.
+
+- Embedded-C functions and blocks may now access script level global variables
+  using the STAP_GLOBAL_GET_* and STAP_GLOBAL_SET_* macros.
+
+  To read or write the script global var, the /* pragma:read:var */ or
+  /* pragma:write:var */ marker must be placed in the embedded-C function or block.
+  The written type must match the type inferred at script level.
+
+  Scalars:
+    STAP_GLOBAL_SET_var(STAP_GLOBAL_GET_var()+1) -> increments script global var by 1
+    STAP_GLOBAL_SET_var("hello")
+
+  Associative arrays:
+    STAP_GLOBAL_GET_var(index-1, ..., index-n)
+    STAP_GLOBAL_SET_var(index-1, ..., index-n, new value)
+
+- Probe point brace expansion is now supported to improve brevity in
+  specifying probe points. For example,
+
+  process.{function("a"), function("b").{call,return}}
+  => process.function("a"), process.function("b").call, process.function("b").return
+
+  process.{function("*").callees,plt}?
+  => process.function("*").callees?, process.plt?
+
+  {kernel,module("nfs")}.function("nfs*")!
+  => kernel.function("nfs*")!, module("nfs").function("nfs*")!
+
+- Profiling timers at arbitrary frequencies are now provided and perf probes
+  now support a frequency field as an alternative to sampling counts.
+
+  probe timer.profile.freq.hz(N)
+  probe perf.type(N).config(M).hz(X)
+
+  The specified frequency is only accurate up to around 100hz. You may
+  need to provide a higher value to achieve the desired rate.
+
+- Added support for private global variables and private functions. The scope
+  of these is limited to the tapset file they are defined in (PR19136).
+
+- New tapset function string_quoted() to quote and \-escape general strings.
+  String $context variables that are pretty-printed are now processed with
+  such a quotation engine, falling back to a 0x%x (hex pointer) on errors.
+
+- Functions get_mmap_args() and get_32mmap_args() got deprecated.
+
+* What's new in version 2.9, 2015-10-08
+
+- SystemTap now uses symbols from /proc/kallsyms when kernel debuginfo is not
+  available.
+
+- New --prologue-searching[=WHEN] option has been added to stap with '-P' being
+  its short counterpart.  Using --prologue-searching=never turns prologue
+  searching deliberately off working around issue of int_arg() returning wrong
+  value when a 32-bit userspace binary having debug info is being probed with
+  active prologue searching (PR18649).
+
+- The powerpc variant of nd_syscall.compat_sysctl got deprecated on favor of
+  nd_syscall.sysctl32. This aligns the nd_syscall to its respective syscall and
+  to ia64/s390/x86_64 variants too.
+
+- New tapset function assert(expression, msg) has been added.
+
+- Embedded-C functions may now use the new STAP_PRINTF(fmt, ...)
+  macro for output.
+
+- New tapset functions fullname_struct_path and fullname_struct_nameidata
+  resolve full path names from internal kernel struct pointers.
+  
+- New tapset functions arch_bytes() and uarch_bytes() to obtain address size
+  for kernel and user space respectively.
+
+- New tapset function switch_file() allows control over rotation
+  of output files.
+
+- The [nd_]syscall tapset got autodocumented. Related paragraph got added to PDF
+  and HTML tapset reference. Also a new tapset::syscall 3stap man page got added.
+
+- Embedded-C functions with parameter arity-0 can now be marked with
+  the /* stable */ /* pure */ pragmas, if (roughly speaking) the
+  function is side-effect-free and idempotent.  The translator may
+  execute these speculatively and have their results memoized.  This
+  lets probes with multiple calls to such functions run faster. 
+  
+  Context variable ($foo) getter functions (in non-guru mode), and
+  numerous tapset functions are now marked as /* stable */ /* pure */.
+  Several example scripts have been modified to eschew explicit
+  memoization.
+
+- Callee probe points now support '.return' and '.call' suffix.
+  For example,
+
+    process("proc").function("foo").callee("bar").return
+
+  will fire upon returning from bar when called by foo.
+
+    process("proc").function("foo").callee("bar").call
+
+  will only fire for non-inlined callees.
+
+- The following tapset variables and functions are deprecated in
+  version 2.9:
+  - The '__int32_compat' library macro got deprecated in favor of
+    new '__compat_long' library macro.
+  - The 'uargs' convenience variable of the 'seccomp' syscall probe
+    got deprecated in favor of new 'uargs_uaddr' variable.
+
+- SystemTap has reduced its memory consumption by using interned_strings (a
+  wrapper for boost::string_ref) in place of std::string instances. The change
+  is to reduce the number of duplicate strings created by replacing them with
+  interned_strings which act like pointers to existing strings.
+
+  For the implementation of interned_string, see stringtable.h
+
+* What's new in version 2.8, 2015-06-17
+
+- SystemTap has improved support for probing golang programs. Work has been
+  done to be able to handle DWARF information, reporting file names, line
+  numbers, and column numbers, and tolerance of odd characters in symbol names.
+
+- The function::*, probe::* and new macro::* man pages cross-references the
+  enclosing tapset::* man page. For example:
+
+  function::pn(3stap) mentions tapset::pn(3stap) in the SEE ALSO section
+
+- New stapref(1) man page provides a reference for the scripting language. The
+  stapref page contains an overview of the features available in the language,
+  such as keywords, data types, operators and more.
+
+- The @task macro performs the very common @cast to a task_struct.
+
+  The embedded-C bodies of task_current() and pid2task() are now wrapped
+  by @task, which gives them a debuginfo type on the return value.  With
+  autocast type propagation, this removes the need for any explicit @cast
+  in many places.
+
+  Other places which take untyped task pointers as parameters, for
+  instance, now use @task as well to simplify their code.
+
+- New namespace-aware tapset functions [task_]ns_*() and ia new option
+  --target-namespaces=PID to denote a target set of namespaces corresponding to
+  the PID's namespaces. The namespace-aware tapsets will return values
+  relative to the target namespaces if specified, or the stap process' namespaces.
+
+- Netfilter probes now attempt to decode Spanning Tree Protocol packets
+  into local variables: probe netfilter.bridge.*, br_* variables,
+  stp_dump.stp sample script.
+
+- Colorization of error string tokens is made more robust, especially
+  in presence of $N/@N substitution.
+
+- The following tapset variables and functions are deprecated in
+  version 2.8:
+  - The 'hostname_uaddr' variable in the syscall.setdomainname and
+    nd_syscall.setdomainname probe aliases have been deprecated in
+    favor of the new 'domainname_uaddr' variable.
+  - The 'fd' and 'fd_str' variables in the syscall.execveat and
+    nd_syscall.execveat probe aliases have been deprecated in favor of
+    the new 'dirfd' and 'dirfd_str' variables.
+
+* What's new in version 2.7, 2015-02-18
+
+- Some systemtap sample scripts are now identified with the "_best" keyword,
+  because they are generally useful or educational.  They are now promoted
+  within the generated index files.
+
+- Passing strings to and from functions has become faster due to optimization
+  (passing some strings by reference instead of by value/copy).  It may
+  be disabled by using the unoptimize flag (-u).
+
+  To make embedded-C functions eligible for the same optimization, use the pragma
+  /* unmodified-fnargs */ to indicate that the function body will not modify
+  the function arguments.  Remember to use MAXSTRINGLEN for string length,
+  rather than sizeof(string_arg) (which might now be a pointer).
+
+- SystemTap now allows .function probes to be specified by their full function
+  name, file, and declaration line number. Use the .statement probe to probe a
+  specific line number.
+
+- Tracepoint probes can now also be specified by the target subsystem. For
+  example, the following are all supported:
+
+  probe kernel.trace("sched:sched_switch") --> probe sched_switch found in the
+                                               sched subsystem
+  probe kernel.trace("sched:*") --> probe all tracepoints in sched subsystem
+
+  As a result, tapset functions such as pn() will now return a different string
+  than before. To retain the previous behaviour, use '--compatible=2.6'.
+
+- The following functions are deprecated in release 2.7:
+  - _adjtx_mode_str(), _statfs_f_type_str(), _waitid_opt_str(),
+    _internal_wait_opt_str(), and _epoll_events_str().
+
+- New tapset functions [u]symfileline(), [u]symfile() and [u]symline() will
+  return a string containing the specified portion of the filename:linenumber
+  match from a given address.
+
+  Using these functions may result in large generated modules from stored
+  address->file:line information.
+
+* What's new in version 2.6, 2014-09-05
+
+- SystemTap now supports on-the-fly arming/disarming of certain probe types:
+  kprobes, uprobes, and timer.*s(NUM) probes. For example, this probe
+
+  probe kernel.function("vfs_read") if (i > 4) { ... }
+
+  will automatically register/unregister the associated kprobe on vfs_read
+  whenever the value of the condition changes (as some probe handler
+  modifies 'i').  This allows us to avoid probe overhead when we're not
+  interested.  If the arming capability is not relevant/useful, nest the
+  condition in the normal probe handler:
+
+  probe kernel.function("vfs_read") { if (i > 4) { ... } }
+
+- statement("*@file:NNN").nearest probes now available to let systemtap
+  translate probe to nearest probe-able line to one given if necessary
+
+- process("PATH").library("PATH").plt("NAME").return probes are now supported.
+
+- SystemTap now supports SDT probes with operands that refer to symbols.
+
+- While in listing mode (-l/-L), probes printed are now more consistent
+  and precise.
+
+- Statement probes now support enumerated linenos to probe discontiguous
+  linenos using the form:
+
+  process.statement("foo@file.c:3,5-7,9")
+
+- Statement counting is now suppressed in the generated c code for probes that
+  are non-recursive and loop-free. Statement counting can be turned back on in
+  unoptimize mode (-u).
+
+- SystemTap now asserts that the PID provided for a process probe corresponds
+  to a running process.
+
+- DWARF process probes can be bound to a specific process using the form:
+
+  process(PID).function("*")
+
+- SystemTap now accepts additional scripts through the new -E SCRIPT option.
+  There still needs to be a main script specified through -e or file in order
+  to provide an additional script. This makes it feasible to have scripts in
+  the $HOME/.systemtap/rc file.  For example:
+
+  -E 'probe begin, end, error { log("systemtap script " . pn()) }'
+  -E 'probe timer.s(30) { error ("timeout") }
+
+  The -E SCRIPT option can also be used in listing mode (-l/-L), such that
+  probe points for the additional scripts will not listed, but other parts of
+  the script are still available, such as macros or aliases.
+
+- SystemTap now supports array slicing within foreach loop conditions, delete
+  statements and membership tests. Wildcards are represented by "*". Examples
+  of the expressions are:
+
+  foreach ([a,b,c] in val[*,2,*])
+  delete val[*, 2, *]
+  [*, 2, *] in val
+
+- Integer expressions which are derived from DWARF values, like context $vars,
+  @cast, and @var, will now carry that type information into subsequent reads.
+  Such expressions can now use "->" and "[]" operators, as can local variables
+  which were assigned such values.
+
+  foo = $param->foo; printf("x:%d y:%d\n", foo->x, foo->y)
+  printf("my value is %d\n", ($type == 42 ? $foo : $bar)->value)
+  printf("my parent pid is %d\n", task_parent(task_current())->tgid)
+
+* What's new in version 2.5, 2014-04-30
+
+- Systemtap now supports backtracing through its own, invoking module.
+
+- Java probes now support backtracing using the print_java_backtrace()
+  and sprint_java_backtrace() functions.
+
+- Statement probes (e.g. process.statement) are now faster to resolve,
+  more precise, and work better with inlined functions.
+
+- New switches have been added to help inspect the contents of installed
+  library files:
+
+  stap --dump-functions --> list all library functions and their args
+  stap --dump-probe-aliases --> list all library probe aliases
+
+- The heuristic algorithms used to search for function-prologue
+  endings were improved, to cover more optimization (or
+  lack-of-optimization, or incorrect-debuginfo) cases.  These
+  heuristics are necessary to find $context parameters for some
+  function-call/entry probes.  We recommend programs be built with
+  CFLAGS+=-grecord-gcc-switches to feed information to the heuristics.
+
+- The stap --use-server option now more correctly supports address:port
+  type parametrization, for manual use in the absence of avahi.
+
+- A new probe alias "oneshot" allows a single quick script fragment to run,
+  then exit.
+
+- The argv tapset now merges translate-time and run-time positional
+  arguments, so all of these work:
+
+  stap -e 'probe oneshot {println(argv[1]," ",argv[2])}' hello world
+
+  stap -e 'probe oneshot {println(argv[1]," ",argv[2])}' \
+       -G argv_1=hello -G argv_2=world
+
+  staprun hello.ko argv_1=hello argv_2=world
+
+- SystemTap now falls back on the symbol table for probing
+  functions in processes if the debuginfo is not available.
+
+- SystemTap now supports a %( guru_mode == 0 /* or 1 */ %)
+  conditional for making dual-use scripts.
+
+- SystemTap now supports UEFI/SecureBoot systems, via
+  machine-owner-keys maintained by a trusted stap-server on the
+  network.  (Key enrollment requires a one-time reboot and BIOS
+  conversation.)
+  https://sourceware.org/systemtap/wiki/SecureBoot
+
+- SystemTap now reports more accurate and succinct errors on type
+  mismatches.
+
+- Embedded-C functions may use STAP_RETURN(value) instead of the
+  more wordy STAP_RETVALUE assignment followed by a "goto out".
+  The macro supports numeric or string values as appropriate.
+  STAP_ERROR(...) is available to return with a (catchable) error.
+
+- Some struct-sockaddr fields are now individually decoded for
+  socket-related syscalls:
+  probe syscall.connect { println (uaddr_af, ":", uaddr_ip) }
+
+- The documentation for the SystemTap initscript service and the
+  SystemTap compile-server service have been completely converted from
+  README files to man pages (see systemtap(8) and stap-server(8)).
+
+- SystemTap is now capable of inserting modules early during the boot
+  process on dracut-based systems. See the 'onboot' command in
+  systemtap(8) for more information.
+
+- DWARF probes can now use the '.callee[s]' variants, which allow more
+  precise function probing. For example, the probe point
+
+    process("myproc").function("foo").callee("bar")
+
+  will fire upon entering bar() from foo(). A '.callees' probe will
+  instead place probes on all callees of foo().
+    Note that this also means that probe point wildcards should be used
+  with more care. For example, use signal.*.return rather than
+  signal.*.*, which would also match '.callees'. See stapprobes(3stap)
+  for more info. This feature requires at least GCC 4.7.
+
+- A few new functions in the task_time tapsets, as well as a new tapset
+  function task_ancestry(), which prints out the parentage of a process.
+
+- The kprocess.exec probe has been updated to use syscall.execve, which
+  allows access to the new process' arguments (through the new 'argstr'
+  or 'args' variables) as well as giving better support across kernel
+  versions. Note also that the 'filename' variable now holds the
+  filename (quoted), or the address (unquoted) if it couldn't be
+  retrieved.
+
+- The [s]println() function can now be called without any arguments to
+  simply print a newline.
+
+- Suggestions are now provided when markers could not be resolved. For
+  example, process("stap").mark("benchmart") will suggest 'benchmark'.
+
+- SystemTap colors can now be turned off by simply setting
+  SYSTEMTAP_COLORS to be empty, rather than having to make it invalid.
+
+- There is a new context tapset function, pnlabel(), which returns the
+  name of the label which fired.
+
+- The following tapset variables and functions are deprecated in
+  release 2.5:
+  - The 'clone_flags', 'stack_start', 'stack_size',
+    'parent_tid_uaddr', and 'child_tid_uaddr' variables in the
+    'syscall.fork' and 'nd_syscall.fork' probe aliases. 
+  - The '_sendflags_str()' and '_recvflags_str()' functions have been
+    deprecated in favor of the new '_msg_flags_str()' function.
+  - The 'flags' and 'flags_str' variables in the 'syscall.accept' and
+    'nd_syscall.accept' probe alias.
+  - The 'first', 'second', and 'uptr_uaddr' variables in the
+    'syscall.compat_sys_shmctl', and 'nd_syscall.compat_sys_shmctl'
+    probe aliases have been deprecated in favor of the new 'shmid',
+    'cmd', and 'buf_uaddr' variables.
 
 * What's new in version 2.4, 2013-11-06
 

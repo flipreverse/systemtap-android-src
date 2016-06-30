@@ -1,13 +1,13 @@
 // NB: functionally equivalent to linux/target_set.stp
 
-global _target_set # map: target-set-pid -> ancestor-pid
+@__private30 global _target_set # map: target-set-pid -> ancestor-pid
 
 function target_set_pid (pid)
 {
 	return ([pid] in _target_set)
 }
 
-probe begin
+probe init
 {
 	if (target())
 		_target_set[target()] = stp_pid()

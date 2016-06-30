@@ -10,7 +10,9 @@
 #define _STP_STRING_H_
 
 #define to_oct_digit(c) ((c) + '0')
-static int _stp_text_str(char *out, char *in, int inlen, int outlen, int quoted, int user);
+#define to_hex_digit(c) ({ char __c = (c); __c += (__c < 10 ? '0' : 'A' - 10); __c; })
+
+static int _stp_text_str(char *out, const char *in, int inlen, int outlen, int quoted, int user);
 
 
 #if defined(__KERNEL__)

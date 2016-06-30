@@ -1,10 +1,10 @@
-% Copyright (C) 2005-2010 Red Hat Inc.
+% Copyright (C) 2005-2013 Red Hat Inc.
 % This file is part of systemtap, and is free software.  You can
 % redistribute it and/or modify it under the terms of the GNU General
 % Public License (GPL); either version 2, or (at your option) any
 % later version.
 
-\documentclass{article}
+\documentclass[compatible]{article}
 \usepackage{html}
 \usepackage{graphicx}
 % \usepackage{moreverb}
@@ -12,7 +12,7 @@
 \usepackage{listings}
 \usepackage{fullpage}
 \usepackage{fancybox}
-\usepackage[compatible]{nomencl}
+% \usepackage{nomencl}
 % \usepackage{geometry}
 % \geometry{letterpaper,text={7in,8.5in}}
 \usepackage{charter}
@@ -21,9 +21,7 @@
     {\begin{makeimage}\begin{center}\begin{Sbox}\begin{minipage}}%
     {\end{minipage}\end{Sbox}\fbox{\TheSbox}\end{center}\end{makeimage}}
 
-\begin{htmlonly}
-\renewcommand{\nomenclature}[2]{}
-\end{htmlonly}
+\newcommand{\nomenclature}[2]{}
 
 % \usepackage{draftcopy} % ugly
 \bibliographystyle{plain}
@@ -322,7 +320,7 @@ probe kernel.function("*@net/socket.c").return {
   return now don't match anymore.  This is because now the first probe
   will match both normal function entry and inlined functions.  Try
   putting the \verb+.call+ modifier back and add another probe just for
-  \verb+probe kernel.function("*@net/socket.c").return+
+  \verb+probe kernel.function("*@net/socket.c").inline+
   What \verb+printf+ statement can you come up with in the probe handler
   to show the inlined function entries nicely in between the \verb+.call+
   and \verb+.return+ thread indented output?
@@ -1109,11 +1107,11 @@ and a live GIT source repository.  Come join us!
 \appendix
 
 \section{Glossary}
-\renewcommand{\nomname}{}
-\printglossary
-\begin{htmlonly}
-{\em Sorry, not available in HTML.}
-\end{htmlonly}
+% \renewcommand{\nomname}{}
+% \printglossary
+% \begin{htmlonly}
+{\em Sorry, no glossary available.}
+% \end{htmlonly}
 
 \section{Errors}
 

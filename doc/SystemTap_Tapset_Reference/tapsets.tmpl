@@ -7,7 +7,7 @@
   <title>SystemTap Tapset Reference Manual</title>
 <!--starthere-->
   <copyright>
-   <year>2008-2013</year>
+   <year>2008-2015</year>
    <holder>Red Hat, Inc. and others</holder>
   </copyright>
 
@@ -126,6 +126,7 @@
 !Itapset/linux/context-caller.stp
 !Itapset/linux/ucontext-unwind.stp
 !Itapset/linux/task.stp
+!Itapset/linux/task_ancestry.stp
 !Itapset/pn.stp
 !Itapset/linux/pstrace.stp
 !Itapset/registers.stp
@@ -281,6 +282,7 @@
     </para>
 !Itapset/linux/kprocess.stp
 !Itapset/linux/target_set.stp
+!Itapset/linux/loadavg.stp
   </chapter>
   <chapter id="signal.stp">
     <title>Signal Tapset</title>
@@ -297,6 +299,15 @@
       It contains the following functions:
     </para>
 !Itapset/errno.stp
+  </chapter>
+  <chapter id="rlimit.stp">
+    <title>RLIMIT Tapset</title>
+    <para>
+      This set of functions is used to handle string which defines resource limits (RLIMIT_*) and returns
+      corresponding number of resource limit.
+      It contains the following functions:
+    </para>
+!Itapset/linux/rlimit.stp
   </chapter>
   <chapter id="dev.stp">
     <title>Device Tapset</title>
@@ -430,4 +441,26 @@
     </para>
 !Itapset/speculative.stp
   </chapter>
+
+  <chapter id="json.stp">
+    <title>JSON Tapset</title>
+    <para>
+      This family of probe points, functions, and macros is used to
+      output data in JSON format.
+      It contains the following probe points, functions, and macros:
+    </para>
+!Itapset/linux/json.stp
+!Itapset/linux/json.stpm    
+  </chapter>
+
+  <chapter id="switchfile.stp">
+    <title>Output file switching Tapset</title>
+    <para>
+      Utility function to allow switching of output files.
+    </para>
+!Itapset/switchfile.stp
+  </chapter>
+
+!Syscalls
+
 </book>

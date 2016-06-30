@@ -35,10 +35,10 @@ static atomic_t __stp_attach_count = ATOMIC_INIT (0);
 
 #define debug_task_finder_attach() (atomic_inc(&__stp_attach_count))
 #define debug_task_finder_detach() (atomic_dec(&__stp_attach_count))
-#define debug_task_finder_report() (_stp_dbug(__FUNCTION__, __LINE__, \
-					      "attach count: %d, inuse count: %d\n", \
-					      atomic_read(&__stp_attach_count), \
-					      atomic_read(&__stp_inuse_count)))
+#define debug_task_finder_report()					\
+    (printk(KERN_ERR "%s:%d - attach count: %d, inuse count: %d\n",	\
+	    __FUNCTION__, __LINE__, atomic_read(&__stp_attach_count),	\
+	    atomic_read(&__stp_inuse_count)))
 #else
 #define debug_task_finder_attach()	/* empty */
 #define debug_task_finder_detach()	/* empty */
@@ -95,7 +95,7 @@ struct stap_task_finder_target {
 };
 
 static LIST_HEAD(__stp_tf_task_work_list);
-static DEFINE_SPINLOCK(__stp_tf_task_work_list_lock);
+static STP_DEFINE_SPINLOCK(__stp_tf_task_work_list_lock);
 struct __stp_tf_task_work {
 	struct list_head list;
 	struct task_struct *task;
@@ -132,9 +132,9 @@ __stp_tf_alloc_task_work(void *data)
 	// list for easier lookup, but as short as the list should be
 	// (and as short lived as these items are) the extra overhead
 	// probably isn't worth the effort.
-	spin_lock_irqsave(&__stp_tf_task_work_list_lock, flags);
+	stp_spin_lock_irqsave(&__stp_tf_task_work_list_lock, flags);
 	list_add(&tf_work->list, &__stp_tf_task_work_list);
-	spin_unlock_irqrestore(&__stp_tf_task_work_list_lock, flags);
+	stp_spin_unlock_irqrestore(&__stp_tf_task_work_list_lock, flags);
 
 	return &tf_work->work;
 }
@@ -150,14 +150,14 @@ static void __stp_tf_free_task_work(struct task_work *work)
 	tf_work = container_of(work, struct __stp_tf_task_work, work);
 
 	// Remove the item from the list.
-	spin_lock_irqsave(&__stp_tf_task_work_list_lock, flags);
+	stp_spin_lock_irqsave(&__stp_tf_task_work_list_lock, flags);
 	list_for_each_entry(node, &__stp_tf_task_work_list, list) {
 		if (tf_work == node) {
 			list_del(&tf_work->list);
 			break;
 		}
 	}
-	spin_unlock_irqrestore(&__stp_tf_task_work_list_lock, flags);
+	stp_spin_unlock_irqrestore(&__stp_tf_task_work_list_lock, flags);
 
 	// Actually free the data.
 	_stp_kfree(tf_work);
@@ -169,17 +169,18 @@ static void __stp_tf_free_task_work(struct task_work *work)
 static void __stp_tf_cancel_task_work(void)
 {
 	struct __stp_tf_task_work *node;
+	struct __stp_tf_task_work *tmp;
 	unsigned long flags;
 
 	// Cancel all remaining requests.
-	spin_lock_irqsave(&__stp_tf_task_work_list_lock, flags);
-	list_for_each_entry(node, &__stp_tf_task_work_list, list) {
+	stp_spin_lock_irqsave(&__stp_tf_task_work_list_lock, flags);
+	list_for_each_entry_safe(node, tmp, &__stp_tf_task_work_list, list) {
 	    // Remove the item from the list, cancel it, then free it.
 	    list_del(&node->list);
 	    stp_task_work_cancel(node->task, node->work.func);
 	    _stp_kfree(node);
 	}
-	spin_unlock_irqrestore(&__stp_tf_task_work_list_lock, flags);
+	stp_spin_unlock_irqrestore(&__stp_tf_task_work_list_lock, flags);
 }
 
 static u32
@@ -417,30 +418,12 @@ stap_utrace_detach_ops(struct utrace_engine_ops *ops)
 	debug_task_finder_report();
 }
 
-static void
-__stp_task_finder_cleanup(void)
-{
-	// The utrace_shutdown() function detaches and deletes
-	// everything for us - we don't have to go through each
-	// engine.
-	utrace_shutdown();
-}
-
 static char *
 __stp_get_mm_path(struct mm_struct *mm, char *buf, int buflen)
 {
-	struct file *vm_file;
+	struct file *vm_file = stap_find_exe_file(mm);
 	char *rc = NULL;
 
-	// The down_read() function can sleep, so we'll call
-	// down_read_trylock() instead, which can fail.  If if fails,
-	// we'll just pretend this task didn't have a path.
-	if (!mm || ! down_read_trylock(&mm->mmap_sem)) {
-		*buf = '\0';
-		return ERR_PTR(-ENOENT);
-	}
-
-	vm_file = stap_find_exe_file(mm);
 	if (vm_file) {
 #ifdef STAPCONF_DPATH_PATH
 		rc = d_path(&(vm_file->f_path), buf, buflen);
@@ -448,12 +431,12 @@ __stp_get_mm_path(struct mm_struct *mm, char *buf, int buflen)
 		rc = d_path(vm_file->f_dentry, vm_file->f_vfsmnt,
 			    buf, buflen);
 #endif
+		fput(vm_file);
 	}
 	else {
 		*buf = '\0';
 		rc = ERR_PTR(-ENOENT);
 	}
-	up_read(&mm->mmap_sem);
 	return rc;
 }
 
@@ -700,7 +683,11 @@ __stp_call_mmap_callbacks_with_addr(struct stap_task_finder_target *tgt,
 		length = vma->vm_end - vma->vm_start;
 		offset = (vma->vm_pgoff << PAGE_SHIFT);
 		vm_flags = vma->vm_flags;
+#ifdef STAPCONF_DPATH_PATH
+		dentry = vma->vm_file->f_path.dentry;
+#else
 		dentry = vma->vm_file->f_dentry;
+#endif
 
 		// Allocate space for a path
 		mmpath_buf = _stp_kmalloc(PATH_MAX);
@@ -815,7 +802,7 @@ __stp_utrace_attach_match_filename(struct task_struct *tsk,
 #ifdef STAPCONF_TASK_UID
 	tsk_euid = tsk->euid;
 #else
-#ifdef CONFIG_UIDGID_STRICT_TYPE_CHECKS
+#if defined(CONFIG_USER_NS) || (LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0))
 	tsk_euid = from_kuid_munged(current_user_ns(), task_euid(tsk));
 #else
 	tsk_euid = task_euid(tsk);
@@ -1193,6 +1180,7 @@ __stp_call_mmap_callbacks_for_task(struct stap_task_finder_target *tgt,
 			    // get deleted from out under us.
 			    vma_cache_p->f_path = &(vma->vm_file->f_path);
 			    path_get(vma_cache_p->f_path);
+			    vma_cache_p->dentry = vma->vm_file->f_path.dentry;
 #else
 			    // Notice we're increasing the reference
 			    // count for 'dentry' and 'f_vfsmnt'.
@@ -1202,8 +1190,8 @@ __stp_call_mmap_callbacks_for_task(struct stap_task_finder_target *tgt,
 			    dget(vma_cache_p->dentry);
 			    vma_cache_p->f_vfsmnt = vma->vm_file->f_vfsmnt;
 			    mntget(vma_cache_p->f_vfsmnt);
-#endif
 			    vma_cache_p->dentry = vma->vm_file->f_dentry;
+#endif
 			    vma_cache_p->addr = vma->vm_start;
 			    vma_cache_p->length = vma->vm_end - vma->vm_start;
 			    vma_cache_p->offset = (vma->vm_pgoff << PAGE_SHIFT);
@@ -1414,7 +1402,7 @@ __stp_utrace_task_finder_target_syscall_entry(u32 action,
 	// results.
 	//
 	// FIXME: do we need to handle mremap()?
-	syscall_no = syscall_get_nr(tsk, regs);
+	syscall_no = _stp_syscall_get_nr(tsk, regs);
 	is_mmap_or_mmap2 = (syscall_no == MMAP_SYSCALL_NO(tsk)
 			    || syscall_no == MMAP2_SYSCALL_NO(tsk) ? 1 : 0);
 	if (!is_mmap_or_mmap2) {
@@ -1705,7 +1693,7 @@ stap_start_task_finder(void)
 #ifdef STAPCONF_TASK_UID
 		tsk_euid = tsk->euid;
 #else
-#ifdef CONFIG_UIDGID_STRICT_TYPE_CHECKS
+#if defined(CONFIG_USER_NS) || (LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0))
 		tsk_euid = from_kuid_munged(current_user_ns(), task_euid(tsk));
 #else
 		tsk_euid = task_euid(tsk);
@@ -1770,9 +1758,20 @@ stap_task_finder_post_init(void)
 		return;
 	}
 
+#ifdef DEBUG_TASK_FINDER
+	printk(KERN_ERR "%s:%d - entry.\n", __FUNCTION__, __LINE__);
+#endif
 	rcu_read_lock();
 	do_each_thread(grp, tsk) {
 		struct list_head *tgt_node;
+
+		if (atomic_read(&__stp_task_finder_state) != __STP_TF_RUNNING) {
+#ifdef DEBUG_TASK_FINDER
+			printk(KERN_ERR "%s:%d - exiting early...\n",
+			       __FUNCTION__, __LINE__);
+#endif
+			break;
+		}
 
 		/* If in stap -c/-x mode, skip over other processes. */
 		if (_stp_target && tsk->tgid != _stp_target)
@@ -1802,10 +1801,12 @@ stap_task_finder_post_init(void)
 				int rc = utrace_control(tsk, engine,
 							UTRACE_INTERRUPT);
 				/* If utrace_control() returns
-				 * EINPROGRESS when we're trying to
-				 * stop/interrupt, that means the task
-				 * hasn't stopped quite yet, but will
-				 * soon.  Ignore this error. */
+				 * EINPROGRESS when we're
+				 * trying to stop/interrupt,
+				 * that means the task hasn't
+				 * stopped quite yet, but will
+				 * soon.  Ignore this
+				 * error. */
 				if (rc != 0 && rc != -EINPROGRESS) {
 					_stp_error("utrace_control returned error %d on pid %d",
 						   rc, (int)tsk->pid);
@@ -1821,6 +1822,9 @@ stap_task_finder_post_init(void)
 	} while_each_thread(grp, tsk);
 	rcu_read_unlock();
 	atomic_set(&__stp_task_finder_complete, 1);
+#ifdef DEBUG_TASK_FINDER
+	printk(KERN_ERR "%s:%d - exit.\n", __FUNCTION__, __LINE__);
+#endif
 	return;
 }
 
@@ -1840,24 +1844,24 @@ stap_stop_task_finder(void)
 {
 #ifdef DEBUG_TASK_FINDER
 	int i = 0;
-#endif
 
+	printk(KERN_ERR "%s:%d - entry\n", __FUNCTION__, __LINE__);
+#endif
 	if (atomic_read(&__stp_task_finder_state) == __STP_TF_UNITIALIZED)
 		return;
 
 	atomic_set(&__stp_task_finder_state, __STP_TF_STOPPING);
-
 	debug_task_finder_report();
-#if 0
-	/* We don't need this since __stp_task_finder_cleanup()
-	 * removes everything by calling utrace_shutdown(). */
-	stap_utrace_detach_ops(&__stp_utrace_task_finder_ops);
-#endif
-	__stp_task_finder_cleanup();
+
+	// The utrace_shutdown() function detaches and cleans up
+	// everything for us - we don't have to go through each
+	// engine. This also means that the attach_count could end up
+	// > 0 (since we don't got through each engine individually).
+	utrace_shutdown();
+
 	debug_task_finder_report();
 	atomic_set(&__stp_task_finder_state, __STP_TF_STOPPED);
 
-#if 0
 	/* Now that all the engines are detached, make sure
 	 * all the callbacks are finished.  If they aren't, we'll
 	 * crash the kernel when the module is removed. */
@@ -1872,12 +1876,15 @@ stap_stop_task_finder(void)
 		printk(KERN_ERR "it took %d polling loops to quit.\n", i);
 #endif
 	debug_task_finder_report();
-#endif
+
+	/* Make sure all outstanding task work requests are finished. */
+	stp_task_work_exit();
+	__stp_tf_cancel_task_work();
 
 	utrace_exit();
-
-	/* Make sure all outstanding task work requests are canceled. */
-	__stp_tf_cancel_task_work();
+#ifdef DEBUG_TASK_FINDER
+	printk(KERN_ERR "%s:%d - exit\n", __FUNCTION__, __LINE__);
+#endif
 }
 
 #endif /* TASK_FINDER2_C */

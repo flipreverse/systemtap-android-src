@@ -155,9 +155,12 @@ static int host_connected()
     return 1;
   if (sigio_enabled)
     return sigio_port_status;
-  struct pollfd p = { listening_port_fd , POLLHUP, 0 };
-  poll(&p, 1, 0);
-  return !(p.revents & POLLHUP);
+  // Note that POLLHUP is useless there, it's just so that events != 0
+  struct pollfd p = { listening_port_fd, POLLHUP, 0 };
+  if (poll(&p, 1, 0) < 0) // if we can't poll, we don't know the real
+    return 0; // status, so be safe and say we're not connected
+  else // rc >= 0   // POLLHUP occurred (or we timed out == connected)
+    return !(p.revents & POLLHUP);
 }
 
 #define dbug(level, format, args...) do {                            \
@@ -263,9 +266,12 @@ sigio_handler(int sig)
   // sanity checks
   if (sig != SIGIO || listening_port_fd == -1)
     return;
+  // Note that POLLHUP is useless there, it's just so that events != 0
   struct pollfd pfd = { listening_port_fd, POLLHUP, 0 };
-  poll(&pfd, 1, 0);
-  sigio_port_status = !(pfd.revents & POLLHUP);
+  if (poll(&pfd, 1, 0) >= 0)
+    // POLLHUP occurred (or we timed out == connected)
+    sigio_port_status = !(pfd.revents & POLLHUP);
+  // else (i.e. poll() failed), keep the same status
 }
 
 static int
@@ -496,12 +502,14 @@ spawn_staprun_piped(char** args)
     }
   if ((err = pipe_child_fd(&fa, outfd, 1)) != 0)
     {
-      reply("ERROR: Can't create pipe for stdout: %s\n", strerror(err));
+      reply("ERROR: Can't create pipe for stdout: %s\n",
+            err > 0 ? strerror(err) : "pipe_child_fd");
       goto cleanup_fa;
     }
   if ((err = pipe_child_fd(&fa, errfd, 2)) != 0)
     {
-      reply("ERROR: Can't create pipe for stderr: %s\n", strerror(err));
+      reply("ERROR: Can't create pipe for stderr: %s\n",
+            err > 0 ? strerror(err) : "pipe_child_fd");
       goto cleanup_out;
     }
 
@@ -606,10 +614,11 @@ do_run()
     {
       // make staprun fds non-blocking and prep polling array
       int flags;
-      flags = fcntl(fd_staprun_out, F_GETFL) | O_NONBLOCK;
-      fcntl(fd_staprun_out, F_SETFL, flags);
-      flags = fcntl(fd_staprun_err, F_GETFL) | O_NONBLOCK;
-      fcntl(fd_staprun_err, F_SETFL, flags);
+      if ((flags = fcntl(fd_staprun_out, F_GETFL)) == -1
+        || fcntl(fd_staprun_out, F_SETFL, flags | O_NONBLOCK) == -1
+        ||(flags = fcntl(fd_staprun_err, F_GETFL)) == -1
+        || fcntl(fd_staprun_err, F_SETFL, flags | O_NONBLOCK) == -1)
+          return reply ("ERROR: Call to fcntl() failed");
 
       pfds[PFD_STAPRUN_OUT].fd = fd_staprun_out;
       pfds[PFD_STAPRUN_OUT].events = POLLIN;
@@ -638,7 +647,11 @@ process_command(void)
   // stap commands are short and always end in \n. Even if we do block it's not
   // so bad a thing.
   if (fgets(command, sizeof(command), stapsh_in) == NULL)
-    return;
+    {
+      if (feof(stapsh_in)) // no more stap commands coming
+        pfds[PFD_STAP_OUT].events = 0;
+      return;
+    }
 
   dbug(1, "command: %s", command);
   const char* arg = strtok(command, STAPSH_TOK_DELIM) ?: "(null)";
@@ -665,10 +678,10 @@ process_command(void)
 }
 
 static void
-prefix_staprun(int fdin, FILE *out, const char *stream)
+prefix_staprun(int i, FILE *out, const char *stream)
 {
   char buf[4096];
-  ssize_t n = read(fdin, buf, sizeof buf);
+  ssize_t n = read(pfds[i].fd, buf, sizeof buf);
   if (n > 0)
     {
       // actually check if we need to prefix data (we could also be piping for
@@ -679,6 +692,8 @@ prefix_staprun(int fdin, FILE *out, const char *stream)
         dbug(2, "failed fwrite\n"); // appease older gccs (don't ignore fwrite rc)
       fflush(out);
     }
+  else if (n == 0) // eof
+    pfds[i].events = 0;
 }
 
 int
@@ -739,7 +754,7 @@ main(int argc, char* const argv[])
   // Prep pfds. For now we're only interested in commands from stap, and we
   // don't poll staprun until it is started.
   pfds[PFD_STAP_OUT].fd = fileno(stapsh_in);
-  pfds[PFD_STAP_OUT].events = POLLIN | POLLHUP;
+  pfds[PFD_STAP_OUT].events = POLLIN;
   pfds[PFD_STAPRUN_OUT].events = 0;
   pfds[PFD_STAPRUN_ERR].events = 0;
 
@@ -751,17 +766,24 @@ main(int argc, char* const argv[])
       sleep(2); // Once we support only platforms with guaranteed SIGIO support,
                 // we could replace this with a pause().
 
-  for (;;)
+  // keep polling as long as we're listening for stap commands
+  while (pfds[PFD_STAP_OUT].events)
     {
-      poll(pfds, staprun_pid > 0 ? 3 : 1, -1);
+      if (poll(pfds, 3, -1) < 0)
+        {
+          if (errno == EINTR)
+            continue; // go back to poll()
+          else
+            die ("poll() failed with critical error");
+        }
       if (pfds[PFD_STAP_OUT].revents & POLLHUP)
         break;
       if (pfds[PFD_STAP_OUT].revents & POLLIN)
         process_command();
       if (pfds[PFD_STAPRUN_OUT].revents & POLLIN)
-        prefix_staprun(pfds[PFD_STAPRUN_OUT].fd, stapsh_out, "stdout");
+        prefix_staprun(PFD_STAPRUN_OUT, stapsh_out, "stdout");
       if (pfds[PFD_STAPRUN_ERR].revents & POLLIN)
-        prefix_staprun(pfds[PFD_STAPRUN_ERR].fd, stapsh_err, "stderr");
+        prefix_staprun(PFD_STAPRUN_ERR, stapsh_err, "stderr");
     }
 
   cleanup(0);

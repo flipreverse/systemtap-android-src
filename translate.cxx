@@ -1,5 +1,5 @@
 // translation pass
-// Copyright (C) 2005-2013 Red Hat Inc.
+// Copyright (C) 2005-2014 Red Hat Inc.
 // Copyright (C) 2005-2008 Intel Corporation.
 // Copyright (C) 2010 Novell Corporation.
 //
@@ -21,6 +21,7 @@
 #include "runtime/k_syms.h"
 #include "dwflpp.h"
 #include "stapregex.h"
+#include "stringtable.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -54,6 +55,7 @@ extern "C" {
 #define STAP_T_05 _("\"aggregation overflow in ")
 #define STAP_T_06 _("\"empty aggregate\";")
 #define STAP_T_07 _("\"histogram index out of range\";")
+
 using namespace std;
 
 class var;
@@ -62,6 +64,11 @@ struct aggvar;
 struct mapvar;
 class itervar;
 
+// A null-sink output stream, similar to /dev/null
+// (no buffer -> badbit -> quietly suppressed output)
+static ostream nullstream(NULL);
+static translator_output null_o(nullstream);
+
 struct c_unparser: public unparser, public visitor
 {
   systemtap_session* session;
@@ -69,21 +76,35 @@ struct c_unparser: public unparser, public visitor
 
   derived_probe* current_probe;
   functiondecl* current_function;
+
+  const functioncall* assigned_functioncall;
+  const string* assigned_functioncall_retval;
+
   unsigned tmpvar_counter;
   unsigned label_counter;
   unsigned action_counter;
+  unsigned fc_counter;
+  bool already_checked_action_count;
 
   varuse_collecting_visitor vcv_needs_global_locks;
 
-  map<string, string> probe_contents;
+  map<string, probe*> probe_contents;
 
   map<pair<bool, string>, string> compiled_printfs;
 
-  c_unparser (systemtap_session* ss):
-    session (ss), o (ss->op), current_probe(0), current_function (0),
-    tmpvar_counter (0), label_counter (0), action_counter(0),
-    vcv_needs_global_locks (*ss) {}
+  c_unparser (systemtap_session* ss, translator_output* op=NULL):
+    session (ss), o (op ?: ss->op), current_probe(0), current_function (0),
+    assigned_functioncall (0), assigned_functioncall_retval (0),
+    tmpvar_counter (0), label_counter (0), action_counter(0), fc_counter(0),
+    already_checked_action_count(false), vcv_needs_global_locks (*ss) {}
   ~c_unparser () {}
+
+  // The main c_unparser doesn't write declarations as it traverses,
+  // but the c_tmpcounter subclass will.
+  virtual void var_declare(string const&, var const&) {}
+
+  // If we've seen a dupe, return it; else remember this and return NULL.
+  probe *get_probe_dupe (derived_probe *dp);
 
   void emit_map_type_instantiations ();
   void emit_common_header ();
@@ -102,20 +123,21 @@ struct c_unparser: public unparser, public visitor
   void emit_lock_decls (const varuse_collecting_visitor& v);
   void emit_locks ();
   void emit_probe (derived_probe* v);
+  void emit_probe_condition_update(derived_probe* v);
   void emit_unlocks ();
 
   void emit_compiled_printfs ();
   void emit_compiled_printf_locals ();
   void declare_compiled_printf (bool print_to_stream, const string& format);
-  const string& get_compiled_printf (bool print_to_stream, const string& format);
+  virtual const string& get_compiled_printf (bool print_to_stream,
+					     const string& format);
 
   // for use by stats (pmap) foreach
   set<string> aggregations_active;
 
   // values immediately available in foreach_loop iterations
   map<string, string> foreach_loop_values;
-  void visit_foreach_loop_value (visitor* vis, foreach_loop* s,
-                                 const string& value="");
+  void visit_foreach_loop_value (foreach_loop* s, const string& value="");
   bool get_foreach_loop_value (arrayindex* ai, string& value);
 
   // for use by looping constructs
@@ -126,15 +148,21 @@ struct c_unparser: public unparser, public visitor
   virtual string c_localname (const string& e, bool mangle_oldstyle = false);
   virtual string c_globalname (const string &e);
   virtual string c_funcname (const string &e);
-  string c_expression (expression* e);
 
   string c_arg_define (const string& e);
   string c_arg_undef (const string& e);
 
+  string map_keytypes(vardecl* v);
+  void c_global_write_def(vardecl* v);
+  void c_global_read_def(vardecl* v);
+  void c_global_write_undef(vardecl* v);
+  void c_global_read_undef(vardecl* v);
+
   void c_assign (var& lvalue, const string& rvalue, const token* tok);
-  void c_assign (const string& lvalue, expression* rvalue, const string& msg);
+  void c_assign (tmpvar& lvalue, expression* rvalue, const char* msg);
+  void c_assign (const string& lvalue, expression* rvalue, const char* msg);
   void c_assign (const string& lvalue, const string& rvalue, exp_type type,
-                 const string& msg, const token* tok);
+                 const char* msg, const token* tok);
 
   void c_declare(exp_type ty, const string &ident);
   void c_declare_static(exp_type ty, const string &ident);
@@ -201,68 +229,70 @@ struct c_unparser: public unparser, public visitor
   void visit_stat_op (stat_op* e);
   void visit_hist_op (hist_op* e);
   void visit_cast_op (cast_op* e);
+  void visit_autocast_op (autocast_op* e);
   void visit_atvar_op (atvar_op* e);
   void visit_defined_op (defined_op* e);
   void visit_entry_op (entry_op* e);
   void visit_perf_op (perf_op* e);
+
+  // start/close statements with multiple independent child visits
+  virtual void start_compound_statement (const char*, statement*) { }
+  virtual void close_compound_statement (const char*, statement*) { }
+
+  // wrap one child visit of a compound statement
+  virtual void wrap_compound_visit (expression *e) { if (e) e->visit (this); }
+  virtual void wrap_compound_visit (statement *s) { if (s) s->visit (this); }
 };
 
 // A shadow visitor, meant to generate temporary variable declarations
-// for function or probe bodies.  Member functions should exactly match
-// the corresponding c_unparser logic and traversal sequence,
-// to ensure interlocking naming and declaration of temp variables.
-struct c_tmpcounter:
-  public traversing_visitor
+// for function or probe bodies.  The output is discarded, but we now do
+// real work in var_declare().
+struct c_tmpcounter cxx_final: public c_unparser
 {
   c_unparser* parent;
+  set<string> declared_vars;
+
   c_tmpcounter (c_unparser* p):
-    parent (p)
-  {
-    parent->tmpvar_counter = 0;
-  }
+    c_unparser(p->session, &null_o), parent (p)
+  { }
 
-  void load_map_indices(arrayindex* e);
-  void load_aggregate (expression *e);
+  // When vars are created *and used* (i.e. not overridden tmpvars) they call
+  // var_declare(), which will forward to the parent c_unparser for output;
+  void var_declare(string const&, var const& v) cxx_override;
 
-  void visit_block (block *s);
-  void visit_for_loop (for_loop* s);
-  void visit_foreach_loop (foreach_loop* s);
-  // void visit_return_statement (return_statement* s);
-  void visit_delete_statement (delete_statement* s);
-  // void visit_embedded_expr (embedded_expr* e);
-  void visit_binary_expression (binary_expression* e);
-  // void visit_unary_expression (unary_expression* e);
-  void visit_pre_crement (pre_crement* e);
-  void visit_post_crement (post_crement* e);
-  // void visit_logical_or_expr (logical_or_expr* e);
-  // void visit_logical_and_expr (logical_and_expr* e);
-  void visit_array_in (array_in* e);
-  void visit_regex_query (regex_query* e);
-  void visit_comparison (comparison* e);
-  void visit_concatenation (concatenation* e);
-  // void visit_ternary_expression (ternary_expression* e);
-  void visit_assignment (assignment* e);
-  void visit_arrayindex (arrayindex* e);
-  void visit_functioncall (functioncall* e);
-  void visit_print_format (print_format* e);
-  void visit_stat_op (stat_op* e);
+  void emit_function (functiondecl* fd);
+  void emit_probe (derived_probe* dp);
+
+  const string& get_compiled_printf (bool print_to_stream,
+				     const string& format) cxx_override;
+
+  void start_compound_statement (const char*, statement*) cxx_override;
+  void close_compound_statement (const char*, statement*) cxx_override;
+
+  void wrap_compound_visit (expression *e) cxx_override;
+  void wrap_compound_visit (statement *s) cxx_override;
+
+  void start_struct_def (std::ostream::pos_type &before,
+                         std::ostream::pos_type &after, const token* tok);
+  void close_struct_def (std::ostream::pos_type before,
+                         std::ostream::pos_type after);
 };
 
 struct c_unparser_assignment:
   public throwing_visitor
 {
   c_unparser* parent;
-  string op;
+  interned_string op;
   expression* rvalue;
   bool post; // true == value saved before modify operator
-  c_unparser_assignment (c_unparser* p, const string& o, expression* e):
+  c_unparser_assignment (c_unparser* p, interned_string o, expression* e):
     throwing_visitor ("invalid lvalue type"),
     parent (p), op (o), rvalue (e), post (false) {}
-  c_unparser_assignment (c_unparser* p, const string& o, bool pp):
+  c_unparser_assignment (c_unparser* p, interned_string o, bool pp):
     throwing_visitor ("invalid lvalue type"),
     parent (p), op (o), rvalue (0), post (pp) {}
 
-  void prepare_rvalue (string const & op,
+  void prepare_rvalue (interned_string op,
 		       tmpvar & rval,
 		       token const*  tok);
 
@@ -270,27 +300,6 @@ struct c_unparser_assignment:
 		  var const & lvar,
 		  tmpvar const & tmp,
 		  token const*  tok);
-
-  // only symbols and arrayindex nodes are possible lvalues
-  void visit_symbol (symbol* e);
-  void visit_arrayindex (arrayindex* e);
-};
-
-
-struct c_tmpcounter_assignment:
-  public traversing_visitor
-// leave throwing for illegal lvalues to the c_unparser_assignment instance
-{
-  c_tmpcounter* parent;
-  const string& op;
-  expression* rvalue;
-  bool post; // true == value saved before modify operator
-  c_tmpcounter_assignment (c_tmpcounter* p, const string& o, expression* e, bool pp = false):
-    parent (p), op (o), rvalue (e), post (pp) {}
-
-  void prepare_rvalue (tmpvar & rval);
-
-  void c_assignop(tmpvar & res);
 
   // only symbols and arrayindex nodes are possible lvalues
   void visit_symbol (symbol* e);
@@ -346,20 +355,31 @@ protected:
   string name;
   bool do_mangle;
 
+private:
+  mutable bool declaration_needed;
+
 public:
 
   var(c_unparser *u, bool local, exp_type ty,
       statistic_decl const & sd, string const & name)
-    : u(u), local(local), ty(ty), sd(sd), name(name), do_mangle(true)
+    : u(u), local(local), ty(ty), sd(sd), name(name),
+      do_mangle(true), declaration_needed(false)
   {}
 
   var(c_unparser *u, bool local, exp_type ty, string const & name)
-    : u(u), local(local), ty(ty), name(name), do_mangle(true)
+    : u(u), local(local), ty(ty), name(name),
+      do_mangle(true), declaration_needed(false)
   {}
 
   var(c_unparser *u, bool local, exp_type ty,
       string const & name, bool do_mangle)
-    : u(u), local(local), ty(ty), name(name), do_mangle(do_mangle)
+    : u(u), local(local), ty(ty), name(name),
+      do_mangle(do_mangle), declaration_needed(false)
+  {}
+
+  var(c_unparser *u, bool local, exp_type ty, unsigned & counter)
+    : u(u), local(local), ty(ty), name("__tmp" + lex_cast(counter++)),
+      do_mangle(false), declaration_needed(true)
   {}
 
   virtual ~var() {}
@@ -413,6 +433,12 @@ public:
 
   string value() const
   {
+    if (declaration_needed)
+      {
+	u->var_declare (name, *this);
+	declaration_needed = false;
+      }
+
     if (local)
       return "l->" + c_name();
     else
@@ -502,7 +528,7 @@ public:
       }
   }
 
-  void declare(c_unparser &c) const
+  virtual void declare(c_unparser &c) const
   {
     c.c_declare(ty, c_name());
   }
@@ -511,6 +537,13 @@ public:
 ostream & operator<<(ostream & o, var const & v)
 {
   return o << v.value();
+}
+
+void
+c_tmpcounter::var_declare (string const& name, var const& v)
+{
+  if (declared_vars.insert(name).second)
+    v.declare (*parent);
 }
 
 struct stmt_expr
@@ -537,7 +570,7 @@ protected:
 
 public:
   tmpvar(c_unparser *u, exp_type ty, unsigned & counter)
-    : var(u, true, ty, ("__tmp" + lex_cast(counter++)), false),
+    : var(u, true, ty, counter),
       overridden(false)
   {}
 
@@ -549,6 +582,11 @@ public:
   {
     overridden = true;
     override_value = value;
+  }
+
+  bool is_overridden()
+  {
+    return overridden;
   }
 
   string value() const
@@ -569,7 +607,7 @@ struct aggvar
   : public var
 {
   aggvar(c_unparser *u, unsigned & counter)
-    : var(u, true, pe_stats, ("__tmp" + lex_cast(counter++)), false)
+    : var(u, true, pe_stats, counter)
   {}
 
   string init() const
@@ -578,7 +616,7 @@ struct aggvar
     return value() + " = NULL;";
   }
 
-  void declare(c_unparser &c) const
+  void declare(c_unparser &c) const cxx_override
   {
     assert (type() == pe_stats);
     c.o->newline() << "struct stat_data *" << name << ";";
@@ -821,30 +859,27 @@ struct mapvar
 
 
 class itervar
+  : public var
 {
-  exp_type referent_ty;
-  string name;
-
 public:
 
-  itervar (symbol* e, unsigned & counter)
-    : referent_ty(e->referent->type),
-      name("__tmp" + lex_cast(counter++))
+  itervar (c_unparser *u, symbol* e, unsigned & counter)
+    : var(u, true, e->referent->type, counter)
   {
-    if (referent_ty == pe_unknown)
+    if (type() == pe_unknown)
       throw SEMANTIC_ERROR(_("iterating over unknown reference type"), e->tok);
   }
 
-  string declare () const
+  void declare(c_unparser &c) const cxx_override
   {
-    return "struct map_node *" + name + ";";
+    c.o->newline() << "struct map_node *" << name << ";";
   }
 
   string start (mapvar const & mv) const
   {
     string res;
 
-    if (mv.type() != referent_ty)
+    if (mv.type() != type())
       throw SEMANTIC_ERROR(_("inconsistent iterator type in itervar::start()"));
 
     if (mv.is_parallel())
@@ -855,7 +890,7 @@ public:
 
   string next (mapvar const & mv) const
   {
-    if (mv.type() != referent_ty)
+    if (mv.type() != type())
       throw SEMANTIC_ERROR(_("inconsistent iterator type in itervar::next()"));
 
     if (mv.is_parallel())
@@ -864,9 +899,16 @@ public:
       return "_stp_map_iter (" + mv.value() + ", " + value() + ")";
   }
 
-  string value () const
+  // Cannot handle deleting and iterating on pmaps
+  string del_next (mapvar const & mv) const
   {
-    return "l->" + name;
+    if (mv.type() != type())
+      throw SEMANTIC_ERROR(_("inconsistent iterator type in itervar::next()"));
+
+    if (mv.is_parallel())
+      throw SEMANTIC_ERROR(_("deleting a value of an unsupported map type"));
+    else
+      return "_stp_map_iterdel (" + mv.value() + ", " + value() + ")";
   }
 
   string get_key (mapvar const& mv, exp_type ty, unsigned i) const
@@ -889,7 +931,7 @@ public:
 
   string get_value (mapvar const& mv, exp_type ty) const
   {
-    if (ty != referent_ty)
+    if (ty != type())
       throw SEMANTIC_ERROR(_("inconsistent iterator value in itervar::get_value()"));
 
     switch (ty)
@@ -918,9 +960,81 @@ ostream & operator<<(ostream & o, itervar const & v)
 
 // ------------------------------------------------------------------------
 
+struct unmodified_fnargs_checker : public embedded_tags_visitor
+{
+  bool embedded_seen; // excludes code with pure and unmodified-args
+  unmodified_fnargs_checker (): embedded_tags_visitor(true), embedded_seen(false) {}
+
+  void visit_embeddedcode (embeddedcode *e)
+    {
+      embedded_tags_visitor::visit_embeddedcode(e);
+      // set embedded_seen to true if it does not contain /* unmodified-fnargs */
+      embedded_seen = (embedded_seen || !tagged_p("/* unmodified-fnargs */"));
+    }
+};
+
+bool
+is_unmodified_string_fnarg (systemtap_session* sess, functiondecl* fd, vardecl* v)
+{
+  if (sess->unoptimized || v->type != pe_string)
+    return false;
+
+  // check that there is no embedded code that might modify the fn args
+  unmodified_fnargs_checker ecv;
+  fd->body->visit(& ecv);
+  if (ecv.embedded_seen)
+    return false;
+
+  varuse_collecting_visitor vut (*sess);
+  vut.current_function = fd;
+  fd->body->visit(& vut);
+  return (find(vut.written.begin(), vut.written.end(), v) == vut.written.end());
+}
+
+// If we've seen a dupe, return it; else remember this and return NULL.
+probe *
+c_unparser::get_probe_dupe (derived_probe *dp)
+{
+  if (session->unoptimized)
+    return NULL;
+
+  // Notice we're using the probe body itself instead of the emitted C
+  // probe body to compare probes.  We need to do this because the
+  // emitted C probe body has stuff in it like:
+  //   c->last_stmt = "identifier 'printf' at foo.stp:<line>:<column>";
+  //
+  // which would make comparisons impossible.
+
+  ostringstream oss;
+
+  dp->print_dupe_stamp (oss);
+  dp->body->print(oss);
+
+  // Since the generated C changes based on whether or not the probe
+  // needs locks around global variables, this needs to be reflected
+  // here.  We don't want to treat as duplicate the handlers of
+  // begin/end and normal probes that differ only in need_global_locks.
+  oss << "# needs_global_locks: " << dp->needs_global_locks () << endl;
+
+  // NB: dependent probe conditions *could* be listed here, but don't need to
+  // be.  That's because they're only dependent on the probe body, which is
+  // already "hashed" in above.
+
+  pair<map<string, probe*>::iterator, bool> const& inserted =
+    probe_contents.insert(make_pair(oss.str(), dp));
+
+  if (inserted.second)
+    return NULL; // it's new!
+
+  // Already seen it; here's the old one:
+  return inserted.first->second;
+}
+
 void
 c_unparser::emit_common_header ()
 {
+  c_tmpcounter ct (this);
+
   o->newline();
 
   // Per CPU context for probes. Includes common shared state held for
@@ -935,127 +1049,19 @@ c_unparser::emit_common_header ()
   o->newline() << "union {";
   o->indent(1);
 
-  // To elide context variables for probe handler functions that
-  // themselves are about to get duplicate-eliminated, we XXX
-  // duplicate the parse-tree-hash method from ::emit_probe().
-  map<string, string> tmp_probe_contents;
-  // The reason we don't use c_unparser::probe_contents itself
-  // for this is that we don't want to muck up the data for
-  // that later routine.
-
   for (unsigned i=0; i<session->probes.size(); i++)
-    {
-      derived_probe* dp = session->probes[i];
+    ct.emit_probe (session->probes[i]);
 
-      // NB: see c_unparser::emit_probe() for original copy of duplicate-hashing logic.
-      ostringstream oss;
-      oss << "# needs_global_locks: " << dp->needs_global_locks () << endl;
-      dp->print_dupe_stamp (oss);
-      dp->body->print(oss);
-      // NB: dependent probe conditions *could* be listed here, but don't need to be.
-      // That's because they're only dependent on the probe body, which is already
-      // "hashed" in above.
-
-      if (tmp_probe_contents.count(oss.str()) == 0) // unique
-        {
-          tmp_probe_contents[oss.str()] = dp->name; // save it
-
-          o->newline() << "struct " << dp->name << "_locals {";
-          o->indent(1);
-          for (unsigned j=0; j<dp->locals.size(); j++)
-            {
-              vardecl* v = dp->locals[j];
-              try
-                {
-                  o->newline() << c_typename (v->type) << " "
-                               << c_localname (v->name) << ";";
-                } catch (const semantic_error& e) {
-                semantic_error e2 (e);
-                if (e2.tok1 == 0) e2.tok1 = v->tok;
-                throw e2;
-              }
-            }
-
-          // NB: This part is finicky.  The logic here must
-          // match up with
-          c_tmpcounter ct (this);
-          dp->body->visit (& ct);
-
-          o->newline(-1) << "} " << dp->name << ";";
-        }
-    }
   o->newline(-1) << "} probe_locals;";
 
   // PR10516: function locals
   o->newline() << "union {";
   o->indent(1);
 
-  for (map<string,functiondecl*>::iterator it = session->functions.begin(); it != session->functions.end(); it++)
-    {
-      functiondecl* fd = it->second;
-      o->newline()
-        << "struct " << c_funcname (fd->name) << "_locals {";
-      o->indent(1);
-      for (unsigned j=0; j<fd->locals.size(); j++)
-        {
-	  vardecl* v = fd->locals[j];
-	  try
-	    {
-              if (fd->mangle_oldstyle)
-                {
-                  // PR14524: retain old way of referring to the locals
-                  o->newline() << "union { "
-                               << c_typename (v->type) << " "
-                               << c_localname (v->name) << "; "
-                               << c_typename (v->type) << " "
-                               << c_localname (v->name, true) << "; };";
-                }
-              else
-                {
-                  o->newline() << c_typename (v->type) << " "
-                               << c_localname (v->name) << ";";
-                }
-	    } catch (const semantic_error& e) {
-	      semantic_error e2 (e);
-	      if (e2.tok1 == 0) e2.tok1 = v->tok;
-	      throw e2;
-	    }
-        }
-      for (unsigned j=0; j<fd->formal_args.size(); j++)
-        {
-          vardecl* v = fd->formal_args[j];
-	  try
-	    {
-              if (fd->mangle_oldstyle)
-                {
-                  // PR14524: retain old way of referring to the locals
-                  o->newline() << "union { "
-                               << c_typename (v->type) << " "
-                               << c_localname (v->name) << "; "
-                               << c_typename (v->type) << " "
-                               << c_localname (v->name, true) << "; };";
-                }
-              else
-                {
-                  o->newline() << c_typename (v->type) << " "
-                               << c_localname (v->name) << ";";
-                }
-	    } catch (const semantic_error& e) {
-	      semantic_error e2 (e);
-	      if (e2.tok1 == 0) e2.tok1 = v->tok;
-	      throw e2;
-	    }
-        }
-      c_tmpcounter ct (this);
-      fd->body->visit (& ct);
-      if (fd->type == pe_unknown)
-	o->newline() << "/* no return value */";
-      else
-	{
-	  o->newline() << c_typename (fd->type) << " __retvalue;";
-	}
-      o->newline(-1) << "} " << c_funcname (fd->name) << ";";
-    }
+  for (map<string,functiondecl*>::iterator it = session->functions.begin();
+       it != session->functions.end(); it++)
+    ct.emit_function (it->second);
+
   o->newline(-1) << "} locals [MAXNESTING+1];"; 
 
   // NB: The +1 above for extra room for outgoing arguments of next nested function.
@@ -1083,6 +1089,47 @@ c_unparser::emit_common_header ()
 
   emit_compiled_printfs();
 
+  if (!session->runtime_usermode_p())
+    {
+      // Updated in probe handlers to signal that a module refresh is needed.
+      // Checked and cleared by common epilogue after scheduling refresh work.
+      o->newline( 0)  << "static atomic_t need_module_refresh = ATOMIC_INIT(0);";
+
+      // We will use a workqueue to schedule module_refresh work when we need
+      // to enable/disable probes.
+      o->newline( 0)  << "#include <linux/workqueue.h>";
+      o->newline( 0)  << "static struct work_struct module_refresher_work;";
+      o->newline( 0)  << "#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,20)";
+      o->newline( 0)  << "static void module_refresher(void *data) {";
+      o->newline( 0)  << "#else";
+      o->newline( 0)  << "static void module_refresher(struct work_struct *work) {";
+      o->newline( 0)  << "#endif";
+      o->newline( 1)  <<    "systemtap_module_refresh(NULL);";
+      o->newline(-1)  << "}";
+
+      o->newline( 0)  << "#ifdef STP_ON_THE_FLY_TIMER_ENABLE";
+      o->newline( 0)  << "#include \"timer.h\"";
+      o->newline( 0)  << "static struct hrtimer module_refresh_timer;";
+
+      o->newline( 0)  << "#ifndef STP_ON_THE_FLY_INTERVAL";
+      o->newline( 0)  << "#define STP_ON_THE_FLY_INTERVAL (100*1000*1000)"; // default to 100 ms
+      o->newline( 0)  << "#endif";
+
+      o->newline( 0)  << "hrtimer_return_t module_refresh_timer_cb(struct hrtimer *timer) {";
+      o->newline(+1)  <<   "if (atomic_cmpxchg(&need_module_refresh, 1, 0) == 1)";
+      // NB: one might like to invoke systemtap_module_refresh(NULL) directly from
+      // here ... however hrtimers are called from an unsleepable context, so no can do.
+      o->newline(+1)  <<     "schedule_work(&module_refresher_work);";
+      o->newline(-1)  <<   "hrtimer_set_expires(timer,";
+      o->newline( 0)  <<   "  ktime_add(hrtimer_get_expires(timer),";
+      o->newline( 0)  <<   "            ktime_set(0, STP_ON_THE_FLY_INTERVAL))); ";
+      o->newline( 0)  <<   "return HRTIMER_RESTART;";
+      o->newline(-1)  << "}";
+      o->newline( 0)  << "#endif /* STP_ON_THE_FLY_TIMER_ENABLE */";
+    }
+
+  o->newline(0) << "#include \"namespaces.h\"";
+
   o->newline();
 }
 
@@ -1105,6 +1152,13 @@ c_unparser::get_compiled_printf (bool print_to_stream, const string& format)
   if (it == compiled_printfs.end())
     throw SEMANTIC_ERROR (_("internal error translating printf"));
   return it->second;
+}
+
+const string&
+c_tmpcounter::get_compiled_printf (bool print_to_stream, const string& format)
+{
+  parent->declare_compiled_printf (print_to_stream, format);
+  return parent->get_compiled_printf (print_to_stream, format);
 }
 
 void
@@ -1429,7 +1483,14 @@ c_unparser::emit_compiled_printfs ()
 void
 c_unparser::emit_global_param (vardecl *v)
 {
-  string vn = c_globalname (v->name);
+  // Only true globals can be params, not private variables.
+  if (!v->name.starts_with("__global_")) return;
+
+  // Only non-synthetic globals can be params.
+  if (v->synthetic) return;
+
+  string global = c_globalname (v->name);
+  interned_string param = v->name.substr(sizeof("__global_") - 1);
 
   // For dyninst, use the emit_global_init_* functionality instead.
   assert (!session->runtime_usermode_p());
@@ -1439,19 +1500,19 @@ c_unparser::emit_global_param (vardecl *v)
   // #undef is spit out at the end of the C file, so that removing the
   // definition won't affect any other embedded-C or generated code.
   // XXX: better not have a global variable named module_param_named etc.!
-  o->newline() << "#undef " << v->name; // avoid colliding with non-mangled name
+  o->newline() << "#undef " << param; // avoid colliding with non-mangled name
 
   // Emit module_params for this global, if its type is convenient.
   if (v->arity == 0 && v->type == pe_long)
     {
-      o->newline() << "module_param_named (" << v->name << ", "
-                   << "global(" << vn << "), int64_t, 0);";
+      o->newline() << "module_param_named (" << param << ", "
+                   << "global(" << global << "), int64_t, 0);";
     }
   else if (v->arity == 0 && v->type == pe_string)
     {
       // NB: no special copying is needed.
-      o->newline() << "module_param_string (" << v->name << ", "
-                   << "global(" << vn << "), MAXSTRINGLEN, 0);";
+      o->newline() << "module_param_string (" << param << ", "
+                   << "global(" << global << "), MAXSTRINGLEN, 0);";
     }
 }
 
@@ -1469,18 +1530,24 @@ c_unparser::emit_global_init_setters ()
       if (v->arity > 0) continue;
       if (v->type != pe_string && v->type != pe_long) continue;
 
+      // Only true globals can be params, not private variables.
+      if (!v->name.starts_with("__global_")) continue;
+
+      string global = c_globalname (v->name);
+      interned_string param = v->name.substr(sizeof("__global_") - 1);
+
       // Do not mangle v->name for the comparison!
-      o->line() << "if (0 == strcmp(name,\"" << v->name << "\"))" << " {";
+      o->line() << "if (0 == strcmp(name,\"" << param << "\"))" << " {";
 
       o->indent(1);
       if (v->type == pe_string)
         {
-          c_assign("stp_global_init." + c_globalname(v->name), "value", pe_string, "BUG: global module param", v->tok);
+          c_assign("stp_global_init." + global, "value", pe_string, "BUG: global module param", v->tok);
           o->newline() << "return 0;";
         }
       else
         {
-          o->newline() << "return set_int64_t(value, &stp_global_init." << c_globalname(v->name) << ");";
+          o->newline() << "return set_int64_t(value, &stp_global_init." << global << ");";
         }
 
       o->newline(-1) << "} else ";
@@ -1643,6 +1710,10 @@ c_unparser::emit_module_init ()
       o->assert_0_indent(); 
     }
 
+  o->newline() << "#ifdef STAP_NEED_TRACEPOINTS";
+  o->newline() << "#include \"linux/stp_tracepoint.c\"";
+  o->newline() << "#endif";
+
   o->newline();
   o->newline() << "static int systemtap_module_init (void) {";
   o->newline(1) << "int rc = 0;";
@@ -1661,6 +1732,7 @@ c_unparser::emit_module_init ()
       // run a probe compiled for a different version.  Catch this early,
       // just in case modversions didn't.
       o->newline() << "{";
+      o->newline() << "#ifndef STP_NO_VERREL_CHECK";
       o->newline(1) << "const char* release = UTS_RELEASE;";
       o->newline() << "#ifdef STAPCONF_GENERATED_COMPILE";
       o->newline() << "const char* version = UTS_VERSION;";
@@ -1694,6 +1766,7 @@ c_unparser::emit_module_init ()
 		    << ");";
       o->newline() << "rc = -EINVAL;";
       o->newline(-1) << "}";
+      o->newline() << "#endif";
       o->newline() << "#endif";
 
       // perform buildid-based checking if able
@@ -1745,6 +1818,15 @@ c_unparser::emit_module_init ()
   o->newline() << "rc = _stp_init_time();";  // Kick off the Big Bang.
   o->newline() << "if (rc) {";
   o->newline(1) << "_stp_error (\"couldn't initialize gettimeofday\");";
+  o->newline() << "goto out;";
+  o->newline(-1) << "}";
+  o->newline() << "#endif";
+
+  // initialize tracepoints (if needed)
+  o->newline() << "#ifdef STAP_NEED_TRACEPOINTS";
+  o->newline() << "rc = stp_tracepoint_init();";
+  o->newline() << "if (rc) {";
+  o->newline(1) << "_stp_error (\"couldn't initialize tracepoints\");";
   o->newline() << "goto out;";
   o->newline(-1) << "}";
   o->newline() << "#endif";
@@ -1806,6 +1888,16 @@ c_unparser::emit_module_init ()
       o->newline() << "if (rc) goto out;";
     }
 
+  if (!session->runtime_usermode_p())
+    {
+      // Initialize workqueue needed for on-the-fly arming/disarming
+      o->newline() << "#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,20)";
+      o->newline() << "INIT_WORK(&module_refresher_work, module_refresher, NULL);";
+      o->newline() << "#else";
+      o->newline() << "INIT_WORK(&module_refresher_work, module_refresher);";
+      o->newline() << "#endif";
+    }
+
   // Run all probe registrations.  This actually runs begin probes.
 
   for (unsigned i=0; i<g.size(); i++)
@@ -1833,13 +1925,63 @@ c_unparser::emit_module_init ()
   o->newline() << "if (atomic_read (session_state()) == STAP_SESSION_STARTING)";
   // NB: only other valid state value is ERROR, in which case we don't
   o->newline(1) << "atomic_set (session_state(), STAP_SESSION_RUNNING);";
+  o->newline(-1);
 
   // Run all post-session starting code.
   for (unsigned i=0; i<g.size(); i++)
     {
       g[i]->emit_module_post_init (*session);
     }
-  o->newline(-1) << "return 0;";
+
+  if (!session->runtime_usermode_p())
+    {
+      o->newline() << "#ifdef STP_ON_THE_FLY_TIMER_ENABLE";
+
+      // Initialize hrtimer needed for on-the-fly arming/disarming
+      o->newline() << "hrtimer_init(&module_refresh_timer, CLOCK_MONOTONIC,";
+      o->newline() << "             HRTIMER_MODE_REL);";
+      o->newline() << "module_refresh_timer.function = &module_refresh_timer_cb;";
+
+      // We check here if it's worth it to start the timer at all. We only need
+      // the background timer if there is a probe which doesn't support directy
+      // scheduling work (otf_safe_context() == false), but yet does affect the
+      // condition of at least one probe which supports on-the-fly operations.
+      {
+        // for each derived probe...
+        bool start_timer = false;
+        for (unsigned i=0; i<session->probes.size() && !start_timer; i++)
+          {
+            // if it isn't safe in this probe type to directly schedule work,
+            // and this probe could affect other probes...
+            if (session->probes[i]->group
+                && !session->probes[i]->group->otf_safe_context(*session)
+                && !session->probes[i]->probes_with_affected_conditions.empty())
+              {
+                // and if any of those possible probes support on-the-fly operations,
+                // then we'll need the timer
+                for (set<derived_probe*>::const_iterator
+                      it  = session->probes[i]->probes_with_affected_conditions.begin();
+                      it != session->probes[i]->probes_with_affected_conditions.end()
+                            && !start_timer; ++it)
+                  {
+                    if ((*it)->group->otf_supported(*session))
+                      start_timer = true;
+                  }
+              }
+          }
+
+        if (start_timer)
+          {
+            o->newline() << "hrtimer_start(&module_refresh_timer,";
+            o->newline() << "              ktime_set(0, STP_ON_THE_FLY_INTERVAL),";
+            o->newline() << "              HRTIMER_MODE_REL);";
+          }
+      }
+
+      o->newline() << "#endif /* STP_ON_THE_FLY_TIMER_ENABLE */";
+    }
+
+  o->newline() << "return 0;";
 
   // Error handling path; by now all partially registered probe groups
   // have been unregistered.
@@ -1859,8 +2001,11 @@ c_unparser::emit_module_init ()
 
   // For any partially registered/unregistered kernel facilities.
   o->newline() << "atomic_set (session_state(), STAP_SESSION_STOPPED);";
-  o->newline() << "#ifdef STAPCONF_SYNCHRONIZE_SCHED";
-  o->newline() << "synchronize_sched();";
+  o->newline() << "stp_synchronize_sched();";
+
+  // In case tracepoints were started, they need to be cleaned up
+  o->newline() << "#ifdef STAP_NEED_TRACEPOINTS";
+  o->newline() << " stp_tracepoint_exit();";
   o->newline() << "#endif";
 
   // In case gettimeofday was started, it needs to be stopped
@@ -1879,15 +2024,67 @@ c_unparser::emit_module_init ()
 void
 c_unparser::emit_module_refresh ()
 {
-  o->newline() << "static void systemtap_module_refresh (void) {";
-  o->newline(1) << "int i=0, j=0;"; // for derived_probe_group use
+  o->newline() << "static void systemtap_module_refresh (const char *modname) {";
+  o->newline(1) << "int state;";
+  o->newline() << "int i=0, j=0;"; // for derived_probe_group use
+
+  if (!session->runtime_usermode_p())
+    {
+      o->newline() << "#if defined(STP_TIMING)";
+      o->newline() << "cycles_t cycles_atstart = get_cycles();";
+      o->newline() << "#endif";
+    }
+
+  // Ensure we're only doing the refreshing one at a time. NB: it's important
+  // that we get the lock prior to checking the session_state, in case whoever
+  // is holding the lock (e.g. systemtap_module_exit()) changes it.
+  if (!session->runtime_usermode_p())
+    o->newline() << "mutex_lock(&module_refresh_mutex);";
+
+  /* If we're not in STARTING/RUNNING state, don't try doing any work.
+     PR16766 */
+  o->newline() << "state = atomic_read (session_state());";
+  o->newline() << "if (state != STAP_SESSION_RUNNING && state != STAP_SESSION_STARTING && state != STAP_SESSION_ERROR) {";
+  // cannot _stp_warn etc. since we're not in probe context
+  o->newline(1) << "#if defined(__KERNEL__)";
+  o->newline() << "if (state != STAP_SESSION_STOPPING)";
+  o->newline(1) << "printk (KERN_ERR \"stap module notifier triggered in unexpected state %d\\n\", state);";
+  o->indent(-1);
+  o->newline() << "#endif";
+
+  if (!session->runtime_usermode_p())
+    o->newline() << "mutex_unlock(&module_refresh_mutex);";
+
+  o->newline() << "return;";
+  o->newline(-1) << "}";
+
   o->newline() << "(void) i;";
   o->newline() << "(void) j;";
+
   vector<derived_probe_group*> g = all_session_groups (*session);
   for (unsigned i=0; i<g.size(); i++)
     {
       g[i]->emit_module_refresh (*session);
     }
+
+  if (!session->runtime_usermode_p())
+    {
+      // see also common_probe_entryfn_epilogue()
+      o->newline() << "#if defined(STP_TIMING)";
+      o->newline() << "if (likely(g_refresh_timing)) {";
+      o->newline(1) << "cycles_t cycles_atend = get_cycles ();";
+      o->newline() << "int32_t cycles_elapsed = ((int32_t)cycles_atend > (int32_t)cycles_atstart)";
+      o->newline(1) << "? ((int32_t)cycles_atend - (int32_t)cycles_atstart)";
+      o->newline() << ": (~(int32_t)0) - (int32_t)cycles_atstart + (int32_t)cycles_atend + 1;";
+      o->indent(-1);
+      o->newline() << "_stp_stat_add(g_refresh_timing, cycles_elapsed);";
+      o->newline(-1) << "}";
+      o->newline() << "#endif";
+    }
+
+  if (!session->runtime_usermode_p())
+    o->newline() << "mutex_unlock(&module_refresh_mutex);";
+
   o->newline(-1) << "}\n";
 }
 
@@ -1915,6 +2112,22 @@ c_unparser::emit_module_exit ()
   // while to abort right away.  Currently running probes are allowed to
   // terminate.  These may set STAP_SESSION_ERROR!
 
+  if (!session->runtime_usermode_p())
+    {
+      o->newline() << "#ifdef STP_ON_THE_FLY_TIMER_ENABLE";
+      o->newline() << "hrtimer_cancel(&module_refresh_timer);";
+      o->newline() << "#endif";
+    }
+
+  // cargo cult prologue ... hope to flush any pending workqueue items too
+  o->newline() << "stp_synchronize_sched();";
+
+  // Get the lock before exiting to ensure there's no one in module_refresh
+  // NB: this should't be able to happen, because both the module_refresh_timer
+  // and the workqueue ought to have been shut down by now.
+  if (!session->runtime_usermode_p())
+    o->newline() << "mutex_lock(&module_refresh_mutex);";
+
   // We're processing the derived_probe_group list in reverse
   // order.  This ensures that probes get unregistered in reverse
   // order of the way they were registered.
@@ -1923,13 +2136,14 @@ c_unparser::emit_module_exit ()
        i != g.rend(); i++)
     (*i)->emit_module_exit (*session); // NB: runs "end" probes
 
+  if (!session->runtime_usermode_p())
+    o->newline() << "mutex_unlock(&module_refresh_mutex);";
+
   // But some other probes may have launched too during unregistration.
   // Let's wait a while to make sure they're all done, done, done.
 
   // cargo cult prologue
-  o->newline() << "#ifdef STAPCONF_SYNCHRONIZE_SCHED";
-  o->newline() << "synchronize_sched();";
-  o->newline() << "#endif";
+  o->newline() << "stp_synchronize_sched();";
 
   // NB: systemtap_module_exit is assumed to be called from ordinary
   // user context, say during module unload.  Among other things, this
@@ -1938,9 +2152,7 @@ c_unparser::emit_module_exit ()
 
   // cargo cult epilogue
   o->newline() << "atomic_set (session_state(), STAP_SESSION_STOPPED);";
-  o->newline() << "#ifdef STAPCONF_SYNCHRONIZE_SCHED";
-  o->newline() << "synchronize_sched();";
-  o->newline() << "#endif";
+  o->newline() << "stp_synchronize_sched();";
 
   // XXX: might like to have an escape hatch, in case some probe is
   // genuinely stuck somehow
@@ -1966,6 +2178,11 @@ c_unparser::emit_module_exit ()
       o->newline() << "struct context* __restrict__ c;";
       o->newline() << "c = _stp_runtime_entryfn_get_context();";
     }
+
+  // teardown tracepoints (if needed)
+  o->newline() << "#ifdef STAP_NEED_TRACEPOINTS";
+  o->newline() << " stp_tracepoint_exit();";
+  o->newline() << "#endif";
 
   // teardown gettimeofday (if needed)
   o->newline() << "#ifdef STAP_NEED_GETTIMEOFDAY";
@@ -2005,6 +2222,24 @@ c_unparser::emit_module_exit ()
   o->newline(-1) << "}";
   o->newline() << "#endif"; // STP_TIMING
   o->newline(-1) << "}";
+
+  if (!session->runtime_usermode_p())
+    {
+      o->newline() << "#if defined(STP_TIMING)";
+      o->newline() << "_stp_printf(\"----- refresh report:\\n\");";
+      o->newline() << "if (likely (g_refresh_timing)) {";
+      o->newline(1) << "struct stat_data *stats = _stp_stat_get (g_refresh_timing, 0);";
+      o->newline() << "if (stats->count) {";
+      o->newline(1) << "int64_t avg = _stp_div64 (NULL, stats->sum, stats->count);";
+      o->newline() << "_stp_printf (\"hits: %lld, cycles: %lldmin/%lldavg/%lldmax\\n\",";
+      o->newline(2) << "(long long) stats->count, (long long) stats->min, ";
+      o->newline() <<  "(long long) avg, (long long) stats->max);";
+      o->newline(-3) << "}";
+      o->newline() << "_stp_stat_del (g_refresh_timing);";
+      o->newline(-1) << "}";
+      o->newline() << "#endif"; // STP_TIMING
+    }
+
   o->newline() << "_stp_print_flush();";
   o->newline() << "#endif";
 
@@ -2054,17 +2289,171 @@ c_unparser::emit_module_exit ()
   o->newline(-1) << "}\n";
 }
 
+struct max_action_info: public functioncall_traversing_visitor
+{
+  max_action_info(systemtap_session& s): sess(s), statement_count(0) {}
+
+  systemtap_session& sess;
+  unsigned statement_count;
+  static const unsigned max_statement_count = ~0;
+
+  void add_stmt_count (unsigned val)
+    {
+      statement_count = (statement_count > max_statement_count - val) ? max_statement_count : statement_count + val;
+    }
+  void add_max_stmt_count () { statement_count = max_statement_count; }
+  bool statement_count_finite() { return statement_count < max_statement_count; }
+
+  void visit_for_loop (for_loop*) { add_max_stmt_count(); }
+  void visit_foreach_loop (foreach_loop*) { add_max_stmt_count(); }
+  void visit_expr_statement (expr_statement *stmt)
+    {
+      add_stmt_count(1);
+      traversing_visitor::visit_expr_statement(stmt); // which will trigger visit_functioncall, if applicable
+    }
+  void visit_if_statement (if_statement *stmt)
+    {
+      add_stmt_count(1);
+      stmt->condition->visit(this);
+
+      // Create new visitors for the two forks.  Copy the nested[] set
+      // to prevent infinite recursion for a   function f () { if (a) f() }
+      max_action_info tmp_visitor_then (*this);
+      max_action_info tmp_visitor_else (*this);
+      stmt->thenblock->visit(& tmp_visitor_then);
+      if (stmt->elseblock)
+        {
+          stmt->elseblock->visit(& tmp_visitor_else);
+        }
+
+      // Simply overwrite our copy of statement_count, since these
+      // visitor copies already included our starting count.
+      statement_count = max(tmp_visitor_then.statement_count, tmp_visitor_else.statement_count);
+    }
+
+  void note_recursive_functioncall (functioncall *) { add_max_stmt_count(); }
+
+  void visit_null_statement (null_statement *) { add_stmt_count(1); }
+  void visit_return_statement (return_statement *) { add_stmt_count(1); }
+  void visit_delete_statement (delete_statement *) { add_stmt_count(1); }
+  void visit_next_statement (next_statement *) { add_stmt_count(1); }
+  void visit_break_statement (break_statement *) { add_stmt_count(1); }
+  void visit_continue_statement (continue_statement *) { add_stmt_count(1); }
+};
+
+void
+c_tmpcounter::emit_function (functiondecl* fd)
+{
+  this->current_probe = 0;
+  this->current_function = fd;
+  this->tmpvar_counter = 0;
+  this->action_counter = 0;
+  this->already_checked_action_count = false;
+  declared_vars.clear();
+
+  translator_output *o = parent->o;
+
+  // indent the dummy output as if we were already in a block
+  this->o->indent (1);
+
+  o->newline() << "struct " << c_funcname (fd->name) << "_locals {";
+  o->indent(1);
+
+  for (unsigned j=0; j<fd->locals.size(); j++)
+    {
+      vardecl* v = fd->locals[j];
+      try
+	{
+	  if (fd->mangle_oldstyle)
+	    {
+	      // PR14524: retain old way of referring to the locals
+	      o->newline() << "union { "
+			   << c_typename (v->type) << " "
+			   << c_localname (v->name) << "; "
+			   << c_typename (v->type) << " "
+			   << c_localname (v->name, true) << "; };";
+	    }
+	  else
+	    {
+	      o->newline() << c_typename (v->type) << " "
+			   << c_localname (v->name) << ";";
+	    }
+	} catch (const semantic_error& e) {
+	  semantic_error e2 (e);
+	  if (e2.tok1 == 0) e2.tok1 = v->tok;
+	  throw e2;
+	}
+    }
+
+  for (unsigned j=0; j<fd->formal_args.size(); j++)
+    {
+      vardecl* v = fd->formal_args[j];
+      try
+	{
+	  v->char_ptr_arg = (is_unmodified_string_fnarg (session, fd, v));
+
+	  if (v->char_ptr_arg && session->verbose > 2)
+	    clog << _F("variable %s for function %s will be passed by reference (char *)",
+		       v->name.to_string().c_str(),
+		       fd->unmangled_name.to_string().c_str()) << endl;
+
+	  if (fd->mangle_oldstyle)
+	    {
+	      // PR14524: retain old way of referring to the locals
+	      o->newline() << "union { "
+			   << (v->char_ptr_arg ? "const char *" : c_typename (v->type))
+			   << " " << c_localname (v->name) << "; "
+			   << (v->char_ptr_arg ? "const char *" : c_typename (v->type))
+			   << " " << c_localname (v->name, true) << "; };";
+	    }
+	  else
+	    {
+	      o->newline() << (v->char_ptr_arg ? "const char *" : c_typename (v->type))
+			   << " " << c_localname (v->name) << ";";
+	    }
+	} catch (const semantic_error& e) {
+	  semantic_error e2 (e);
+	  if (e2.tok1 == 0) e2.tok1 = v->tok;
+	  throw e2;
+	}
+    }
+
+  fd->body->visit (this);
+
+  if (fd->type == pe_unknown)
+    o->newline() << "/* no return value */";
+  else
+    {
+      bool as_charp = !session->unoptimized && fd->type == pe_string;
+      if (as_charp && session->verbose > 2)
+	clog << _F("return value for function %s will be passed by reference (char *)",
+		   fd->unmangled_name.to_string().c_str()) << endl;
+      o->newline() << (as_charp ? "char *" : c_typename (fd->type))
+		   << " __retvalue;";
+    }
+  o->newline(-1) << "} " << c_funcname (fd->name) << ";";
+
+  // finish dummy indentation
+  this->o->indent (-1);
+  this->o->assert_0_indent ();
+
+  declared_vars.clear();
+  this->current_function = 0;
+  this->already_checked_action_count = false;
+}
 
 void
 c_unparser::emit_function (functiondecl* v)
 {
-  o->newline() << "static void " << c_funcname (v->name)
-            << " (struct context* __restrict__ c) {";
-  o->indent(1);
   this->current_probe = 0;
   this->current_function = v;
   this->tmpvar_counter = 0;
   this->action_counter = 0;
+  this->already_checked_action_count = false;
+
+  o->newline() << "static void " << c_funcname (v->name)
+            << " (struct context* __restrict__ c) {";
+  o->indent(1);
 
   o->newline() << "__label__ out;";
   o->newline()
@@ -2086,7 +2475,8 @@ c_unparser::emit_function (functiondecl* v)
     o->newline() << "#define STAP_RETVALUE THIS->__retvalue";
 
   // set this, in case embedded-c code sets last_error but doesn't otherwise identify itself
-  o->newline() << "c->last_stmt = " << lex_cast_qstring(*v->tok) << ";";
+  if (v->tok)
+    o->newline() << "c->last_stmt = " << lex_cast_qstring(*v->tok) << ";";
 
   // check/increment nesting level
   // NB: incoming c->nesting level will be -1 (if we're called directly from a probe),
@@ -2100,6 +2490,10 @@ c_unparser::emit_function (functiondecl* v)
   o->newline(-1) << "} else {";
   o->newline(1) << "c->nesting ++;";
   o->newline(-1) << "}";
+
+  // initialize runtime overloading flag
+  o->newline() << "c->next = 0;";
+  o->newline() << "#define STAP_NEXT do { c->next = 1; goto out; } while(0)";
 
   // initialize locals
   // XXX: optimization: use memset instead
@@ -2119,9 +2513,44 @@ c_unparser::emit_function (functiondecl* v)
       o->newline() << retvalue.init();
     }
 
+  switch (v->type)
+    {
+    case pe_long:
+      o->newline() << "#define STAP_RETURN(v) do { STAP_RETVALUE = (int64_t) (v); " 
+        "goto out; } while(0)";
+      break;
+
+    case pe_string:
+      o->newline() <<
+        "#define STAP_RETURN(v) do { strlcpy(STAP_RETVALUE, (v), MAXSTRINGLEN); "
+        "goto out; } while(0)";
+      break;
+
+    default:
+      o->newline() << "#define STAP_RETURN() do { goto out; } while(0)";
+      break;
+    }
+
+  o->newline() << "#define STAP_PRINTF(fmt, ...) do { _stp_printf(fmt, ##__VA_ARGS__); } while (0)";
+  o->newline() << "#define STAP_ERROR(...) do { snprintf(CONTEXT->error_buffer, MAXSTRINGLEN, __VA_ARGS__); CONTEXT->last_error = CONTEXT->error_buffer; goto out; } while (0)";
   o->newline() << "#define return goto out"; // redirect embedded-C return
+
+  max_action_info mai (*session);
+  v->body->visit (&mai);
+
+  if (mai.statement_count_finite() && !session->suppress_time_limits
+      && !session->unoptimized) // this is a finite-statement-count function
+    {
+      o->newline() << "if (c->actionremaining < " << mai.statement_count
+                   << ") { c->last_error = " << STAP_T_04 << "goto out; }";
+      this->already_checked_action_count = true;
+    }
+
   v->body->visit (this);
   o->newline() << "#undef return";
+  o->newline() << "#undef STAP_PRINTF";
+  o->newline() << "#undef STAP_ERROR";
+  o->newline() << "#undef STAP_RETURN";
 
   this->current_function = 0;
 
@@ -2136,6 +2565,7 @@ c_unparser::emit_function (functiondecl* v)
 
   o->newline() << "#undef CONTEXT";
   o->newline() << "#undef THIS";
+  o->newline() << "#undef STAP_NEXT";
   for (unsigned i = 0; i < v->formal_args.size(); i++) {
     o->newline() << c_arg_undef(v->formal_args[i]->name); // #undef STAP_ARG_foo
   }
@@ -2144,12 +2574,72 @@ c_unparser::emit_function (functiondecl* v)
   }
   o->newline() << "#undef STAP_RETVALUE";
   o->newline(-1) << "}\n";
+
+  this->current_function = 0;
+  this->already_checked_action_count = false;
 }
 
+void
+c_tmpcounter::emit_probe (derived_probe* dp)
+{
+  this->current_function = 0;
+  this->current_probe = dp;
+  this->tmpvar_counter = 0;
+  this->action_counter = 0;
+  this->already_checked_action_count = false;
+  declared_vars.clear();
+
+  if (get_probe_dupe (dp) == NULL)
+    {
+      translator_output *o = parent->o;
+
+      // indent the dummy output as if we were already in a block
+      this->o->indent (1);
+
+      o->newline() << "struct " << dp->name() << "_locals {";
+      o->indent(1);
+      for (unsigned j=0; j<dp->locals.size(); j++)
+	{
+	  vardecl* v = dp->locals[j];
+	  try
+	    {
+	      o->newline() << c_typename (v->type) << " "
+			   << c_localname (v->name) << ";";
+	    } catch (const semantic_error& e) {
+	    semantic_error e2 (e);
+	    if (e2.tok1 == 0) e2.tok1 = v->tok;
+	    throw e2;
+	  }
+	}
+
+      dp->body->visit (this);
+
+      // finish by visiting conditions of affected probes to match
+      // c_unparser::emit_probe()
+      if (!dp->probes_with_affected_conditions.empty())
+	{
+	  for (set<derived_probe*>::const_iterator
+		it  = dp->probes_with_affected_conditions.begin();
+		it != dp->probes_with_affected_conditions.end(); ++it)
+	    (*it)->sole_location()->condition->visit(this);
+	}
+
+      o->newline(-1) << "} " << dp->name() << ";";
+
+      // finish dummy indentation
+      this->o->indent (-1);
+      this->o->assert_0_indent ();
+    }
+
+  declared_vars.clear();
+  this->current_probe = 0;
+  this->already_checked_action_count = false;
+}
 
 #define DUPMETHOD_CALL 0
 #define DUPMETHOD_ALIAS 0
 #define DUPMETHOD_RENAME 1
+
 
 void
 c_unparser::emit_probe (derived_probe* v)
@@ -2158,63 +2648,38 @@ c_unparser::emit_probe (derived_probe* v)
   this->current_probe = v;
   this->tmpvar_counter = 0;
   this->action_counter = 0;
+  this->already_checked_action_count = false;
 
   // If we about to emit a probe that is exactly the same as another
   // probe previously emitted, make the second probe just call the
   // first one.
-  //
-  // Notice we're using the probe body itself instead of the emitted C
-  // probe body to compare probes.  We need to do this because the
-  // emitted C probe body has stuff in it like:
-  //   c->last_stmt = "identifier 'printf' at foo.stp:<line>:<column>";
-  //
-  // which would make comparisons impossible.
-  //
-  // --------------------------------------------------------------------------
-  // NB: see also c_unparser:emit_common_header(), which deliberately but sadly
-  // duplicates this calculation.
-  // --------------------------------------------------------------------------
-  //
-  ostringstream oss;
-
-  v->print_dupe_stamp (oss);
-  v->body->print(oss);
-
-  // Since the generated C changes based on whether or not the probe
-  // needs locks around global variables, this needs to be reflected
-  // here.  We don't want to treat as duplicate the handlers of
-  // begin/end and normal probes that differ only in need_global_locks.
-  oss << "# needs_global_locks: " << v->needs_global_locks () << endl;
-
-  // If an identical probe has already been emitted, just call that
-  // one.
-  if (probe_contents.count(oss.str()) != 0)
+  probe *dupe = get_probe_dupe (v);
+  if (dupe != NULL)
     {
-      string dupe = probe_contents[oss.str()];
-
       // NB: Elision of context variable structs is a separate
       // operation which has already taken place by now.
       if (session->verbose > 1)
-        clog << _F("%s elided, duplicates %s\n", v->name.c_str(), dupe.c_str());
+        clog << _F("%s elided, duplicates %s\n",
+		   v->name().c_str(), dupe->name().c_str());
 
 #if DUPMETHOD_CALL
       // This one emits a direct call to the first copy.
       o->newline();
-      o->newline() << "static void " << v->name << " (struct context * __restrict__ c) ";
-      o->newline() << "{ " << dupe << " (c); }";
+      o->newline() << "static void " << v->name() << " (struct context * __restrict__ c) ";
+      o->newline() << "{ " << dupe->name() << " (c); }";
 #elif DUPMETHOD_ALIAS
       // This one defines a function alias, arranging gcc to emit
       // several equivalent symbols for the same function body.
       // For some reason, on gcc 4.1, this is twice as slow as
       // the CALL option.
       o->newline();
-      o->newline() << "static void " << v->name << " (struct context * __restrict__ c) ";
-      o->line() << "__attribute__ ((alias (\"" << dupe << "\")));";
+      o->newline() << "static void " << v->name() << " (struct context * __restrict__ c) ";
+      o->line() << "__attribute__ ((alias (\"" << dupe->name() << "\")));";
 #elif DUPMETHOD_RENAME
       // This one is sneaky.  It emits nothing for duplicate probe
       // handlers.  It instead redirects subsequent references to the
       // probe handler function to the first copy, *by name*.
-      v->name = dupe;
+      v->id = dupe->id;
 #else
 #error "Unknown duplicate elimination method"
 #endif
@@ -2222,11 +2687,9 @@ c_unparser::emit_probe (derived_probe* v)
   else // This probe is unique.  Remember it and output it.
     {
       o->newline();
-      o->newline() << "static void " << v->name << " (struct context * __restrict__ c) ";
+      o->newline() << "static void " << v->name() << " (struct context * __restrict__ c) ";
       o->line () << "{";
       o->indent (1);
-
-      probe_contents[oss.str()] = v->name;
 
       o->newline() << "__label__ out;";
 
@@ -2235,12 +2698,28 @@ c_unparser::emit_probe (derived_probe* v)
         {
           varuse_collecting_visitor vut(*session);
           v->body->visit (& vut);
+
+          // also visit any probe conditions which this current probe might
+          // evaluate so that read locks are emitted as necessary: e.g. suppose
+          //    probe X if (a || b) {...} probe Y {a = ...} probe Z {b = ...}
+          // then Y and Z will already write-lock a and b respectively, but they
+          // also need a read-lock on b and a respectively, since they will read
+          // them when evaluating the new cond_enabled field (see c_unparser::
+          // emit_probe_condition_update()).
+          for (set<derived_probe*>::const_iterator
+                it  = v->probes_with_affected_conditions.begin();
+                it != v->probes_with_affected_conditions.end(); ++it)
+            {
+              assert((*it)->sole_location()->condition != NULL);
+              (*it)->sole_location()->condition->visit (& vut);
+            }
+
           emit_lock_decls (vut);
         }
 
       // initialize frame pointer
-      o->newline() << "struct " << v->name << "_locals * __restrict__ l = "
-                   << "& c->probe_locals." << v->name << ";";
+      o->newline() << "struct " << v->name() << "_locals * __restrict__ l = "
+                   << "& c->probe_locals." << v->name() << ";";
       o->newline() << "(void) l;"; // make sure "l" is marked used
 
       // Emit runtime safety net for unprivileged mode.
@@ -2277,6 +2756,21 @@ c_unparser::emit_probe (derived_probe* v)
 
       v->initialize_probe_context_vars (o);
 
+      max_action_info mai (*session);
+      v->body->visit (&mai);
+      if (session->verbose > 1)
+        clog << _F("%d statements for probe %s", mai.statement_count,
+		   v->name().c_str()) << endl;
+
+      if (mai.statement_count_finite() && !session->suppress_time_limits
+          && !session->unoptimized) // this is a finite-statement-count probe
+        {
+          o->newline() << "if (c->actionremaining < " << mai.statement_count 
+                       << ") { c->last_error = " << STAP_T_04 << " goto out; }";
+          this->already_checked_action_count = true;
+        }
+
+
       v->body->visit (this);
 
       record_actions(0, v->body->tok, true);
@@ -2286,6 +2780,15 @@ c_unparser::emit_probe (derived_probe* v)
       // someday be local
 
       o->indent(1);
+
+      if (!v->probes_with_affected_conditions.empty())
+        {
+          for (set<derived_probe*>::const_iterator
+                it  = v->probes_with_affected_conditions.begin();
+                it != v->probes_with_affected_conditions.end(); ++it)
+            emit_probe_condition_update(*it);
+        }
+
       if (v->needs_global_locks ())
 	emit_unlocks ();
 
@@ -2295,10 +2798,41 @@ c_unparser::emit_probe (derived_probe* v)
       o->newline(-1) << "}\n";
     }
 
-
   this->current_probe = 0;
+  this->already_checked_action_count = false;
 }
 
+// Updates the cond_enabled field and sets need_module_refresh if it was
+// changed.
+void
+c_unparser::emit_probe_condition_update(derived_probe* v)
+{
+  unsigned i = v->session_index;
+  assert(i < session->probes.size());
+
+  expression *cond = v->sole_location()->condition;
+  assert(cond);
+
+  string cond_enabled = "stap_probes[" + lex_cast(i) + "].cond_enabled";
+
+  // Concurrency note: we're safe modifying cond_enabled here since we emit
+  // locks not only for globals we write to, but also for globals read in other
+  // probes' whose conditions we visit below (see in c_unparser::emit_probe). So
+  // we can be assured we're the only ones modifying cond_enabled.
+
+  o->newline() << "if (" << cond_enabled << " != ";
+  o->line() << "!!"; // NB: turn general integer into boolean 1 or 0
+  v->sole_location()->condition->visit(this);
+  o->line() << ") {";
+  o->newline(1) << cond_enabled << " ^= 1;"; // toggle it 
+
+  // don't bother refreshing if on-the-fly not supported
+  if (!session->runtime_usermode_p()
+      && v->group && v->group->otf_supported(*session))
+    o->newline() << "atomic_set(&need_module_refresh, 1);";
+
+  o->newline(-1) << "}";
+}
 
 void
 c_unparser::emit_lock_decls(const varuse_collecting_visitor& vut)
@@ -2306,7 +2840,8 @@ c_unparser::emit_lock_decls(const varuse_collecting_visitor& vut)
   unsigned numvars = 0;
 
   if (session->verbose > 1)
-    clog << "probe " << *current_probe->sole_location() << " locks ";
+    clog << "probe " << current_probe->session_index << " "
+            "('" << *current_probe->sole_location() << "') locks";
 
   // We can only make this static in kernel mode.  In stapdyn mode,
   // the globals and their locks are in shared memory.
@@ -2357,8 +2892,8 @@ c_unparser::emit_lock_decls(const varuse_collecting_visitor& vut)
 
       numvars ++;
       if (session->verbose > 1)
-        clog << v->name << "[" << (read_p ? "r" : "")
-             << (write_p ? "w" : "")  << "] ";
+        clog << " " << v->name << "[" << (read_p ? "r" : "")
+             << (write_p ? "w" : "")  << "]";
     }
 
   o->newline(-1) << "};";
@@ -2366,7 +2901,7 @@ c_unparser::emit_lock_decls(const varuse_collecting_visitor& vut)
   if (session->verbose > 1)
     {
       if (!numvars)
-        clog << _("nothing");
+        clog << _(" nothing");
       clog << endl;
     }
 }
@@ -2446,6 +2981,32 @@ mapvar::shortname(exp_type e)
     }
 }
 
+string
+c_unparser::map_keytypes(vardecl* v)
+{
+  string result;
+  vector<exp_type> types = v->index_types;
+  types.push_back (v->type);
+  for (unsigned i = 0; i < types.size(); ++i)
+    {
+      switch (types[i])
+        {
+        case pe_long:
+          result += 'i';
+          break;
+        case pe_string:
+          result += 's';
+          break;
+        case pe_stats:
+          result += 'x';
+          break;
+        default:
+          throw SEMANTIC_ERROR(_("unknown type of map"));
+          break;
+        }
+    }
+  return result;
+}
 
 void
 c_unparser::emit_map_type_instantiations ()
@@ -2562,46 +3123,55 @@ c_unparser::c_arg_undef (const string& e)
   return "#undef STAP_ARG_" + e;
 }
 
-
-string
-c_unparser::c_expression (expression *e)
+void
+c_unparser::c_global_write_def(vardecl* v)
 {
-  // We want to evaluate expression 'e' and return its value as a
-  // string.  In the case of expressions that are just numeric
-  // constants, if we just print the value into a string, it won't
-  // have the same value as being visited by c_unparser.  For
-  // instance, a numeric constant evaluated using print() would return
-  // "5", while c_unparser::visit_literal_number() would
-  // return "((int64_t)5LL)".  String constants evaluated using
-  // print() would just return the string, while
-  // c_unparser::visit_literal_string() would return the string with
-  // escaped double quote characters.  So, we need to "visit" the
-  // expression.
-
-  // However, we have to be careful of side effects.  Currently this
-  // code is only being used for evaluating literal numbers and
-  // strings, which currently have no side effects.  Until needed
-  // otherwise, limit the use of this function to literal numbers and
-  // strings.
-  if (e->tok->type != tok_number && e->tok->type != tok_string)
-    throw SEMANTIC_ERROR(_("unsupported c_expression token type"));
-
-  // Create a fake output stream so we can grab the string output.
-  ostringstream oss;
-  translator_output tmp_o(oss);
-
-  // Temporarily swap out the real translator_output stream with our
-  // fake one.
-  translator_output *saved_o = o;
-  o = &tmp_o;
-
-  // Visit the expression then restore the original output stream
-  e->visit (this);
-  o = saved_o;
-
-  return (oss.str());
+  if (v->arity > 0)
+    {
+      o->newline() << "#define STAP_GLOBAL_SET_" << v->unmangled_name << "(...) "
+                   << "({int rc = _stp_map_set_" << map_keytypes(v)
+                   << "(global(" << c_globalname(v->name) << "), __VA_ARGS__); "
+                   << "if (unlikely(rc)) { c->last_error = " << STAP_T_01
+                   << lex_cast(v->maxsize > 0 ? "size limit (" + lex_cast(v->maxsize)
+                      + ")" : "MAXMAPENTRIES") + "\"; goto out; } rc;})";
+    }
+  else
+    {
+      o->newline() << "#define STAP_GLOBAL_SET_" << v->unmangled_name << "(val) ";
+      if (v->type == pe_string)
+          o->line() << "strlcpy(global(" << c_globalname(v->name) << "), val, MAXSTRINGLEN)";
+      else if (v->type == pe_long)
+          o->line() << "global_set(" << c_globalname(v->name) << ", val)";
+    }
 }
 
+void
+c_unparser::c_global_read_def(vardecl* v)
+{
+  if (v->arity > 0)
+    {
+      o->newline() << "#define STAP_GLOBAL_GET_" << v->unmangled_name << "(...) "
+                   << "_stp_map_get_" << map_keytypes(v)
+                   << "(global(" << c_globalname(v->name) << "), __VA_ARGS__)";
+    }
+  else
+    {
+      o->newline() << "#define STAP_GLOBAL_GET_" << v->unmangled_name << "() "
+                   << "global(" << c_globalname(v->name) << ")";
+    }
+}
+
+void
+c_unparser::c_global_write_undef(vardecl* v)
+{
+  o->newline() << "#undef STAP_GLOBAL_SET_" << v->unmangled_name;
+}
+
+void
+c_unparser::c_global_read_undef(vardecl* v)
+{
+  o->newline() << "#undef STAP_GLOBAL_GET_" << v->unmangled_name;
+}
 
 void
 c_unparser::c_assign (var& lvalue, const string& rvalue, const token *tok)
@@ -2619,9 +3189,53 @@ c_unparser::c_assign (var& lvalue, const string& rvalue, const token *tok)
     }
 }
 
+
+void
+c_unparser::c_assign(tmpvar& t, expression *e, const char* msg)
+{
+  // We don't really need a tmpvar if the expression is a literal.
+  // (NB: determined by the expression itself, not tok->type!)
+
+  if (dynamic_cast<literal*>(e))
+    {
+      // We need to use the visitors to get proper C values, like
+      // "((int64_t)5LL)" for numbers and escaped characters in strings.
+
+      // Create a fake output stream so we can grab the string output.
+      ostringstream oss;
+      translator_output tmp_o(oss);
+
+      // Temporarily swap out the real translator_output stream with our
+      // fake one.
+      translator_output *saved_o = o;
+      o = &tmp_o;
+
+      // Visit the expression then restore the original output stream
+      e->visit (this);
+      o = saved_o;
+
+      // All instances of this tmpvar will use the literal value.
+      t.override (oss.str());
+    }
+  else
+    c_assign (t.value(), e, msg);
+}
+
+struct expression_is_functioncall : public nop_visitor
+{
+  functioncall* fncall;
+  expression_is_functioncall ()
+    : fncall(NULL) {}
+
+  void visit_functioncall (functioncall* e)
+    {
+      fncall = e;
+    }
+};
+
 void
 c_unparser::c_assign (const string& lvalue, expression* rvalue,
-		      const string& msg)
+		      const char* msg)
 {
   if (rvalue->type == pe_long)
     {
@@ -2631,11 +3245,33 @@ c_unparser::c_assign (const string& lvalue, expression* rvalue,
     }
   else if (rvalue->type == pe_string)
     {
-      c_strcpy (lvalue, rvalue);
+      expression_is_functioncall eif;
+      rvalue->visit(& eif);
+      if (!session->unoptimized && eif.fncall)
+        {
+	  const functioncall* saved_fncall = assigned_functioncall;
+	  const string* saved_retval = assigned_functioncall_retval;
+
+          // let the functioncall know that the return value is being saved/used
+          // and keep track of the lvalue, so that the retval assignment can
+          // happen in ::visit_functioncall, to avoid complications with nesting.
+	  assigned_functioncall = eif.fncall;
+	  assigned_functioncall_retval = &lvalue;
+          eif.fncall->visit (this);
+          o->line() << ";";
+
+	  assigned_functioncall = saved_fncall;
+	  assigned_functioncall_retval = saved_retval;
+        }
+      else
+        {
+          // will call rvalue->visit()
+          c_strcpy (lvalue, rvalue);
+        }
     }
   else
     {
-      string fullmsg = msg + _(" type unsupported");
+      string fullmsg = string(msg) + _(" type unsupported");
       throw SEMANTIC_ERROR (fullmsg, rvalue->tok);
     }
 }
@@ -2643,7 +3279,7 @@ c_unparser::c_assign (const string& lvalue, expression* rvalue,
 
 void
 c_unparser::c_assign (const string& lvalue, const string& rvalue,
-		      exp_type type, const string& msg, const token* tok)
+		      exp_type type, const char* msg, const token* tok)
 {
   if (type == pe_long)
     {
@@ -2655,7 +3291,7 @@ c_unparser::c_assign (const string& lvalue, const string& rvalue,
     }
   else
     {
-      string fullmsg = msg + _(" type unsupported");
+      string fullmsg = string(msg) + _(" type unsupported");
       throw SEMANTIC_ERROR (fullmsg, tok);
     }
 }
@@ -2698,7 +3334,8 @@ c_unparser_assignment::c_assignop(tmpvar & res,
 	  res = lval;
 	}
       else
-        throw SEMANTIC_ERROR (_F("string assignment operator %s unsupported", op.c_str()), tok);
+        throw SEMANTIC_ERROR (_F("string assignment operator %s unsupported",
+				 op.to_string().c_str()), tok);
     }
   else if (op == "<<<")
     {
@@ -2861,7 +3498,7 @@ c_unparser::is_local(vardecl const *r, token const *tok)
   if (tok)
     throw SEMANTIC_ERROR (_("unresolved symbol"), tok);
   else
-    throw SEMANTIC_ERROR (_("unresolved symbol: ") + r->name);
+    throw SEMANTIC_ERROR (_("unresolved symbol: ") + (string)r->name);
 }
 
 
@@ -2887,7 +3524,7 @@ c_unparser::getvar(vardecl *v, token const *tok)
   else
     {
       statistic_decl sd;
-      std::map<std::string, statistic_decl>::const_iterator i;
+      std::map<interned_string, statistic_decl>::const_iterator i;
       i = session->stat_decls.find(v->name);
       if (i != session->stat_decls.end())
 	sd = i->second;
@@ -2902,7 +3539,7 @@ c_unparser::getmap(vardecl *v, token const *tok)
   if (v->arity < 1)
     throw SEMANTIC_ERROR(_("attempt to use scalar where map expected"), tok);
   statistic_decl sd;
-  std::map<std::string, statistic_decl>::const_iterator i;
+  std::map<interned_string, statistic_decl>::const_iterator i;
   i = session->stat_decls.find(v->name);
   if (i != session->stat_decls.end())
     sd = i->second;
@@ -2914,7 +3551,7 @@ c_unparser::getmap(vardecl *v, token const *tok)
 itervar
 c_unparser::getiter(symbol *s)
 {
-  return itervar (s, tmpvar_counter);
+  return itervar (this, s, tmpvar_counter);
 }
 
 
@@ -2928,8 +3565,10 @@ c_unparser::record_actions (unsigned actions, const token* tok, bool update)
 
   // Update if needed, or after queueing up a few actions, in case of very
   // large code sequences.
-  if (((update && action_counter > 0) || action_counter >= 10/*<-arbitrary*/) && !session->suppress_time_limits)
+  if (((update && action_counter > 0) || action_counter >= 10/*<-arbitrary*/)
+    && !session->suppress_time_limits && !already_checked_action_count)
     {
+
       o->newline() << "c->actionremaining -= " << action_counter << ";";
       o->newline() << "if (unlikely (c->actionremaining <= 0)) {";
       o->newline(1) << "c->last_error = ";
@@ -2950,6 +3589,12 @@ c_unparser::record_actions (unsigned actions, const token* tok, bool update)
 void
 c_unparser::visit_block (block *s)
 {
+  // Key insight: individual statements of a block can reuse
+  // temporary variable slots, since temporaries don't survive
+  // statement boundaries.  So we use gcc's anonymous union/struct
+  // facility to explicitly overlay the temporaries.
+  start_compound_statement ("block_statement", s);
+
   o->newline() << "{";
   o->indent (1);
 
@@ -2957,7 +3602,7 @@ c_unparser::visit_block (block *s)
     {
       try
         {
-          s->statements[i]->visit (this);
+          wrap_compound_visit (s->statements[i]);
 	  o->newline();
         }
       catch (const semantic_error& e)
@@ -2966,12 +3611,16 @@ c_unparser::visit_block (block *s)
         }
     }
   o->newline(-1) << "}";
+
+  close_compound_statement ("block_statement", s);
 }
 
 
 void c_unparser::visit_try_block (try_block *s)
 {
   record_actions(0, s->tok, true); // flush prior actions
+
+  start_compound_statement ("try_block", s);
 
   o->newline() << "{";
   o->newline(1) << "__label__ normal_fallthrough;";
@@ -2981,7 +3630,7 @@ void c_unparser::visit_try_block (try_block *s)
   assert (!session->unoptimized || s->try_block); // dead_stmtexpr_remover would zap it
   if (s->try_block)
     {
-      s->try_block->visit (this);
+      wrap_compound_visit (s->try_block);
       record_actions(0, s->try_block->tok, true); // flush accumulated actions
     }
   o->newline() << "goto normal_fallthrough;";
@@ -3010,13 +3659,15 @@ void c_unparser::visit_try_block (try_block *s)
 
   if (s->catch_block)
     {
-      s->catch_block->visit (this);
+      wrap_compound_visit (s->catch_block);
       record_actions(0, s->catch_block->tok, true); // flush accumulated actions
     }
 
   o->newline() << "normal_fallthrough:";
   o->newline() << ";"; // to have _some_ statement
   o->newline(-1) << "}";
+
+  close_compound_statement ("try_block", s);
 }
 
 
@@ -3028,8 +3679,34 @@ c_unparser::visit_embeddedcode (embeddedcode *s)
   if (s->code.find ("/* myproc-unprivileged */") != string::npos)
     o->newline() << "assert_is_myproc();";
   o->newline() << "{";
+
+  vector<vardecl*> read_defs;
+  vector<vardecl*> write_defs;
+  for (unsigned i = 0; i < session->globals.size(); i++)
+    {
+      vardecl* v = session->globals[i];
+      string name = v->unmangled_name;
+      if (s->code.find("/* pragma:read:" + name + " */") != string::npos)
+        {
+          c_global_read_def(v);
+          read_defs.push_back(v);
+        }
+      if (s->code.find("/* pragma:write:" + name + " */") != string::npos)
+        {
+          c_global_write_def(v);
+          write_defs.push_back(v);
+        }
+    }
+
   o->newline(1) << s->code;
-  o->newline(-1) << "}";
+  o->indent(-1);
+
+  for (vector<vardecl*>::const_iterator it = read_defs.begin(); it != read_defs.end(); ++it)
+    c_global_read_undef(*it);
+  for (vector<vardecl*>::const_iterator it = write_defs.begin(); it != write_defs.end(); ++it)
+    c_global_write_undef(*it);
+
+  o->newline() << "}";
 }
 
 
@@ -3051,67 +3728,106 @@ c_unparser::visit_expr_statement (expr_statement *s)
 
 
 void
+c_tmpcounter::wrap_compound_visit (statement *s)
+{
+  if (!s) return;
+
+  std::ostream::pos_type before_struct_pos;
+  std::ostream::pos_type after_struct_pos;
+
+  start_struct_def(before_struct_pos, after_struct_pos, s->tok);
+  c_unparser::wrap_compound_visit (s);
+  close_struct_def(before_struct_pos, after_struct_pos);
+}
+
+void
+c_tmpcounter::wrap_compound_visit (expression *e)
+{
+  if (!e) return;
+
+  std::ostream::pos_type before_struct_pos;
+  std::ostream::pos_type after_struct_pos;
+
+  start_struct_def(before_struct_pos, after_struct_pos, e->tok);
+  c_unparser::wrap_compound_visit (e);
+  close_struct_def(before_struct_pos, after_struct_pos);
+}
+
+void
+c_tmpcounter::start_struct_def (std::ostream::pos_type &before,
+                                std::ostream::pos_type &after, const token* tok)
+{
+  // To avoid lots of empty structs, remember  where we are now.  Then,
+  // output the struct start and remember that positon.  If when we get
+  // done with the statement we haven't moved, then we don't really need
+  // the struct.  To get rid of the struct start we output, we'll seek back
+  // to where we were before we output the struct (done in ::close_struct_def).
+  translator_output *o = parent->o;
+  before = o->tellp();
+  o->newline() << "struct { /* source: " << tok->location.file->name
+               << ":" << lex_cast(tok->location.line) << " */";
+  o->indent(1);
+  after = o->tellp();
+}
+
+void
+c_tmpcounter::close_struct_def (std::ostream::pos_type before,
+                                std::ostream::pos_type after)
+{
+  // meant to be used with ::start_struct_def. remove the struct if empty.
+  translator_output *o = parent->o;
+  o->indent(-1);
+  if (after == o->tellp())
+    o->seekp(before);
+  else
+    o->newline() << "};";
+}
+
+void
+c_tmpcounter::start_compound_statement (const char* tag, statement *s)
+{
+  const source_loc& loc = s->tok->location;
+  translator_output *o = parent->o;
+  o->newline() << "union { /* " << tag << ": "
+               << loc.file->name << ":"
+               << lex_cast(loc.line) << " */";
+  o->indent(1);
+}
+
+void
+c_tmpcounter::close_compound_statement (const char*, statement *)
+{
+  translator_output *o = parent->o;
+  o->newline(-1) << "};";
+}
+
+
+void
 c_unparser::visit_if_statement (if_statement *s)
 {
   record_actions(1, s->tok, true);
+
+  start_compound_statement ("if_statement", s);
+
   o->newline() << "if (";
   o->indent (1);
-  s->condition->visit (this);
+  wrap_compound_visit (s->condition);
   o->indent (-1);
   o->line() << ") {";
   o->indent (1);
-  s->thenblock->visit (this);
+  wrap_compound_visit (s->thenblock);
   record_actions(0, s->thenblock->tok, true);
   o->newline(-1) << "}";
   if (s->elseblock)
     {
       o->newline() << "else {";
       o->indent (1);
-      s->elseblock->visit (this);
+      wrap_compound_visit (s->elseblock);
       record_actions(0, s->elseblock->tok, true);
       o->newline(-1) << "}";
     }
-}
 
-
-void
-c_tmpcounter::visit_block (block *s)
-{
-  // Key insight: individual statements of a block can reuse
-  // temporary variable slots, since temporaries don't survive
-  // statement boundaries.  So we use gcc's anonymous union/struct
-  // facility to explicitly overlay the temporaries.
-  parent->o->newline() << "union {";
-  parent->o->indent(1);
-  for (unsigned i=0; i<s->statements.size(); i++)
-    {
-      // To avoid lots of empty structs inside the union, remember
-      // where we are now.  Then, output the struct start and remember
-      // that positon.  If when we get done with the statement we
-      // haven't moved, then we don't really need the struct.  To get
-      // rid of the struct start we output, we'll seek back to where
-      // we were before we output the struct.
-      std::ostream::pos_type before_struct_pos = parent->o->tellp();
-      parent->o->newline() << "struct {";
-      parent->o->indent(1);
-      std::ostream::pos_type after_struct_pos = parent->o->tellp();
-      s->statements[i]->visit (this);
-      parent->o->indent(-1);
-      if (after_struct_pos == parent->o->tellp())
-	parent->o->seekp(before_struct_pos);
-      else
-	parent->o->newline() << "};";
-    }
-  parent->o->newline(-1) << "};";
-}
-
-void
-c_tmpcounter::visit_for_loop (for_loop *s)
-{
-  if (s->init) s->init->visit (this);
-  s->cond->visit (this);
-  s->block->visit (this);
-  if (s->incr) s->incr->visit (this);
+  close_compound_statement ("if_statement", s);
 }
 
 
@@ -3123,8 +3839,10 @@ c_unparser::visit_for_loop (for_loop *s)
   string contlabel = "continue_" + ctr;
   string breaklabel = "break_" + ctr;
 
+  start_compound_statement ("for_loop", s);
+
   // initialization
-  if (s->init) s->init->visit (this);
+  wrap_compound_visit (s->init);
   record_actions(1, s->tok, true);
 
   // condition
@@ -3139,13 +3857,13 @@ c_unparser::visit_for_loop (for_loop *s)
   o->newline() << "if (! (";
   if (s->cond->type != pe_long)
     throw SEMANTIC_ERROR (_("expected numeric type"), s->cond->tok);
-  s->cond->visit (this);
+  wrap_compound_visit (s->cond);
   o->line() << ")) goto " << breaklabel << ";";
 
   // body
   loop_break_labels.push_back (breaklabel);
   loop_continue_labels.push_back (contlabel);
-  s->block->visit (this);
+  wrap_compound_visit (s->block);
   record_actions(0, s->block->tok, true);
   loop_break_labels.pop_back ();
   loop_continue_labels.pop_back ();
@@ -3153,12 +3871,14 @@ c_unparser::visit_for_loop (for_loop *s)
   // iteration
   o->newline(-1) << contlabel << ":";
   o->indent(1);
-  if (s->incr) s->incr->visit (this);
+  wrap_compound_visit (s->incr);
   o->newline() << "goto " << toplabel << ";";
 
   // exit
   o->newline(-1) << breaklabel << ":";
   o->newline(1) << "; /* dummy statement */";
+
+  close_compound_statement ("for_loop", s);
 }
 
 
@@ -3196,8 +3916,7 @@ expression_is_arrayindex (expression *e,
 
 // Look for opportunities to used a saved value at the beginning of the loop
 void
-c_unparser::visit_foreach_loop_value (visitor* vis, foreach_loop* s,
-                                      const string& value)
+c_unparser::visit_foreach_loop_value (foreach_loop* s, const string& value)
 {
   bool stable_value = false;
 
@@ -3240,11 +3959,11 @@ c_unparser::visit_foreach_loop_value (visitor* vis, foreach_loop* s,
         ai.indexes.push_back(s->indexes[i]);
       string loopai = lex_cast(ai);
       foreach_loop_values[loopai] = value;
-      s->block->visit (vis);
+      s->block->visit (this);
       foreach_loop_values.erase(loopai);
     }
   else
-    s->block->visit (vis);
+    s->block->visit (this);
 }
 
 
@@ -3262,55 +3981,6 @@ c_unparser::get_foreach_loop_value (arrayindex* ai, string& value)
 
 
 void
-c_tmpcounter::visit_foreach_loop (foreach_loop *s)
-{
-  symbol *array;
-  hist_op *hist;
-  classify_indexable (s->base, array, hist);
-
-  if (array)
-    {
-      itervar iv = parent->getiter (array);
-      parent->o->newline() << iv.declare();
-    }
-  else
-   {
-     // See commentary in c_tmpcounter::visit_arrayindex for
-     // discussion of tmpvars required to look into @hist_op(...)
-     // expressions.
-
-     // First make sure we have exactly one pe_long variable to use as
-     // our bucket index.
-
-     if (s->indexes.size() != 1 || s->indexes[0]->referent->type != pe_long)
-       throw SEMANTIC_ERROR(_("Invalid indexing of histogram"), s->tok);
-
-      // Then declare what we need to form the aggregate we're
-      // iterating over, and all the tmpvars needed by our call to
-      // load_aggregate().
-
-      aggvar agg = parent->gensym_aggregate ();
-      agg.declare(*(this->parent));
-      load_aggregate (hist->stat);
-    }
-
-  // Create a temporary for the loop limit counter and the limit
-  // expression result.
-  if (s->limit)
-    {
-      tmpvar res_limit = parent->gensym (pe_long);
-      res_limit.declare(*parent);
-
-      s->limit->visit (this);
-
-      tmpvar limitv = parent->gensym (pe_long);
-      limitv.declare(*parent);
-    }
-
-  parent->visit_foreach_loop_value(this, s);
-}
-
-void
 c_unparser::visit_foreach_loop (foreach_loop *s)
 {
   symbol *array;
@@ -3325,7 +3995,6 @@ c_unparser::visit_foreach_loop (foreach_loop *s)
   if (array)
     {
       mapvar mv = getmap (array->referent, s->tok);
-      itervar iv = getiter (array);
       vector<var> keys;
 
       // NB: structure parallels for_loop
@@ -3337,7 +4006,7 @@ c_unparser::visit_foreach_loop (foreach_loop *s)
         {
 	  // Evaluate the limit expression once.
 	  res_limit = new tmpvar(gensym(pe_long));
-	  c_assign (res_limit->value(), s->limit, "foreach limit");
+	  c_assign (*res_limit, s->limit, "foreach limit");
 	}
 
       // aggregate array if required
@@ -3411,10 +4080,6 @@ c_unparser::visit_foreach_loop (foreach_loop *s)
 
       // NB: sort direction sense is opposite in runtime, thus the negation
 
-      if (mv.is_parallel())
-	aggregations_active.insert(mv.value());
-      o->newline() << iv << " = " << iv.start (mv) << ";";
-
       tmpvar *limitv = NULL;
       if (s->limit)
       {
@@ -3422,6 +4087,28 @@ c_unparser::visit_foreach_loop (foreach_loop *s)
 	  limitv = new tmpvar(gensym (pe_long));
 	  o->newline() << *limitv << " = 0LL;";
       }
+
+      if (mv.is_parallel())
+	aggregations_active.insert(mv.value());
+
+      itervar iv = getiter (array);
+      o->newline() << iv << " = " << iv.start (mv) << ";";
+
+      vector<tmpvar *> array_slice_vars;
+      // store the the variables corresponding to the index of the array slice
+      // as temporary variables
+      if (!s->array_slice.empty())
+          for (unsigned i = 0; i < s->array_slice.size(); ++i)
+            {
+              if (s->array_slice[i])
+                {
+                  tmpvar *asvar = new tmpvar(gensym(s->array_slice[i]->type));
+                  c_assign(*asvar, s->array_slice[i], "array slice index");
+                  array_slice_vars.push_back(asvar);
+                }
+              else
+                array_slice_vars.push_back(NULL);
+            }
 
       record_actions(1, s->tok, true);
 
@@ -3460,13 +4147,49 @@ c_unparser::visit_foreach_loop (foreach_loop *s)
 	  c_assign (v, iv.get_key (mv, v.type(), i), s->tok);
 	}
 
+      // in the case that the user specified something like
+      // foreach ([a,b] in foo[*, 123]), need to check that it iterates over
+      // the specified values, ie b is alwasy going to be 123
+      if (!s->array_slice.empty())
+        {
+          //add in the beginning portion of the if statement
+          o->newline() << "if (0"; // in case all are wildcards
+          for (unsigned i = 0; i < s->array_slice.size(); ++i)
+
+            // only output a comparsion if the expression is not "*".
+            if (s->array_slice[i])
+            {
+              o->line() << " || ";
+              if (s->indexes[i]->type == pe_string)
+                {
+                  if (s->array_slice[i]->type != pe_string)
+                    throw SEMANTIC_ERROR (_("expected string types"), s->tok);
+                  o->line() << "strncmp(" << getvar (s->indexes[i]->referent)
+                            << ", " << *array_slice_vars[i];
+                  o->line() << ", MAXSTRINGLEN) !=0";
+                }
+              else if (s->indexes[i]->type == pe_long)
+                {
+                  if (s->array_slice[i]->type != pe_long)
+                    throw SEMANTIC_ERROR (_("expected numeric types"), s->tok);
+                  o->line() << getvar (s->indexes[i]->referent) << " != "
+                            << *array_slice_vars[i];
+                }
+              else
+              {
+                  throw SEMANTIC_ERROR (_("unexpected type"), s->tok);
+              }
+            }
+          o->line() << ") goto " << contlabel << ";"; // end of the if statment
+        }
+
       if (s->value)
         {
 	  var v = getvar (s->value->referent);
 	  c_assign (v, iv.get_value (mv, v.type()), s->tok);
         }
 
-      visit_foreach_loop_value(this, s, iv.get_value(mv, array->type));
+      visit_foreach_loop_value(s, iv.get_value(mv, array->type));
       record_actions(0, s->block->tok, true);
       o->newline(-1) << "}";
       loop_break_labels.pop_back ();
@@ -3487,14 +4210,11 @@ c_unparser::visit_foreach_loop (foreach_loop *s)
   else
     {
       // Iterating over buckets in a histogram.
-      assert(s->indexes.size() == 1);
-      assert(s->indexes[0]->referent->type == pe_long);
-      var bucketvar = getvar (s->indexes[0]->referent);
 
-      aggvar agg = gensym_aggregate ();
-
-      var *v = load_aggregate(hist->stat, agg);
-      v->assert_hist_compatible(*hist);
+      // First make sure we have exactly one pe_long variable to use as
+      // our bucket index.
+      if (s->indexes.size() != 1 || s->indexes[0]->referent->type != pe_long)
+	throw SEMANTIC_ERROR(_("Invalid indexing of histogram"), s->tok);
 
       tmpvar *res_limit = NULL;
       tmpvar *limitv = NULL;
@@ -3502,12 +4222,19 @@ c_unparser::visit_foreach_loop (foreach_loop *s)
         {
 	  // Evaluate the limit expression once.
 	  res_limit = new tmpvar(gensym(pe_long));
-	  c_assign (res_limit->value(), s->limit, "foreach limit");
+	  c_assign (*res_limit, s->limit, "foreach limit");
 
 	  // Create the loop limit variable here and initialize it.
 	  limitv = new tmpvar(gensym (pe_long));
 	  o->newline() << *limitv << " = 0LL;";
 	}
+
+      var bucketvar = getvar (s->indexes[0]->referent);
+
+      aggvar agg = gensym_aggregate ();
+
+      var *v = load_aggregate(hist->stat, agg);
+      v->assert_hist_compatible(*hist);
 
       record_actions(1, s->tok, true);
       o->newline() << "for (" << bucketvar << " = 0; "
@@ -3534,7 +4261,7 @@ c_unparser::visit_foreach_loop (foreach_loop *s)
           c_assign (v, agg.get_hist (bucketvar), s->tok);
         }
 
-      visit_foreach_loop_value(this, s, agg.get_hist(bucketvar));
+      visit_foreach_loop_value(s, agg.get_hist(bucketvar));
       record_actions(1, s->block->tok, true);
 
       o->newline(-1) << contlabel << ":";
@@ -3569,24 +4296,13 @@ c_unparser::visit_return_statement (return_statement* s)
 void
 c_unparser::visit_next_statement (next_statement* s)
 {
-  if (current_probe == 0)
-    throw SEMANTIC_ERROR (_("cannot 'next' from function"), s->tok);
+  /* Set next flag to indicate to caller to call next alternative function */
+  if (current_function != 0)
+    o->newline() << "c->next = 1;";
 
   record_actions(1, s->tok, true);
   o->newline() << "goto out;";
 }
-
-
-struct delete_statement_operand_tmp_visitor:
-  public traversing_visitor
-{
-  c_tmpcounter *parent;
-  delete_statement_operand_tmp_visitor (c_tmpcounter *p):
-    parent (p)
-  {}
-  //void visit_symbol (symbol* e);
-  void visit_arrayindex (arrayindex* e);
-};
 
 
 struct delete_statement_operand_visitor:
@@ -3604,19 +4320,20 @@ struct delete_statement_operand_visitor:
 void
 delete_statement_operand_visitor::visit_symbol (symbol* e)
 {
+  translator_output* o = parent->o;
   assert (e->referent != 0);
   if (e->referent->arity > 0)
     {
       mapvar mvar = parent->getmap(e->referent, e->tok);
       /* NB: Memory deallocation/allocation operations
        are not generally safe.
-      parent->o->newline() << mvar.fini ();
-      parent->o->newline() << mvar.init ();
+      o->newline() << mvar.fini ();
+      o->newline() << mvar.init ();
       */
       if (mvar.is_parallel())
-	parent->o->newline() << "_stp_pmap_clear (" << mvar.value() << ");";
+	o->newline() << "_stp_pmap_clear (" << mvar.value() << ");";
       else
-	parent->o->newline() << "_stp_map_clear (" << mvar.value() << ");";
+	o->newline() << "_stp_map_clear (" << mvar.value() << ");";
     }
   else
     {
@@ -3624,13 +4341,13 @@ delete_statement_operand_visitor::visit_symbol (symbol* e)
       switch (e->type)
 	{
 	case pe_stats:
-	  parent->o->newline() << "_stp_stat_clear (" << v.value() << ");";
+	  o->newline() << "_stp_stat_clear (" << v.value() << ");";
 	  break;
 	case pe_long:
-	  parent->o->newline() << v.value() << " = 0;";
+	  o->newline() << v.value() << " = 0;";
 	  break;
 	case pe_string:
-	  parent->o->newline() << v.value() << "[0] = '\\0';";
+	  o->newline() << v.value() << "[0] = '\\0';";
 	  break;
 	case pe_unknown:
 	default:
@@ -3640,60 +4357,132 @@ delete_statement_operand_visitor::visit_symbol (symbol* e)
 }
 
 void
-delete_statement_operand_tmp_visitor::visit_arrayindex (arrayindex* e)
-{
-  symbol *array;
-  hist_op *hist;
-  classify_indexable (e->base, array, hist);
-
-  if (array)
-    {
-      assert (array->referent != 0);
-      vardecl* r = array->referent;
-
-      // One temporary per index dimension.
-      for (unsigned i=0; i<r->index_types.size(); i++)
-	{
-	  tmpvar ix = parent->parent->gensym (r->index_types[i]);
-	  ix.declare (*(parent->parent));
-	  e->indexes[i]->visit(parent);
-	}
-    }
-  else
-    {
-      throw SEMANTIC_ERROR(_("cannot delete histogram bucket entries\n"), e->tok);
-    }
-}
-
-void
 delete_statement_operand_visitor::visit_arrayindex (arrayindex* e)
 {
   symbol *array;
   hist_op *hist;
   classify_indexable (e->base, array, hist);
+  translator_output* o = parent->o;
 
   if (array)
     {
-      vector<tmpvar> idx;
-      parent->load_map_indices (e, idx);
+      bool array_slice = false;
+      for (unsigned i = 0; i < e->indexes.size(); i ++)
+        if (e->indexes[i] == NULL)
+          {
+            array_slice = true;
+            break;
+          }
 
-      {
-	mapvar mvar = parent->getmap (array->referent, e->tok);
-	parent->o->newline() << mvar.del (idx) << ";";
-      }
+      if (!array_slice) // delete a single element
+        {
+          vector<tmpvar> idx;
+          parent->load_map_indices (e, idx);
+          mapvar mvar = parent->getmap (array->referent, e->tok);
+          o->newline() << mvar.del (idx) << ";";
+        }
+      else // delete elements if they match the array slice.
+        {
+          vardecl* r = array->referent;
+          mapvar mvar = parent->getmap (r, e->tok);
+          itervar iv = parent->getiter(array);
+
+          // create tmpvars for the array indexes, storing NULL where there is
+          // no specific value that the index should be
+          vector<tmpvar *> array_slice_vars;
+          vector<tmpvar> idx; // for the indexes if the variable is a pmap
+          for (unsigned i=0; i<e->indexes.size(); i++)
+            {
+              if (e->indexes[i])
+                {
+                  tmpvar *asvar = new tmpvar(parent->gensym(e->indexes[i]->type));
+                  parent->c_assign (*asvar, e->indexes[i], "tmp var");
+                  array_slice_vars.push_back(asvar);
+                  if (mvar.is_parallel())
+                    idx.push_back(*asvar);
+                }
+              else
+                {
+                  array_slice_vars.push_back(NULL);
+                  if (mvar.is_parallel())
+                    {
+                      tmpvar *asvar = new tmpvar(parent->gensym(r->index_types[i]));
+                      idx.push_back(*asvar);
+                    }
+                }
+            }
+
+          if (mvar.is_parallel())
+            {
+              o->newline() << "if (unlikely(NULL == "
+                           << mvar.calculate_aggregate() << ")) {";
+              o->newline(1) << "c->last_error = ";
+              o->line() << STAP_T_05 << mvar << "\";";
+              o->newline() << "c->last_stmt = "
+                           << lex_cast_qstring(*e->tok) << ";";
+              o->newline() << "goto out;";
+              o->newline(-1) << "}";
+            }
+
+          // iterate through the map, deleting elements that match the array slice
+          string ctr = lex_cast (parent->label_counter++);
+          string toplabel = "top_" + ctr;
+          string breaklabel = "break_" + ctr;
+
+          o->newline() << iv << " = " << iv.start(mvar) << ";";
+          o->newline() << toplabel << ":";
+
+          o->newline(1) << "if (!(" << iv << ")){";
+          o->newline(1) << "goto " << breaklabel << ";}";
+
+          // insert the comparison for keys that aren't wildcards
+          o->newline(-1) << "if (1"; // in case all are wildcards
+          for (unsigned i=0; i<array_slice_vars.size(); i++)
+            if (array_slice_vars[i] != NULL)
+              {
+              if (array_slice_vars[i]->type() == pe_long)
+                o->line() << " && " << *array_slice_vars[i] << " == "
+                          << iv.get_key(mvar, array_slice_vars[i]->type(), i);
+              else if (array_slice_vars[i]->type() == pe_string)
+                o->line() << " && strncmp(" << *array_slice_vars[i] << ", "
+                          << iv.get_key(mvar, array_slice_vars[i]->type(), i)
+                          << ", MAXSTRINGLEN) == 0";
+              else
+                throw SEMANTIC_ERROR (_("unexpected type"), e->tok);
+              }
+
+          o->line() <<  ") {";
+
+          // conditional is true, so delete item and go to the next item
+          if (mvar.is_parallel())
+            {
+              o->indent(1);
+              // fills in the wildcards with the current iteration's (map) indexes
+              for (unsigned i = 0; i<array_slice_vars.size(); i++)
+                if (array_slice_vars[i] == NULL)
+                  parent->c_assign (idx[i].value(),
+                                    iv.get_key(mvar, r->index_types[i], i),
+                                    r->index_types[i], "tmpvar", e->tok);
+              o->newline() << iv << " = " << iv.next(mvar) << ";";
+              o->newline() << mvar.del(idx) << ";";
+            }
+          else
+            o->newline(1) << iv << " = " << iv.del_next(mvar) << ";";
+
+          o->newline(-1) << "} else";
+          o->newline(1) << iv << " = " << iv.next(mvar) << ";";
+
+          o->newline(-1) << "goto " << toplabel << ";";
+
+          o->newline(-1) << breaklabel<< ":";
+          o->newline(1) << "; /* dummy statement */";
+          o->indent(-1);
+        }
     }
   else
     {
       throw SEMANTIC_ERROR(_("cannot delete histogram bucket entries\n"), e->tok);
     }
-}
-
-
-void
-c_tmpcounter::visit_delete_statement (delete_statement* s)
-{
-  delete_statement_operand_tmp_visitor dv (this);
-  s->value->visit (&dv);
 }
 
 
@@ -3732,7 +4521,7 @@ c_unparser::visit_continue_statement (continue_statement* s)
 void
 c_unparser::visit_literal_string (literal_string* e)
 {
-  const string& v = e->value;
+  interned_string v = e->value;
   o->line() << '"';
   for (unsigned i=0; i<v.size(); i++)
     // NB: The backslash character is specifically passed through as is.
@@ -3763,26 +4552,32 @@ c_unparser::visit_literal_number (literal_number* e)
 
 
 void
-c_tmpcounter::visit_binary_expression (binary_expression* e)
-{
-  if (e->op == "/" || e->op == "%")
-    {
-      tmpvar left = parent->gensym (pe_long);
-      tmpvar right = parent->gensym (pe_long);
-      if (e->left->tok->type != tok_number)
-        left.declare (*parent);
-      if (e->right->tok->type != tok_number)
-	right.declare (*parent);
-    }
-
-  e->left->visit (this);
-  e->right->visit (this);
-}
-
-
-void
 c_unparser::visit_embedded_expr (embedded_expr* e)
 {
+  bool has_defines = false;
+  vector<vardecl*> read_defs;
+  vector<vardecl*> write_defs;
+  for (unsigned i = 0; i < session->globals.size(); i++)
+    {
+      vardecl* v = session->globals[i];
+      string name = v->unmangled_name;
+      if (e->code.find("/* pragma:read:" + name + " */") != string::npos)
+        {
+          has_defines = true;
+          c_global_read_def(v);
+          read_defs.push_back(v);
+        }
+      if (e->code.find("/* pragma:write:" + name + " */") != string::npos)
+        {
+          has_defines = true;
+          c_global_write_def(v);
+          write_defs.push_back(v);
+        }
+    }
+
+  if (has_defines)
+    o->newline();
+
   o->line() << "(";
 
   // Automatically add a call to assert_is_myproc to any code tagged with
@@ -3798,6 +4593,14 @@ c_unparser::visit_embedded_expr (embedded_expr* e)
     throw SEMANTIC_ERROR (_("expected numeric or string type"), e->tok);
 
   o->line() << ")";
+
+  for (vector<vardecl*>::const_iterator it = read_defs.begin(); it != read_defs.end(); ++it)
+    c_global_read_undef(*it);
+  for (vector<vardecl*>::const_iterator it = write_defs.begin(); it != write_defs.end(); ++it)
+    c_global_write_undef(*it);
+
+  if (has_defines)
+    o->newline();
 }
 
 
@@ -3842,23 +4645,8 @@ c_unparser::visit_binary_expression (binary_expression* e)
       o->line() << "({";
       o->indent(1);
 
-      if (e->left->tok->type == tok_number)
-	left.override(c_expression(e->left));
-      else
-        {
-	  o->newline() << left << " = ";
-	  e->left->visit (this);
-	  o->line() << ";";
-	}
-
-      if (e->right->tok->type == tok_number)
-	right.override(c_expression(e->right));
-      else
-        {
-	  o->newline() << right << " = ";
-	  e->right->visit (this);
-	  o->line() << ";";
-	}
+      c_assign (left, e->left, "division");
+      c_assign (right, e->right, "division");
 
       o->newline() << "if (unlikely(!" << right << ")) {";
       o->newline(1) << "c->last_error = ";
@@ -3937,44 +4725,6 @@ c_unparser::visit_logical_and_expr (logical_and_expr* e)
 
 
 void
-c_tmpcounter::visit_array_in (array_in* e)
-{
-  symbol *array;
-  hist_op *hist;
-  classify_indexable (e->operand->base, array, hist);
-
-  if (array)
-    {
-      assert (array->referent != 0);
-      vardecl* r = array->referent;
-
-      // One temporary per index dimension.
-      for (unsigned i=0; i<r->index_types.size(); i++)
-	{
-	  tmpvar ix = parent->gensym (r->index_types[i]);
-	  ix.declare (*parent);
-	  e->operand->indexes[i]->visit(this);
-	}
-
-      // A boolean result.
-      tmpvar res = parent->gensym (e->type);
-      res.declare (*parent);
-    }
-  else
-    {
-      // By definition:
-      //
-      // 'foo in @hist_op(...)'  is true iff
-      // '@hist_op(...)[foo]'    is nonzero
-      //
-      // so we just delegate to the latter call, since int64_t is also
-      // our boolean type.
-      e->operand->visit(this);
-    }
-}
-
-
-void
 c_unparser::visit_array_in (array_in* e)
 {
   symbol *array;
@@ -3985,15 +4735,108 @@ c_unparser::visit_array_in (array_in* e)
     {
       stmt_expr block(*this);
 
-      vector<tmpvar> idx;
-      load_map_indices (e->operand, idx);
-      // o->newline() << "c->last_stmt = " << lex_cast_qstring(*e->tok) << ";";
-
       tmpvar res = gensym (pe_long);
-      mapvar mvar = getmap (array->referent, e->tok);
-      c_assign (res, mvar.exists(idx), e->tok);
+      vector<tmpvar> idx;
 
-      o->newline() << res << ";";
+      // determine if the array index contains an asterisk
+      bool array_slice = false;
+      for (unsigned i = 0; i < e->operand->indexes.size(); i ++)
+        if (e->operand->indexes[i] == NULL)
+          {
+            array_slice = true;
+            break;
+          }
+
+      if (!array_slice) // checking for membership of a specific element
+        {
+          load_map_indices (e->operand, idx);
+          // o->newline() << "c->last_stmt = " << lex_cast_qstring(*e->tok) << ";";
+
+          mapvar mvar = getmap (array->referent, e->tok);
+          c_assign (res, mvar.exists(idx), e->tok);
+
+          o->newline() << res << ";";
+        }
+      else
+        {
+          // create tmpvars for the array indexes, storing NULL where there is
+          // no specific value that the index should be
+          vector<tmpvar *> array_slice_vars;
+          for (unsigned i=0; i<e->operand->indexes.size(); i++)
+            {
+              if (e->operand->indexes[i])
+                {
+                  tmpvar *asvar = new tmpvar(gensym(e->operand->indexes[i]->type));
+                  c_assign (*asvar, e->operand->indexes[i], "tmp var");
+                  array_slice_vars.push_back(asvar);
+                }
+              else
+                array_slice_vars.push_back(NULL);
+            }
+
+          mapvar mvar = getmap (array->referent, e->operand->tok);
+          itervar iv = getiter(array);
+          vector<tmpvar> idx;
+
+          // we may not need to aggregate if we're already in a foreach
+          bool pre_agg = (aggregations_active.count(mvar.value()) > 0);
+          if (mvar.is_parallel() && !pre_agg)
+            {
+              o->newline() << "if (unlikely(NULL == "
+                           << mvar.calculate_aggregate() << ")) {";
+              o->newline(1) << "c->last_error = ";
+              o->line() << STAP_T_05 << mvar << "\";";
+              o->newline() << "c->last_stmt = " << lex_cast_qstring(*e->tok) << ";";
+              o->newline() << "goto out;";
+              o->newline(-1) << "}";
+            }
+
+          string ctr = lex_cast (label_counter++);
+          string toplabel = "top_" + ctr;
+          string contlabel = "continue_" + ctr;
+          string breaklabel = "break_" + ctr;
+
+          o->newline() << iv << " = " << iv.start(mvar) << ";";
+          c_assign (res, "0", e->tok); // set the default to 0
+
+          o->newline() << toplabel << ":";
+
+          o->newline(1) << "if (!(" << iv << "))";
+          o->newline(1) << "goto " << breaklabel << ";";
+
+          // generate code for comparing the keys to the index slice
+          o->newline(-1) << "if (1"; // in case all are wildcards
+          for (unsigned i=0; i<array_slice_vars.size(); i++)
+            {
+              if (array_slice_vars[i] != NULL)
+                {
+                if (array_slice_vars[i]->type() == pe_long)
+                  o->line() << " && " << *array_slice_vars[i] << " == "
+                            << iv.get_key(mvar, array_slice_vars[i]->type(), i);
+                else if (array_slice_vars[i]->type() == pe_string)
+                  o->line() << " && strncmp(" << *array_slice_vars[i] << ", "
+                            << iv.get_key(mvar, array_slice_vars[i]->type(), i)
+                            << ", MAXSTRINGLEN) == 0";
+                else
+                  throw SEMANTIC_ERROR (_("unexpected type"), e->tok);
+                }
+            }
+          o->line() <<  "){";
+          o->indent(1);
+          // conditional is true, so set res and go to break
+          c_assign (res, "1", e->tok);
+          o->newline() << "goto " << breaklabel << ";";
+          o->newline(-1) << "}";
+
+          // else, keep iterating
+          o->newline() << iv << " = " << iv.next(mvar) << ";";
+          o->newline() << "goto " << toplabel << ";";
+
+          o->newline(-1) << breaklabel<< ":";
+          o->newline(1) << "; /* dummy statement */";
+          o->newline(-1) << res << ";";
+        }
+
     }
   else
     {
@@ -4006,13 +4849,6 @@ c_unparser::visit_array_in (array_in* e)
       // our boolean type.
       e->operand->visit(this);
     }
-}
-
-void
-c_tmpcounter::visit_regex_query (regex_query* e)
-{
-  e->left->visit(this);
-  e->right->visit(this);
 }
 
 void
@@ -4030,22 +4866,6 @@ c_unparser::visit_regex_query (regex_query* e)
 }
 
 void
-c_tmpcounter::visit_comparison (comparison* e)
-{
-  // When computing string operands, their results may be in overlapping
-  // __retvalue memory, so we need to save at least one in a tmpvar.
-  if (e->left->type == pe_string)
-    {
-      tmpvar left = parent->gensym (pe_string);
-      if (e->left->tok->type != tok_string)
-        left.declare (*parent);
-    }
-
-  e->left->visit (this);
-  e->right->visit (this);
-}
-
-void
 c_unparser::visit_comparison (comparison* e)
 {
   o->line() << "(";
@@ -4055,19 +4875,17 @@ c_unparser::visit_comparison (comparison* e)
       if (e->right->type != pe_string)
         throw SEMANTIC_ERROR (_("expected string types"), e->tok);
 
-      o->line() << "({";
-      o->indent(1);
+      // PR13283 indicated that we may need a temporary variable to
+      // store the operand strings, if e.g. they are both references
+      // into function call __retvalue's, which overlap in memory.
+      // ... but we now handle that inside the function call machinery,
+      // which always returns an allocated temporary variable.
 
-      tmpvar left = gensym (pe_string);
-      if (e->left->tok->type == tok_string)
-        left.override(c_expression(e->left));
-      else
-        c_assign (left.value(), e->left, "assignment");
-
-      o->newline() << "strncmp (" << left << ", ";
+      o->line() << "(strncmp ((";
+      e->left->visit (this);
+      o->line() << "), (";
       e->right->visit (this);
-      o->line() << ", MAXSTRINGLEN) " << e->op << " 0;";
-      o->newline(-1) << "})";
+      o->line() << "), MAXSTRINGLEN) " << e->op << " 0)";
     }
   else if (e->left->type == pe_long)
     {
@@ -4084,16 +4902,6 @@ c_unparser::visit_comparison (comparison* e)
     throw SEMANTIC_ERROR (_("unexpected type"), e->left->tok);
 
   o->line() << ")";
-}
-
-
-void
-c_tmpcounter::visit_concatenation (concatenation* e)
-{
-  tmpvar t = parent->gensym (e->type);
-  t.declare (*parent);
-  e->left->visit (this);
-  e->right->visit (this);
 }
 
 
@@ -4142,14 +4950,6 @@ c_unparser::visit_ternary_expression (ternary_expression* e)
 
 
 void
-c_tmpcounter::visit_assignment (assignment *e)
-{
-  c_tmpcounter_assignment tav (this, e->op, e->right);
-  e->left->visit (& tav);
-}
-
-
-void
 c_unparser::visit_assignment (assignment* e)
 {
   if (e->op == "<<<")
@@ -4178,14 +4978,6 @@ c_unparser::visit_assignment (assignment* e)
 
 
 void
-c_tmpcounter::visit_pre_crement (pre_crement* e)
-{
-  c_tmpcounter_assignment tav (this, e->op, 0);
-  e->operand->visit (& tav);
-}
-
-
-void
 c_unparser::visit_pre_crement (pre_crement* e)
 {
   if (e->type != pe_long ||
@@ -4193,14 +4985,6 @@ c_unparser::visit_pre_crement (pre_crement* e)
     throw SEMANTIC_ERROR (_("expected numeric type"), e->tok);
 
   c_unparser_assignment tav (this, e->op, false);
-  e->operand->visit (& tav);
-}
-
-
-void
-c_tmpcounter::visit_post_crement (post_crement* e)
-{
-  c_tmpcounter_assignment tav (this, e->op, 0, true);
   e->operand->visit (& tav);
 }
 
@@ -4231,36 +5015,6 @@ c_unparser::visit_symbol (symbol* e)
 }
 
 
-void
-c_tmpcounter_assignment::prepare_rvalue (tmpvar & rval)
-{
-  if (rvalue)
-    {
-      // literal number and strings don't need any temporaries declared
-      if (rvalue->tok->type != tok_number && rvalue->tok->type != tok_string)
-	rval.declare (*(parent->parent));
-
-      rvalue->visit (parent);
-    }
-}
-
-void
-c_tmpcounter_assignment::c_assignop(tmpvar & res)
-{
-  if (res.type() == pe_string)
-    {
-      // string assignment doesn't need any temporaries declared
-    }
-  else if (op == "<<<")
-    res.declare (*(parent->parent));
-  else if (res.type() == pe_long)
-    {
-      // Only the 'post' operators ('x++') need a temporary declared.
-      if (post)
-	res.declare (*(parent->parent));
-    }
-}
-
 // Assignment expansion is tricky.
 //
 // Because assignments are nestable expressions, we have
@@ -4285,33 +5039,12 @@ c_tmpcounter_assignment::c_assignop(tmpvar & res)
 //
 
 void
-c_tmpcounter_assignment::visit_symbol (symbol *e)
-{
-  exp_type ty = rvalue ? rvalue->type : e->type;
-  tmpvar rval = parent->parent->gensym (ty);
-  tmpvar res = parent->parent->gensym (ty);
-
-  prepare_rvalue(rval);
-
-  c_assignop (res);
-}
-
-
-void
-c_unparser_assignment::prepare_rvalue (string const & op,
+c_unparser_assignment::prepare_rvalue (interned_string op,
 				       tmpvar & rval,
 				       token const * tok)
 {
   if (rvalue)
-    {
-      if (rvalue->tok->type == tok_number || rvalue->tok->type == tok_string)
-	// Instead of assigning the numeric or string constant to a
-	// temporary, then assigning the temporary to the final, let's
-	// just override the temporary with the constant.
-	rval.override(parent->c_expression(rvalue));
-      else
-	parent->c_assign (rval.value(), rvalue, "assignment");
-    }
+    parent->c_assign (rval, rvalue, "assignment");
   else
     {
       if (op == "++" || op == "--")
@@ -4327,12 +5060,13 @@ void
 c_unparser_assignment::visit_symbol (symbol *e)
 {
   stmt_expr block(*parent);
+  translator_output* o = parent->o;
 
   assert (e->referent != 0);
   if (e->referent->index_types.size() != 0)
     throw SEMANTIC_ERROR (_("unexpected reference to array"), e->tok);
 
-  // parent->o->newline() << "c->last_stmt = " << lex_cast_qstring(*e->tok) << ";";
+  // o->newline() << "c->last_stmt = " << lex_cast_qstring(*e->tok) << ";";
   exp_type ty = rvalue ? rvalue->type : e->type;
   tmpvar rval = parent->gensym (ty);
   tmpvar res = parent->gensym (ty);
@@ -4342,7 +5076,7 @@ c_unparser_assignment::visit_symbol (symbol *e)
   var lvar = parent->getvar (e->referent, e->tok);
   c_assignop (res, lvar, rval, e->tok);
 
-  parent->o->newline() << res << ";";
+  o->newline() << res << ";";
 }
 
 
@@ -4368,6 +5102,13 @@ c_unparser::visit_cast_op (cast_op* e)
 
 
 void
+c_unparser::visit_autocast_op (autocast_op* e)
+{
+  throw SEMANTIC_ERROR(_("cannot translate general dereference expression"), e->tok);
+}
+
+
+void
 c_unparser::visit_defined_op (defined_op* e)
 {
   throw SEMANTIC_ERROR(_("cannot translate general @defined expression"), e->tok);
@@ -4385,36 +5126,6 @@ void
 c_unparser::visit_perf_op (perf_op* e)
 {
   throw SEMANTIC_ERROR(_("cannot translate general @perf expression"), e->tok);
-}
-
-
-void
-c_tmpcounter::load_map_indices(arrayindex *e)
-{
-  symbol *array;
-  hist_op *hist;
-  classify_indexable (e->base, array, hist);
-
-  if (array)
-    {
-      assert (array->referent != 0);
-      vardecl* r = array->referent;
-
-      // One temporary per index dimension, except in the case of
-      // number or string constants.
-      for (unsigned i=0; i<r->index_types.size(); i++)
-	{
-	  tmpvar ix = parent->gensym (r->index_types[i]);
-	  if (e->indexes[i]->tok->type == tok_number
-	      || e->indexes[i]->tok->type == tok_string)
-	    {
-	      // Do nothing
-	    }
-	  else
-	    ix.declare (*parent);
-	  e->indexes[i]->visit(this);
-	}
-    }
 }
 
 
@@ -4443,18 +5154,7 @@ c_unparser::load_map_indices(arrayindex *e,
 	    throw SEMANTIC_ERROR (_("array index type mismatch"), e->indexes[i]->tok);
 
 	  tmpvar ix = gensym (r->index_types[i]);
-	  if (e->indexes[i]->tok->type == tok_number
-	      || e->indexes[i]->tok->type == tok_string)
-	    // Instead of assigning the numeric or string constant to a
-	    // temporary, then using the temporary, let's just
-	    // override the temporary with the constant.
-	    ix.override(c_expression(e->indexes[i]));
-	  else
-	    {
-	      // o->newline() << "c->last_stmt = "
-              // << lex_cast_qstring(*e->indexes[i]->tok) << ";";
-	      c_assign (ix.value(), e->indexes[i], "array index copy");
-	    }
+	  c_assign (ix, e->indexes[i], "array index copy");
 	  idx.push_back (ix);
 	}
     }
@@ -4463,29 +5163,8 @@ c_unparser::load_map_indices(arrayindex *e,
       assert (e->indexes.size() == 1);
       assert (e->indexes[0]->type == pe_long);
       tmpvar ix = gensym (pe_long);
-      // o->newline() << "c->last_stmt = "
-      //	   << lex_cast_qstring(*e->indexes[0]->tok) << ";";
-      c_assign (ix.value(), e->indexes[0], "array index copy");
+      c_assign (ix, e->indexes[0], "array index copy");
       idx.push_back(ix);
-    }
-}
-
-
-void
-c_tmpcounter::load_aggregate (expression *e)
-{
-  symbol *sym = get_symbol_within_expression (e);
-  string agg_value;
-  arrayindex* arr = NULL;
-  expression_is_arrayindex (e, arr);
-
-  // If we have a foreach_loop value, we don't need tmps for indexes
-  if (sym->referent->arity != 0 &&
-      !parent->get_foreach_loop_value(arr, agg_value))
-    {
-      if (!arr)
-	throw SEMANTIC_ERROR(_("expected arrayindex expression"), e->tok);
-      load_map_indices (arr);
     }
 }
 
@@ -4541,12 +5220,15 @@ c_unparser::histogram_index_check(var & base, tmpvar & idx) const
 
 
 void
-c_tmpcounter::visit_arrayindex (arrayindex *e)
+c_unparser::visit_arrayindex (arrayindex* e)
 {
-  // If we have a foreach_loop value, no other tmps are needed
+  // If we have a foreach_loop value, use it and call it a day!
   string ai_value;
-  if (parent->get_foreach_loop_value(e, ai_value))
-    return;
+  if (get_foreach_loop_value(e, ai_value))
+    {
+      o->line() << ai_value;
+      return;
+    }
 
   symbol *array;
   hist_op *hist;
@@ -4554,17 +5236,24 @@ c_tmpcounter::visit_arrayindex (arrayindex *e)
 
   if (array)
     {
-      load_map_indices(e);
+      // Visiting an statistic-valued array in a non-lvalue context is prohibited.
+      if (array->referent->type == pe_stats)
+	throw SEMANTIC_ERROR (_("statistic-valued array in rvalue context"), e->tok);
 
-      // The index-expression result.
-      tmpvar res = parent->gensym (e->type);
-      res.declare (*parent);
+      stmt_expr block(*this);
+
+      vector<tmpvar> idx;
+      load_map_indices (e, idx);
+      tmpvar res = gensym (e->type);
+
+      mapvar mvar = getmap (array->referent, e->tok);
+      // o->newline() << "c->last_stmt = " << lex_cast_qstring(*e->tok) << ";";
+      c_assign (res, mvar.get(idx), e->tok);
+
+      o->newline() << res << ";";
     }
   else
     {
-
-      assert(hist);
-
       // Note: this is a slightly tricker-than-it-looks allocation of
       // temporaries. The reason is that we're in the branch handling
       // histogram-indexing, and the histogram might be build over an
@@ -4590,84 +5279,18 @@ c_tmpcounter::visit_arrayindex (arrayindex *e)
       // (bucket) tmpvar, then all the index tmpvars of our
       // pe_stat-valued subexpression, then our result.
 
-
-      // First all the stuff related to indexing into the histogram
-
-      if (e->indexes.size() != 1)
-	throw SEMANTIC_ERROR(_("Invalid indexing of histogram"), e->tok);
-      tmpvar ix = parent->gensym (pe_long);
-      ix.declare (*parent);
-      e->indexes[0]->visit(this);
-      tmpvar res = parent->gensym (pe_long);
-      res.declare (*parent);
-
-      // Then the aggregate, and all the tmpvars needed by our call to
-      // load_aggregate().
-
-      aggvar agg = parent->gensym_aggregate ();
-      agg.declare(*(this->parent));
-      load_aggregate (hist->stat);
-    }
-}
-
-
-void
-c_unparser::visit_arrayindex (arrayindex* e)
-{
-  // If we have a foreach_loop value, use it and call it a day!
-  string ai_value;
-  if (get_foreach_loop_value(e, ai_value))
-    {
-      o->line() << ai_value;
-      return;
-    }
-
-  symbol *array;
-  hist_op *hist;
-  classify_indexable (e->base, array, hist);
-
-  if (array)
-    {
-      // Visiting an statistic-valued array in a non-lvalue context is prohibited.
-      if (array->referent->type == pe_stats)
-	throw SEMANTIC_ERROR (_("statistic-valued array in rvalue context"), e->tok);
-
-      stmt_expr block(*this);
-
-      // NB: Do not adjust the order of the next few lines; the tmpvar
-      // allocation order must remain the same between
-      // c_unparser::visit_arrayindex and c_tmpcounter::visit_arrayindex
-
-      vector<tmpvar> idx;
-      load_map_indices (e, idx);
-      tmpvar res = gensym (e->type);
-
-      mapvar mvar = getmap (array->referent, e->tok);
-      // o->newline() << "c->last_stmt = " << lex_cast_qstring(*e->tok) << ";";
-      c_assign (res, mvar.get(idx), e->tok);
-
-      o->newline() << res << ";";
-    }
-  else
-    {
-      // See commentary in c_tmpcounter::visit_arrayindex
-
       assert(hist);
       stmt_expr block(*this);
 
-      // NB: Do not adjust the order of the next few lines; the tmpvar
-      // allocation order must remain the same between
-      // c_unparser::visit_arrayindex and c_tmpcounter::visit_arrayindex
+      aggvar agg = gensym_aggregate ();
 
       vector<tmpvar> idx;
       load_map_indices (e, idx);
       tmpvar res = gensym (e->type);
 
-      aggvar agg = gensym_aggregate ();
-
       // These should have faulted during elaboration if not true.
-      assert(idx.size() == 1);
-      assert(idx[0].type() == pe_long);
+      if (idx.size() != 1 || idx[0].type() != pe_long)
+	throw SEMANTIC_ERROR(_("Invalid indexing of histogram"), e->tok);
 
       var *v = load_aggregate(hist->stat, agg);
       v->assert_hist_compatible(*hist);
@@ -4698,38 +5321,6 @@ c_unparser::visit_arrayindex (arrayindex* e)
 
 
 void
-c_tmpcounter_assignment::visit_arrayindex (arrayindex *e)
-{
-  symbol *array;
-  hist_op *hist;
-  classify_indexable (e->base, array, hist);
-
-  if (array)
-    {
-      parent->load_map_indices(e);
-
-      // The expression rval, lval, and result.
-      exp_type ty = rvalue ? rvalue->type : e->type;
-      tmpvar rval = parent->parent->gensym (ty);
-      tmpvar lval = parent->parent->gensym (ty);
-      tmpvar res = parent->parent->gensym (ty);
-
-      prepare_rvalue(rval);
-      lval.declare (*(parent->parent));
-
-      if (op == "<<<")
-	res.declare (*(parent->parent));
-      else
-	c_assignop(res);
-    }
-  else
-    {
-      throw SEMANTIC_ERROR(_("cannot assign to histogram buckets"), e->tok);
-    }
-}
-
-
-void
 c_unparser_assignment::visit_arrayindex (arrayindex *e)
 {
   symbol *array;
@@ -4745,11 +5336,6 @@ c_unparser_assignment::visit_arrayindex (arrayindex *e)
 
       if (array->referent->index_types.size() == 0)
 	throw SEMANTIC_ERROR (_("unexpected reference to scalar"), e->tok);
-
-      // nb: Do not adjust the order of the next few lines; the tmpvar
-      // allocation order must remain the same between
-      // c_unparser_assignment::visit_arrayindex and
-      // c_tmpcounter_assignment::visit_arrayindex
 
       vector<tmpvar> idx;
       parent->load_map_indices (e, idx);
@@ -4821,32 +5407,35 @@ c_unparser_assignment::visit_arrayindex (arrayindex *e)
 
 
 void
-c_tmpcounter::visit_functioncall (functioncall *e)
-{
-  assert (e->referent != 0);
-  functiondecl* r = e->referent;
-  // one temporary per argument, unless literal numbers or strings
-  for (unsigned i=0; i<r->formal_args.size(); i++)
-    {
-      tmpvar t = parent->gensym (r->formal_args[i]->type);
-      if (e->args[i]->tok->type != tok_number
-	  && e->args[i]->tok->type != tok_string)
-	t.declare (*parent);
-      e->args[i]->visit (this);
-    }
-}
-
-
-void
 c_unparser::visit_functioncall (functioncall* e)
 {
-  assert (e->referent != 0);
-  functiondecl* r = e->referent;
-
-  if (r->formal_args.size() != e->args.size())
-    throw SEMANTIC_ERROR (_("invalid length argument list"), e->tok);
+  assert (!e->referents.empty());
 
   stmt_expr block(*this);
+
+  vector<bool> cp_arg(e->referents.size(), true);
+  for (unsigned fd = 0; fd < e->referents.size(); fd++)
+    {
+      functiondecl* r = e->referents[fd];
+
+      if (r->formal_args.size() != e->args.size())
+        throw SEMANTIC_ERROR (_("invalid length argument list"), e->tok);
+
+      for (unsigned i = 0; i < e->args.size(); i++)
+        {
+          if (r->formal_args[i]->type != e->args[i]->type)
+            throw SEMANTIC_ERROR (_("function argument type mismatch"),
+                                  e->args[i]->tok, r->formal_args[i]->tok);
+        }
+
+      // all alternative functions must be compatible if passing by
+      // char pointer
+      for (unsigned i = 0; i < r->formal_args.size(); i++)
+        {
+          if (!r->formal_args[i]->char_ptr_arg)
+            cp_arg[i] = false;
+        }
+    }
 
   // NB: we store all actual arguments in temporary variables,
   // to avoid colliding sharing of context variables with
@@ -4854,66 +5443,135 @@ c_unparser::visit_functioncall (functioncall* e)
 
   // compute actual arguments
   vector<tmpvar> tmp;
-
   for (unsigned i=0; i<e->args.size(); i++)
     {
       tmpvar t = gensym(e->args[i]->type);
 
-      if (r->formal_args[i]->type != e->args[i]->type)
-	throw SEMANTIC_ERROR (_("function argument type mismatch"),
-			      e->args[i]->tok, r->formal_args[i]->tok);
-
-      if (e->args[i]->tok->type == tok_number
-	  || e->args[i]->tok->type == tok_string)
-	t.override(c_expression(e->args[i]));
+      symbol *sym_out;
+      if (cp_arg[i] && e->args[i]->is_symbol(sym_out)
+          && is_local(sym_out->referent, sym_out->tok))
+        t.override(getvar(sym_out->referent, sym_out->tok).value());
       else
-        {
-	  // o->newline() << "c->last_stmt = "
-          // << lex_cast_qstring(*e->args[i]->tok) << ";";
-	  c_assign (t.value(), e->args[i],
-		    _("function actual argument evaluation"));
-	}
+        c_assign (t, e->args[i],
+                  _("function actual argument evaluation"));
       tmp.push_back(t);
     }
 
-  // copy in actual arguments
-  for (unsigned i=0; i<e->args.size(); i++)
-    {
-      if (r->formal_args[i]->type != e->args[i]->type)
-	throw SEMANTIC_ERROR (_("function argument type mismatch"),
-			      e->args[i]->tok, r->formal_args[i]->tok);
+  // overloading execution logic for functioncall:
+  //
+  // - copy in computed function arguments for overload_0
+  // - make the functioncall for overload_0 and overwrite return variable
+  // - if context next flag is not set, goto fc_end
+  //                    *
+  //                    *
+  //                    *
+  // - copy in computed function arguments for overload_n
+  // - make the functioncall for overload_n and overwrite return variable
+  // fc_end:
+  // - yield return value
 
-      c_assign ("c->locals[c->nesting+1]." +
-		c_funcname (r->name) + "." +
-                c_localname (r->formal_args[i]->name),
-                tmp[i].value(),
-                e->args[i]->type,
-                "function actual argument copy",
-                e->args[i]->tok);
+  // store the return value after the function arguments have been worked out
+  // to avoid problems that may occure with nesting.
+  tmpvar tmp_ret = gensym (e->type);
+
+  // NB: as per PR13283, it's important we always allocate a distinct
+  // temporary value to receive the return value.  (We can pass its
+  // address by reference to the function if we like.)
+  
+  bool yield = false; // set if statement expression is non void
+
+  for (unsigned fd = 0; fd < e->referents.size(); fd++)
+    {
+      functiondecl* r = e->referents[fd];
+
+      // copy in actual arguments
+      for (unsigned i=0; i<e->args.size(); i++)
+        {
+          if (r->formal_args[i]->char_ptr_arg)
+            o->newline() << "c->locals[c->nesting+1]." + c_funcname (r->name) + "."
+                            + c_localname (r->formal_args[i]->name) << " = "
+                         << tmp[i].value() << ";";
+          else
+            c_assign ("c->locals[c->nesting+1]." +
+                      c_funcname (r->name) + "." +
+                      c_localname (r->formal_args[i]->name),
+                      tmp[i].value(),
+                      e->args[i]->type,
+                      "function actual argument copy",
+                      e->args[i]->tok);
+        }
+      // optimized string returns need a local storage pointer.
+      bool pointer_ret = (e->type == pe_string && !session->unoptimized);
+      if (pointer_ret)
+        {
+          if (e == assigned_functioncall)
+            tmp_ret.override (*assigned_functioncall_retval);
+          o->newline() << "c->locals[c->nesting+1]." << c_funcname(r->name)
+                       << ".__retvalue = &" << tmp_ret.value() << "[0];";
+        }
+
+      // call function
+      o->newline() << c_funcname (r->name) << " (c);";
+      o->newline() << "if (unlikely(c->last_error)) goto out;";
+
+      if (!already_checked_action_count && !session->suppress_time_limits
+          && !session->unoptimized)
+        {
+          max_action_info mai (*session);
+          r->body->visit(&mai);
+          // if an unoptimized function/probe called an optimized function, then
+          // increase the counter, since the subtraction isn't done within an
+          // optimized function
+          if(mai.statement_count_finite())
+            record_actions (mai.statement_count, e->tok, true);
+        }
+
+      if (r->type == pe_unknown || tmp_ret.is_overridden())
+        // If we passed typechecking with pe_unknown, or if we directly assigned
+        // the functioncall retval, then nothing will use this return value
+        yield = false;
+      else
+        {
+          if (!pointer_ret)
+            {
+              // overwrite the previous return value
+              string value = "c->locals[c->nesting+1]." + c_funcname(r->name) + ".__retvalue";
+              c_assign (tmp_ret.value(), value, e->type,
+                        _("function return result evaluation"), e->tok);
+            }
+          yield = true;
+        }
+
+      if (e->referents.size() > 1)
+        // branch to end of the enclosing statement-expression if one of the
+        // function alternatives is selected
+        o->newline() << "if (!c->next) goto fc_end_" << fc_counter << ";";
     }
 
-  // call function
-  o->newline() << c_funcname (r->name) << " (c);";
-  o->newline() << "if (unlikely(c->last_error)) goto out;";
+  if (e->referents.size() > 1)
+    {
+      // end label and increment counter
+      o->newline() << "fc_end_" << fc_counter++ << ":";
+    }
 
-  // return result from retvalue slot
-  if (r->type == pe_unknown)
-    // If we passed typechecking, then nothing will use this return value
-    o->newline() << "(void) 0;";
+  // check for aborted return from function; this could happen from non-overloaded ones too
+  o->newline() << "if (unlikely(c->next)) { c->last_error = \"all functions exhausted\"; goto out; }";
+
+  // return result from retvalue slot NB: this must be last, for the
+  // enclosing statement-expression ({ ... }) to carry this value.
+  if (yield)
+    o->newline() << tmp_ret.value() << ";";
   else
-    o->newline() << "c->locals[c->nesting+1]"
-                 << "." << c_funcname (r->name)
-                 << ".__retvalue;";
+    o->newline() << "(void) 0;";
 }
 
 
-static int
+// returns true if it should print directly to a stream
+static bool
 preprocess_print_format(print_format* e, vector<tmpvar>& tmp,
                         vector<print_format::format_component>& components,
                         string& format_string)
 {
-  int use_print = 0;
-
   if (e->print_with_format)
     {
       format_string = e->raw_components;
@@ -4925,8 +5583,8 @@ preprocess_print_format(print_format* e, vector<tmpvar>& tmp,
       if (e->print_with_delim)
 	{
 	  stringstream escaped_delim;
-	  const string& dstr = e->delimiter.literal_string;
-	  for (string::const_iterator i = dstr.begin();
+	  interned_string dstr = e->delimiter;
+	  for (interned_string::const_iterator i = dstr.begin();
 	       i != dstr.end(); ++i)
 	    {
 	      if (*i == '%')
@@ -4967,72 +5625,26 @@ preprocess_print_format(print_format* e, vector<tmpvar>& tmp,
     }
 
 
-  if ((tmp.size() == 0 && format_string.find("%%") == string::npos)
-      || (tmp.size() == 1 && format_string == "%s"))
-    use_print = 1;
-  else if (tmp.size() == 1
-	   && e->args[0]->tok->type == tok_string
-	   && format_string == "%s\\n")
+  // optimize simple string prints
+  if (e->print_to_stream && tmp.size() <= 1
+      && format_string.find("%%") == string::npos)
     {
-      use_print = 1;
-      tmp[0].override(tmp[0].value() + "\"\\n\"");
-    }
+      // just a plain format string itself, or
+      // simply formatting a string verbatim.
+      if (tmp.empty() || format_string == "%s")
+	return true;
 
-  return use_print;
-}
-
-void
-c_tmpcounter::visit_print_format (print_format* e)
-{
-  if (e->hist)
-    {
-      aggvar agg = parent->gensym_aggregate ();
-      agg.declare(*(this->parent));
-      load_aggregate (e->hist->stat);
-
-      // And the result for sprint[ln](@hist_*)
-      if (!e->print_to_stream)
-        {
-          exp_type ty = pe_string;
-          tmpvar res = parent->gensym(ty);
-          res.declare(*parent);
-        }
-    }
-  else
-    {
-      // One temporary per argument
-      vector<tmpvar> tmp;
-      for (unsigned i=0; i < e->args.size(); i++)
+      // just a string without formatting plus newline, and it's been
+      // overridden with a literal, then we can token-paste the newline.
+      // TODO could allow any prefix and suffix around "%s", C-escaped.
+      if (tmp[0].is_overridden() && format_string == "%s\\n")
 	{
-	  tmpvar t = parent->gensym (e->args[i]->type);
-	  tmp.push_back(t);
-	  if (e->args[i]->type == pe_unknown)
-	    {
-	      throw SEMANTIC_ERROR(_("unknown type of arg to print operator"),
-				   e->args[i]->tok);
-	    }
-
-	  if (e->args[i]->tok->type != tok_number
-	      && e->args[i]->tok->type != tok_string)
-	    t.declare (*parent);
-	  e->args[i]->visit (this);
+	  tmp[0].override(tmp[0].value() + "\"\\n\"");
+	  return true;
 	}
-
-      // And the result
-      exp_type ty = e->print_to_stream ? pe_long : pe_string;
-      tmpvar res = parent->gensym (ty);
-      if (ty == pe_string)
-	res.declare (*parent);
-
-      // Munge so we can find our compiled printf
-      vector<print_format::format_component> components;
-      string format_string;
-      int use_print = preprocess_print_format(e, tmp, components, format_string);
-
-      // If not in a shortcut case, declare the compiled printf
-      if (!(e->print_to_stream && (e->print_char || use_print)))
-	parent->declare_compiled_printf(e->print_to_stream, format_string);
     }
+
+  return false;
 }
 
 
@@ -5092,21 +5704,9 @@ c_unparser::visit_print_format (print_format* e)
       for (unsigned i=0; i<e->args.size(); i++)
 	{
 	  tmpvar t = gensym(e->args[i]->type);
+	  c_assign (t, e->args[i],
+		    "print format actual argument evaluation");
 	  tmp.push_back(t);
-
-	  // o->newline() << "c->last_stmt = "
-          //	       << lex_cast_qstring(*e->args[i]->tok) << ";";
-
-	  // If we've got a numeric or string constant, instead of
-	  // assigning the numeric or string constant to a temporary,
-	  // then passing the temporary to _stp_printf/_stp_snprintf,
-	  // let's just override the temporary with the constant.
-	  if (e->args[i]->tok->type == tok_number
-	      || e->args[i]->tok->type == tok_string)
-	    tmp[i].override(c_expression(e->args[i]));
-	  else
-	    c_assign (t.value(), e->args[i],
-		      "print format actual argument evaluation");
 	}
 
       // Allocate the result
@@ -5116,7 +5716,7 @@ c_unparser::visit_print_format (print_format* e)
       // Munge so we can find our compiled printf
       vector<print_format::format_component> components;
       string format_string, format_string_out;
-      int use_print = preprocess_print_format(e, tmp, components, format_string);
+      bool use_print = preprocess_print_format(e, tmp, components, format_string);
       format_string_out = print_format::components_to_string(components);
 
       // Make the [s]printf call...
@@ -5250,19 +5850,6 @@ c_unparser::visit_print_format (print_format* e)
     }
 }
 
-
-void
-c_tmpcounter::visit_stat_op (stat_op* e)
-{
-  aggvar agg = parent->gensym_aggregate ();
-  tmpvar res = parent->gensym (pe_long);
-
-  agg.declare(*(this->parent));
-  res.declare(*(this->parent));
-
-  load_aggregate (e->stat);
-}
-
 void
 c_unparser::visit_stat_op (stat_op* e)
 {
@@ -5389,6 +5976,8 @@ struct unwindsym_dump_context
   size_t eh_frame_hdr_len;
   Dwarf_Addr eh_addr;
   Dwarf_Addr eh_frame_hdr_addr;
+  void *debug_line;
+  size_t debug_line_len;
 
   set<string> undone_unwindsym_modules;
 };
@@ -5459,7 +6048,7 @@ static void create_debug_frame_hdr (const unsigned char e_ident[],
       it = fdes.begin();
       Dwarf_Addr first_addr = (*it).first;
       int res = dwfl_module_relocate_address (mod, &first_addr);
-      dwfl_assert ("create_debug_frame_hdr, dwfl_module_relocate_address",
+      DWFL_ASSERT ("create_debug_frame_hdr, dwfl_module_relocate_address",
 		   res >= 0);
       *debug_frame_off = (*it).first - first_addr;
     }
@@ -5592,7 +6181,7 @@ static void get_unwind_data (Dwfl_Module *m,
 static int
 dump_build_id (Dwfl_Module *m,
 	       unwindsym_dump_context *c,
-	       const char *name, Dwarf_Addr base)
+	       const char *name, Dwarf_Addr)
 {
   string modname = name;
 
@@ -5612,7 +6201,7 @@ dump_build_id (Dwfl_Module *m,
         int i;
 
         i = dwfl_module_relocate_address (m, &reloc_vaddr);
-        dwfl_assert ("dwfl_module_relocate_address reloc_vaddr", i >= 0);
+        DWFL_ASSERT ("dwfl_module_relocate_address reloc_vaddr", i >= 0);
 
         secname = dwfl_module_relocation_info (m, i, NULL);
 
@@ -5649,7 +6238,7 @@ dump_build_id (Dwfl_Module *m,
 static int
 dump_section_list (Dwfl_Module *m,
                    unwindsym_dump_context *c,
-                   const char *name, Dwarf_Addr base)
+                   const char *name, Dwarf_Addr)
 {
   // Depending on ELF section names normally means you are doing it WRONG.
   // Sadly it seems we do need it for the kernel modules. Which are ET_REL
@@ -5670,7 +6259,7 @@ dump_section_list (Dwfl_Module *m,
 
   // Look up the relocation basis for symbols
   int n = dwfl_module_relocations (m);
-  dwfl_assert ("dwfl_module_relocations", n >= 0);
+  DWFL_ASSERT ("dwfl_module_relocations", n >= 0);
 
  if (n == 0)
     {
@@ -5722,6 +6311,186 @@ dump_section_list (Dwfl_Module *m,
   return DWARF_CB_ABORT;
 }
 
+static void find_debug_frame_offset (Dwfl_Module *m,
+                                     unwindsym_dump_context *c)
+{
+  Dwarf_Addr start, bias = 0;
+  GElf_Ehdr *ehdr, ehdr_mem;
+  GElf_Shdr *shdr, shdr_mem;
+  Elf_Scn *scn = NULL;
+  Elf_Data *data = NULL;
+  Elf *elf;
+
+  dwfl_module_info (m, NULL, &start, NULL, NULL, NULL, NULL, NULL);
+
+  // fetch .debug_frame info preferably from dwarf debuginfo file.
+  elf = (dwarf_getelf (dwfl_module_getdwarf (m, &bias))
+	 ?: dwfl_module_getelf (m, &bias));
+  ehdr = gelf_getehdr(elf, &ehdr_mem);
+
+  while ((scn = elf_nextscn(elf, scn)))
+    {
+      shdr = gelf_getshdr(scn, &shdr_mem);
+      if (strcmp(elf_strptr(elf, ehdr->e_shstrndx, shdr->sh_name),
+		 ".debug_frame") == 0)
+	{
+	  data = elf_rawdata(scn, NULL);
+	  break;
+	}
+    }
+
+  if (!data) // need this check since dwarf_next_cfi() doesn't do it
+    return;
+
+  // In the .debug_frame the FDE encoding is always DW_EH_PE_absptr.
+  // So there is no need to read the CIEs.  And the size is either 4
+  // or 8, depending on the elf class from e_ident.
+  int size = (ehdr->e_ident[EI_CLASS] == ELFCLASS32) ? 4 : 8;
+  int res = 0;
+  Dwarf_Off off = 0;
+  Dwarf_CFI_Entry entry;
+
+  while (res != 1)
+    {
+      Dwarf_Off next_off;
+      res = dwarf_next_cfi (ehdr->e_ident, data, false, off, &next_off, &entry);
+      if (res == 0)
+	{
+	  if (entry.CIE_id != DW_CIE_ID_64) // ignore CIEs
+	    {
+	      Dwarf_Addr addr;
+	      if (size == 4)
+		addr = (*((uint32_t *) entry.fde.start));
+	      else
+		addr = (*((uint64_t *) entry.fde.start));
+              Dwarf_Addr first_addr = addr;
+              int res = dwfl_module_relocate_address (m, &first_addr);
+              DWFL_ASSERT ("find_debug_frame_offset, dwfl_module_relocate_address",
+                           res >= 0);
+              c->debug_frame_off = addr - first_addr;
+	    }
+	}
+      else if (res < 1)
+        return;
+      off = next_off;
+    }
+}
+
+static int
+dump_line_tables_check (void *data, size_t data_len)
+{
+  uint64_t unit_length = 0,  header_length = 0;
+  uint16_t version = 0;
+  uint8_t *ptr = (uint8_t *)data, *endunitptr, opcode_base = 0;
+  unsigned length = 4;
+
+  while (ptr < ((uint8_t *)data + data_len))
+   {
+      if (ptr + 4 > (uint8_t *)data + data_len)
+        return DWARF_CB_ABORT;
+
+      unit_length = *((uint32_t *) ptr);
+      ptr += 4;
+      if (unit_length == 0xffffffff)
+        {
+          if (ptr + 8 > (uint8_t *)data + data_len)
+            return DWARF_CB_ABORT;
+          length = 8;
+          unit_length = *((uint64_t *) ptr);
+          ptr += 8;
+        }
+
+      if ((ptr + unit_length > (uint8_t *)data + data_len) || unit_length <= 2)
+        return DWARF_CB_ABORT;
+
+      endunitptr = ptr + unit_length;
+
+      version  = *((uint16_t *)ptr);
+      ptr += 2;
+
+      if (unit_length <= (2 + length))
+        return DWARF_CB_ABORT;
+
+      if (length == 4)
+        {
+          header_length = *((uint32_t *) ptr);
+          ptr += 4;
+        }
+      else
+        {
+          header_length = *((uint64_t *) ptr);
+          ptr += 8;
+        }
+
+      // safety check for the next few jumps
+      if (header_length <= ((version >= 4 ? 5 : 4) + 2)
+          || (unit_length - (2 + length) < header_length))
+        return DWARF_CB_ABORT;
+
+      // skip past min instr length, max ops per instr, and line base
+      if (version >= 4)
+        ptr += 3;
+      else
+        ptr += 2;
+
+      // check that the line range is not 0
+      if (*ptr == 0)
+        return DWARF_CB_ABORT;
+      ptr++;
+
+      // check that the header accomodates the std opcode lens section
+      opcode_base = *((uint8_t *) ptr);
+      if (header_length <= (uint64_t) (opcode_base + (version >= 4 ? 7 : 6)))
+        return DWARF_CB_ABORT;
+
+      // the initial checks stop here, before the directory table
+      ptr = endunitptr;
+    }
+  return DWARF_CB_OK;
+}
+
+static void
+dump_line_tables (Dwfl_Module *m, unwindsym_dump_context *c,
+                  const char *, Dwarf_Addr)
+{
+  Elf* elf;
+  Elf_Scn* scn = NULL;
+  Elf_Data* data;
+  GElf_Ehdr *ehdr, ehdr_mem;
+  GElf_Shdr* shdr, shdr_mem;
+  Dwarf_Addr bias, start;
+
+  dwfl_module_info (m, NULL, &start, NULL, NULL, NULL, NULL, NULL);
+
+  elf = dwfl_module_getelf (m, &bias);
+  if (elf == NULL)
+    return;
+
+  // we do not have the index for debug_line, so we can't use elf_getscn()
+  // instead, we need to seach through the sections for the correct one as in
+  // get_unwind_data()
+  ehdr = gelf_getehdr(elf, &ehdr_mem);
+  while ((scn = elf_nextscn(elf, scn)))
+    {
+      shdr = gelf_getshdr(scn, &shdr_mem);
+      if (strcmp(elf_strptr(elf, ehdr->e_shstrndx, shdr->sh_name),
+                 ".debug_line") == 0)
+        {
+          data = elf_rawdata(scn, NULL);
+          if (dump_line_tables_check(data->d_buf, data->d_size) == DWARF_CB_ABORT)
+            return;
+          c->debug_line = data->d_buf;
+          c->debug_line_len = data->d_size;
+          break;
+        }
+    }
+
+  // still need to get some kind of information about the sec_load_offset for
+  // kernel addresses if there is no unwind data
+  if (c->debug_line_len > 0 && !c->session.need_unwind)
+    find_debug_frame_offset (m, c);
+}
+
 /* Some architectures create special local symbols that are not
    interesting. */
 static int
@@ -5748,11 +6517,11 @@ dump_symbol_tables (Dwfl_Module *m,
   dwfl_module_info (m, NULL, NULL, &end, NULL, NULL, NULL, NULL);
 
   int syments = dwfl_module_getsymtab(m);
-  dwfl_assert (_F("Getting symbol table for %s", modname), syments >= 0);
+  DWFL_ASSERT (_F("Getting symbol table for %s", modname), syments >= 0);
 
   // Look up the relocation basis for symbols
   int n = dwfl_module_relocations (m);
-  dwfl_assert ("dwfl_module_relocations", n >= 0);
+  DWFL_ASSERT ("dwfl_module_relocations", n >= 0);
 
   /* Needed on ppc64, for function descriptors. */
   Dwarf_Addr elf_bias;
@@ -5799,7 +6568,7 @@ dump_symbol_tables (Dwfl_Module *m,
 		  int ki;
 		  extra_offset = sym_addr;
 		  ki = dwfl_module_relocate_address (m, &extra_offset);
-		  dwfl_assert ("dwfl_module_relocate_address extra_offset",
+		  DWFL_ASSERT ("dwfl_module_relocate_address extra_offset",
 			       ki >= 0);
 
 		  if (c->session.verbose > 2)
@@ -5819,7 +6588,7 @@ dump_symbol_tables (Dwfl_Module *m,
                   kretprobe_trampoline_addr = sym_addr;
                   ki = dwfl_module_relocate_address(m,
 						    &kretprobe_trampoline_addr);
-                  dwfl_assert ("dwfl_module_relocate_address, kretprobe_trampoline_addr", ki >= 0);
+                  DWFL_ASSERT ("dwfl_module_relocate_address, kretprobe_trampoline_addr", ki >= 0);
 
 		  if (! c->session.need_symbols
 		      && extra_offset != 0)
@@ -5861,7 +6630,7 @@ dump_symbol_tables (Dwfl_Module *m,
 		  func_desc_addr = sym_addr;
 
 		  opd = dwfl_module_address_section (m, &sym_addr, &opd_bias);
-		  dwfl_assert ("dwfl_module_address_section opd", opd != NULL);
+		  DWFL_ASSERT ("dwfl_module_address_section opd", opd != NULL);
 
 		  Elf_Data *opd_data = elf_rawdata (opd, NULL);
 		  assert(opd_data != NULL);
@@ -5882,7 +6651,7 @@ dump_symbol_tables (Dwfl_Module *m,
               if (n > 0) // only try to relocate if there exist relocation bases
                 {
                   int ki = dwfl_module_relocate_address (m, &sym_addr);
-                  dwfl_assert ("dwfl_module_relocate_address sym_addr", ki >= 0);
+                  DWFL_ASSERT ("dwfl_module_relocate_address sym_addr", ki >= 0);
                   secname = dwfl_module_relocation_info (m, ki, NULL);
 
 		  if (func_desc_addr != 0)
@@ -5965,7 +6734,7 @@ dump_symbol_tables (Dwfl_Module *m,
 static int
 dump_unwind_tables (Dwfl_Module *m,
 		    unwindsym_dump_context *c,
-		    const char *name, Dwarf_Addr base)
+		    const char *, Dwarf_Addr)
 {
   // Add unwind data to be included if it exists for this module.
   get_unwind_data (m, &c->debug_frame, &c->eh_frame,
@@ -6001,7 +6770,11 @@ dump_unwindsym_cxt_table(systemtap_session& session, ostream& output,
       return;
     }
 
-  output << "#if defined(STP_USE_DWARF_UNWINDER) && defined(STP_NEED_UNWIND_DATA)\n";
+  // if it is the debug_line data, do not need the unwind flags to be defined
+  if(table == "debug_line")
+    output << "#if defined(STP_NEED_LINE_DATA)\n";
+  else
+    output << "#if defined(STP_USE_DWARF_UNWINDER) && defined(STP_NEED_UNWIND_DATA)\n";
   output << "static uint8_t _stp_module_" << modindex << "_" << table;
   if (!secname.empty())
     output << "_" << secindex;
@@ -6015,7 +6788,10 @@ dump_unwindsym_cxt_table(systemtap_session& session, ostream& output,
 	output << "\n" << "   ";
     }
   output << "};\n";
-  output << "#endif /* STP_USE_DWARF_UNWINDER && STP_NEED_UNWIND_DATA */\n";
+  if (table == "debug_line")
+    output << "#endif /* STP_NEED_LINE_DATA */\n";
+  else
+    output << "#endif /* STP_USE_DWARF_UNWINDER && STP_NEED_UNWIND_DATA */\n";
 }
 
 static int
@@ -6036,6 +6812,8 @@ dump_unwindsym_cxt (Dwfl_Module *m,
   size_t eh_frame_hdr_len = c->eh_frame_hdr_len;
   Dwarf_Addr eh_addr = c->eh_addr;
   Dwarf_Addr eh_frame_hdr_addr = c->eh_frame_hdr_addr;
+  void *debug_line = c->debug_line;
+  size_t debug_line_len = c->debug_line_len;
 
   dump_unwindsym_cxt_table(c->session, c->output, modname, stpmod_idx, "", 0,
 			   "debug_frame", debug_frame, debug_len);
@@ -6046,6 +6824,9 @@ dump_unwindsym_cxt (Dwfl_Module *m,
   dump_unwindsym_cxt_table(c->session, c->output, modname, stpmod_idx, "", 0,
 			   "eh_frame_hdr", eh_frame_hdr, eh_frame_hdr_len);
 
+  dump_unwindsym_cxt_table(c->session, c->output, modname, stpmod_idx, "", 0,
+			   "debug_line", debug_line, debug_line_len);
+
   if (c->session.need_unwind && debug_frame == NULL && eh_frame == NULL)
     {
       // There would be only a small benefit to warning.  A user
@@ -6055,6 +6836,13 @@ dump_unwindsym_cxt (Dwfl_Module *m,
       if (c->session.verbose > 2)
 	c->session.print_warning ("No unwind data for " + modname
 				  + ", " + dwfl_errmsg (-1));
+    }
+
+  if (c->session.need_lines && debug_line == NULL)
+    {
+      if (c->session.verbose > 2)
+        c->session.print_warning ("No debug line data for " + modname + ", " +
+                                  dwfl_errmsg (-1));
     }
 
   for (unsigned secidx = 0; secidx < c->seclist.size(); secidx++)
@@ -6140,7 +6928,18 @@ dump_unwindsym_cxt (Dwfl_Module *m,
 	{
 	  c->output << ".debug_hdr = NULL,\n";
 	  c->output << ".debug_hdr_len = 0,\n";
+          if (c->session.need_lines && secname == ".text")
+            {
+              c->output << "#if defined(STP_NEED_LINE_DATA)\n";
+              Dwarf_Addr dwbias = 0;
+              dwfl_module_getdwarf (m, &dwbias);
+              c->output << ".sec_load_offset = 0x"
+                        << hex << debug_frame_off - dwbias << dec << "\n";
+              c->output << "#else\n";
+            }
 	  c->output << ".sec_load_offset = 0\n";
+          if (c->session.need_lines && secname == ".text")
+            c->output << "#endif /* STP_NEED_LINE_DATA */\n";
 	}
 
 	c->output << "},\n";
@@ -6153,17 +6952,26 @@ dump_unwindsym_cxt (Dwfl_Module *m,
   const char *mainfile;
   dwfl_module_info (m, NULL, NULL, NULL, NULL, NULL, &mainfile, NULL);
 
-  // For user space modules store canonical path and base name.
+  // For user space modules store canonical path.
   // For kernel modules just the name itself.
   string mainpath = resolve_path(mainfile);
-  const char *mainname = mainpath.c_str() + mainpath.rfind('/');
-  if (modname[0] == '/')
-    mainname++;
+  string mainname;
+  if (is_user_module(modname)) // userspace
+    mainname = lex_cast_qstring (path_remove_sysroot(c->session,mainpath));
   else
-    mainname = modname.c_str();
+    { // kernel module
+
+      // If the module name is the full path to the ko, then we have to retrieve
+      // the actual name by which the module will be known inside the kernel.
+      // Otherwise, section relocations would be mismatched.
+      if (is_fully_resolved(modname, c->session.sysroot, c->session.sysenv))
+        mainname = lex_cast_qstring (modname_from_path(modname));
+      else
+        mainname = lex_cast_qstring (modname);
+    }
 
   c->output << "static struct _stp_module _stp_module_" << stpmod_idx << " = {\n";
-  c->output << ".name = " << lex_cast_qstring (mainname) << ", \n";
+  c->output << ".name = " << mainname.c_str() << ",\n";
   c->output << ".path = " << lex_cast_qstring (path_remove_sysroot(c->session,mainpath)) << ",\n";
   c->output << ".eh_frame_addr = 0x" << hex << eh_addr << dec << ", \n";
   c->output << ".unwind_hdr_addr = 0x" << hex << eh_frame_hdr_addr
@@ -6210,6 +7018,22 @@ dump_unwindsym_cxt (Dwfl_Module *m,
   c->output << ".unwind_hdr_len = 0,\n";
   if (eh_frame != NULL)
     c->output << "#endif /* STP_USE_DWARF_UNWINDER && STP_NEED_UNWIND_DATA*/\n";
+
+  if (debug_line != NULL)
+    {
+      c->output << "#if defined(STP_NEED_LINE_DATA)\n";
+      c->output << ".debug_line = "
+		<< "_stp_module_" << stpmod_idx << "_debug_line, \n";
+      c->output << ".debug_line_len = " << debug_line_len << ", \n";
+      c->output << "#else\n";
+    }
+
+  c->output << ".debug_line = NULL,\n";
+  c->output << ".debug_line_len = 0,\n";
+
+  if (debug_line != NULL)
+    c->output << "#endif /* STP_NEED_LINE_DATA */\n";
+
   c->output << ".sections = _stp_module_" << stpmod_idx << "_sections" << ",\n";
   c->output << ".num_sections = sizeof(_stp_module_" << stpmod_idx << "_sections)/"
             << "sizeof(struct _stp_section),\n";
@@ -6260,6 +7084,67 @@ dump_unwindsym_cxt (Dwfl_Module *m,
   if (debug_frame_hdr) free (debug_frame_hdr);
 
   return DWARF_CB_OK;
+}
+
+static void dump_kallsyms(unwindsym_dump_context *c)
+{
+  ifstream kallsyms("/proc/kallsyms");
+  unsigned stpmod_idx = c->stp_module_index;
+  string line;
+  unsigned size = 0;
+  Dwarf_Addr start = 0;
+  Dwarf_Addr end = 0;
+  Dwarf_Addr prev = 0;
+
+  c->output << "static struct _stp_symbol "
+            << "_stp_module_" << stpmod_idx << "_symbols_" << 0 << "[] = {\n";
+
+  while (getline(kallsyms, line))
+    {
+      Dwarf_Addr addr;
+      string name;
+      string module;
+      char type;
+      istringstream iss(line);
+
+      iss >> hex >> addr >> type >> name >> module;
+
+      if (name == KERNEL_RELOC_SYMBOL)
+        start = addr;
+      else if (name == "_end" || module != "")
+        {
+          end = prev;
+          break;
+        }
+
+      if (!start || addr == 0 || prev == addr)
+        continue;
+
+      c->output << "  { 0x" << hex << addr - start << dec
+			<< ", " << lex_cast_qstring(name) << " },\n";
+
+      size++;
+      prev = addr;
+    }
+
+  c->output << "};\n";
+  c->output << "static struct _stp_section _stp_module_" << stpmod_idx << "_sections[] = {\n";
+  c->output << "{\n"
+            << ".name = " << lex_cast_qstring(KERNEL_RELOC_SYMBOL) << ",\n"
+            << ".size = 0x" << hex << end - start << dec << ",\n"
+            << ".symbols = _stp_module_" << stpmod_idx << "_symbols_" << 0 << ",\n"
+            << ".num_symbols = " << size << ",\n";
+  c->output << "},\n";
+  c->output << "};\n";
+  c->output << "static struct _stp_module _stp_module_" << stpmod_idx << " = {\n";
+  c->output << ".name = " << lex_cast_qstring("kernel") << ",\n";
+  c->output << ".sections = _stp_module_" << stpmod_idx << "_sections" << ",\n";
+  c->output << ".num_sections = sizeof(_stp_module_" << stpmod_idx << "_sections)/"
+            << "sizeof(struct _stp_section),\n";
+  c->output << "};\n\n";
+
+  c->undone_unwindsym_modules.erase("kernel");
+  c->stp_module_index++;
 }
 
 static int
@@ -6326,6 +7211,13 @@ dump_unwindsyms (Dwfl_Module *m,
   if (res == DWARF_CB_OK && c->session.need_unwind)
     res = dump_unwind_tables (m, c, name, base);
 
+  c->debug_line = NULL;
+  c->debug_line_len = 0;
+  if (res == DWARF_CB_OK && c->session.need_lines)
+    // we dont set res = dump_line_tables() because unwindsym stuff should still
+    // get dumped to the output even if gathering debug_line data fails
+    (void) dump_line_tables (m, c, name, base);
+
   /* And finally dump everything collected in the output. */
   if (res == DWARF_CB_OK)
     res = dump_unwindsym_cxt (m, c, name, base);
@@ -6343,9 +7235,8 @@ void emit_symbol_data_done (unwindsym_dump_context*, systemtap_session&);
 
 
 void
-add_unwindsym_iol_callback (void *q, const char *data)
+add_unwindsym_iol_callback (set<string> *added, const char *data)
 {
-  std::set<std::string> *added = (std::set<std::string>*)q;
   added->insert (string (data));
 }
 
@@ -6355,9 +7246,9 @@ query_module (Dwfl_Module *mod,
               void **,
               const char *,
               Dwarf_Addr,
-              void *arg)
+              struct dwflpp *dwflpp)
 {
-  ((struct dwflpp*)arg)->focus_on_module(mod, NULL);
+  dwflpp->focus_on_module(mod, NULL);
   return DWARF_CB_OK;
 }
 
@@ -6375,14 +7266,13 @@ add_unwindsym_ldd (systemtap_session &s)
       assert (modname.length() != 0);
       if (! is_user_module (modname)) continue;
 
-      struct dwflpp *mod_dwflpp = new dwflpp(s, modname, false);
-      mod_dwflpp->iterate_over_modules (&query_module, mod_dwflpp);
-      if (mod_dwflpp->module) // existing binary
+      dwflpp mod_dwflpp (s, modname, false);
+      mod_dwflpp.iterate_over_modules(&query_module, &mod_dwflpp);
+      if (mod_dwflpp.module) // existing binary
         {
-          assert (mod_dwflpp->module_name != "");
-          mod_dwflpp->iterate_over_libraries (&add_unwindsym_iol_callback, &added);
+          assert (mod_dwflpp.module_name != "");
+          mod_dwflpp.iterate_over_libraries (&add_unwindsym_iol_callback, &added);
         }
-      delete mod_dwflpp;
     }
 
   s.unwindsym_modules.insert (added.begin(), added.end());
@@ -6392,11 +7282,18 @@ static int find_vdso(const char *path, const struct stat *, int type)
 {
   if (type == FTW_F)
     {
+      /* Assume that if the path's basename starts with 'vdso' and
+       * ends with '.so', it is the vdso.
+       *
+       * Note that this logic should match up with the logic in the
+       * _stp_vma_match_vdso() function in runtime/vma.c. */
       const char *name = strrchr(path, '/');
       if (name)
 	{
+	  const char *ext;
+
 	  name++;
-	  const char *ext = strrchr(name, '.');
+	  ext = strrchr(name, '.');
 	  if (ext
 	      && strncmp("vdso", name, 4) == 0
 	      && strcmp(".so", ext) == 0)
@@ -6476,6 +7373,8 @@ emit_symbol_data (systemtap_session& s)
 				 0, /* eh_frame_hdr_len */
 				 0, /* eh_addr */
 				 0, /* eh_frame_hdr_addr */
+				 NULL, /* debug_line */
+				 0, /* debug_line_len */
 				 s.unwindsym_modules };
 
   // Micro optimization, mainly to speed up tiny regression tests
@@ -6499,11 +7398,10 @@ emit_symbol_data (systemtap_session& s)
 				     offline searches. */
         offline_search_modules.insert (foo);
     }
-  DwflPtr dwfl_ptr = setup_dwfl_kernel (offline_search_modules, &count, s);
-  Dwfl *dwfl = dwfl_ptr.get()->dwfl;
+  Dwfl *dwfl = setup_dwfl_kernel (offline_search_modules, &count, s);
   /* NB: It's not an error to find a few fewer modules than requested.
      There might be third-party modules loaded (e.g. uprobes). */
-  /* dwfl_assert("all kernel modules found",
+  /* DWFL_ASSERT("all kernel modules found",
      count >= offline_search_modules.size()); */
 
   ptrdiff_t off = 0;
@@ -6514,8 +7412,8 @@ emit_symbol_data (systemtap_session& s)
       off = dwfl_getmodules (dwfl, &dump_unwindsyms, (void *) &ctx, off);
     }
   while (off > 0);
-  dwfl_assert("dwfl_getmodules", off == 0);
-  dwfl_ptr.reset();
+  DWFL_ASSERT("dwfl_getmodules", off == 0);
+  dwfl_end(dwfl);
 
   // ---- step 2: process any user modules (files) listed
   for (std::set<std::string>::iterator it = s.unwindsym_modules.begin();
@@ -6525,8 +7423,7 @@ emit_symbol_data (systemtap_session& s)
       string modname = *it;
       assert (modname.length() != 0);
       if (! is_user_module (modname)) continue;
-      DwflPtr dwfl_ptr = setup_dwfl_user (modname);
-      Dwfl *dwfl = dwfl_ptr.get()->dwfl;
+      Dwfl *dwfl = setup_dwfl_user (modname);
       if (dwfl != NULL) // tolerate missing data; will warn below
         {
           ptrdiff_t off = 0;
@@ -6537,26 +7434,69 @@ emit_symbol_data (systemtap_session& s)
               off = dwfl_getmodules (dwfl, &dump_unwindsyms, (void *) &ctx, off);
             }
           while (off > 0);
-          dwfl_assert("dwfl_getmodules", off == 0);
+          DWFL_ASSERT("dwfl_getmodules", off == 0);
         }
-      dwfl_ptr.reset();
+      dwfl_end(dwfl);
     }
+
+  // Use /proc/kallsyms if debuginfo not found.
+  if (ctx.undone_unwindsym_modules.find("kernel") != ctx.undone_unwindsym_modules.end())
+    dump_kallsyms(&ctx);
 
   emit_symbol_data_done (&ctx, s);
 }
 
 void
+self_unwind_declarations(unwindsym_dump_context *ctx)
+{
+  ctx->output << "static uint8_t _stp_module_self_eh_frame [] = {0,};\n";
+  ctx->output << "static struct _stp_symbol _stp_module_self_symbols_0[] = {{0},};\n";
+  ctx->output << "static struct _stp_symbol _stp_module_self_symbols_1[] = {{0},};\n";
+  ctx->output << "static struct _stp_section _stp_module_self_sections[] = {\n";
+  ctx->output << "{.name = \".symtab\", .symbols = _stp_module_self_symbols_0, .num_symbols = 0},\n";
+  ctx->output << "{.name = \".text\", .symbols = _stp_module_self_symbols_1, .num_symbols = 0},\n";
+  ctx->output << "};\n";
+  ctx->output << "static struct _stp_module _stp_module_self = {\n";
+  ctx->output << ".name = \"stap_self_tmp_value\",\n";
+  ctx->output << ".path = \"stap_self_tmp_value\",\n";
+  ctx->output << ".num_sections = 2,\n";
+  ctx->output << ".sections = _stp_module_self_sections,\n";
+  ctx->output << ".eh_frame = _stp_module_self_eh_frame,\n";
+  ctx->output << ".eh_frame_len = 0,\n";
+  ctx->output << ".unwind_hdr_addr = 0x0,\n";
+  ctx->output << ".unwind_hdr = NULL,\n";
+  ctx->output << ".unwind_hdr_len = 0,\n";
+  ctx->output << ".debug_frame = NULL,\n";
+  ctx->output << ".debug_frame_len = 0,\n";
+  ctx->output << ".debug_line = NULL,\n";
+  ctx->output << ".debug_line_len = 0,\n";
+  ctx->output << "};\n";
+}
+
+void
 emit_symbol_data_done (unwindsym_dump_context *ctx, systemtap_session& s)
 {
+  // Add a .eh_frame terminator dummy object file, much like
+  // libgcc/crtstuff.c's EH_FRAME_SECTION_NAME closer.  We need this in
+  // order for runtime/sym.c 
+  translator_output *T_800 = s.op_create_auxiliary(true);
+  T_800->newline() << "__extension__ unsigned int T_800 []"; // assumed 32-bits wide
+  T_800->newline(1) << "__attribute__((used, section(\".eh_frame\"), aligned(4)))";
+  T_800->newline() << "= { 0 };";
+  T_800->newline(-1);
+  T_800->assert_0_indent (); // flush to disk
+
   // Print out a definition of the runtime's _stp_modules[] globals.
   ctx->output << "\n";
-  ctx->output << "static struct _stp_module *_stp_modules [] = {\n";
+  self_unwind_declarations(ctx);
+   ctx->output << "static struct _stp_module *_stp_modules [] = {\n";
   for (unsigned i=0; i<ctx->stp_module_index; i++)
     {
       ctx->output << "& _stp_module_" << i << ",\n";
     }
+  ctx->output << "& _stp_module_self,\n";
   ctx->output << "};\n";
-  ctx->output << "static unsigned _stp_num_modules = " << ctx->stp_module_index << ";\n";
+  ctx->output << "static const unsigned _stp_num_modules = ARRAY_SIZE(_stp_modules);\n";
 
   ctx->output << "static unsigned long _stp_kretprobe_trampoline = ";
   // Special case for -1, which is invalid in hex if host width > target width.
@@ -6575,9 +7515,6 @@ emit_symbol_data_done (unwindsym_dump_context *ctx, systemtap_session& s)
 		       + (*it) + "'");
 }
 
-
-
-
 struct recursion_info: public traversing_visitor
 {
   recursion_info (systemtap_session& s): sess(s), nesting_max(0), recursive(false) {}
@@ -6589,30 +7526,35 @@ struct recursion_info: public traversing_visitor
   void visit_functioncall (functioncall* e) {
     traversing_visitor::visit_functioncall (e); // for arguments
 
-    // check for nesting level
-    unsigned nesting_depth = current_nesting.size() + 1;
-    if (nesting_max < nesting_depth)
+    for (unsigned fd = 0; fd < e->referents.size(); fd++)
       {
-        if (sess.verbose > 3)
-          clog << _F("identified max-nested function: %s (%d)",
-                     e->referent->name.c_str(), nesting_depth) << endl;
-        nesting_max = nesting_depth;
+        functiondecl* referent = e->referents[fd];
+        // check for nesting level
+        unsigned nesting_depth = current_nesting.size() + 1;
+        if (nesting_max < nesting_depth)
+          {
+            if (sess.verbose > 3)
+              clog << _F("identified max-nested function: %s (%d)",
+                         referent->name.to_string().c_str(), nesting_depth) << endl;
+            nesting_max = nesting_depth;
+          }
+
+        // check for (direct or mutual) recursion
+        for (unsigned j=0; j<current_nesting.size(); j++)
+          if (current_nesting[j] == referent)
+            {
+              recursive = true;
+              if (sess.verbose > 3)
+                clog << _F("identified recursive function: %s",
+                           referent->name.to_string().c_str()) << endl;
+              return;
+            }
+
+        // non-recursive traversal
+        current_nesting.push_back (referent);
+        referent->body->visit (this);
+        current_nesting.pop_back ();
       }
-
-    // check for (direct or mutual) recursion
-    for (unsigned j=0; j<current_nesting.size(); j++)
-      if (current_nesting[j] == e->referent)
-        {
-          recursive = true;
-          if (sess.verbose > 3)
-            clog << _F("identified recursive function: %s", e->referent->name.c_str()) << endl;
-          return;
-        }
-
-    // non-recursive traversal
-    current_nesting.push_back (e->referent);
-    e->referent->body->visit (this);
-    current_nesting.pop_back ();
   }
 };
 
@@ -6737,16 +7679,41 @@ translate_pass (systemtap_session& s)
       if (s.bulk_mode)
 	  s.op->newline() << "#define STP_BULKMODE";
 
-      if (s.timing)
+      if (s.timing || s.monitor)
 	s.op->newline() << "#define STP_TIMING";
 
       if (s.need_unwind)
 	s.op->newline() << "#define STP_NEED_UNWIND_DATA 1";
 
+      if (s.need_lines)
+        s.op->newline() << "#define STP_NEED_LINE_DATA 1";
+
       // Emit the total number of probes (not regarding merged probe handlers)
       s.op->newline() << "#define STP_PROBE_COUNT " << s.probes.size();
 
+      // Emit systemtap_module_refresh() prototype so we can reference it
+      s.op->newline() << "static void systemtap_module_refresh (const char* modname);";
+
+      // Be sure to include runtime.h before any real code.
       s.op->newline() << "#include \"runtime.h\"";
+
+      if (!s.runtime_usermode_p())
+        {
+          // When on-the-fly [dis]arming is used, module_refresh can be called from
+          // both the module notifier, as well as when probes need to be
+          // armed/disarmed. We need to protect it to ensure it's only run one at a
+          // time.
+          s.op->newline() << "#include <linux/mutex.h>";
+          s.op->newline() << "static DEFINE_MUTEX(module_refresh_mutex);";
+
+          // For some probes, on-the-fly support is provided through a
+          // background timer (module_refresh_timer). We need to disable that
+          // part if hrtimers are not supported.
+          s.op->newline() << "#include <linux/version.h>";
+          s.op->newline() << "#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,17)";
+          s.op->newline() << "#define STP_ON_THE_FLY_TIMER_ENABLE";
+          s.op->newline() << "#endif";
+        }
 
       // Emit embeds ahead of time, in case they affect context layout
       for (unsigned i=0; i<s.embeds.size(); i++)
@@ -6803,6 +7770,7 @@ translate_pass (systemtap_session& s)
 	s.op->newline() << "struct stp_globals {};";
 
       // Common (static atomic) state of the stap session.
+      s.op->newline();
       s.op->newline() << "#include \"common_session_state.h\"";
 
       s.op->newline() << "#include \"probe_lock.h\" ";
@@ -6834,31 +7802,6 @@ translate_pass (systemtap_session& s)
 	}
       s.op->assert_0_indent();
 
-      for (map<string,functiondecl*>::iterator it = s.functions.begin(); it != s.functions.end(); it++)
-	{
-          assert_no_interrupts();
-	  s.op->newline();
-	  s.up->emit_function (it->second);
-	}
-      s.op->assert_0_indent();
-
-      // Run a varuse_collecting_visitor over probes that need global
-      // variable locks.  We'll use this information later in
-      // emit_locks()/emit_unlocks().
-      for (unsigned i=0; i<s.probes.size(); i++)
-	{
-        assert_no_interrupts();
-        if (s.probes[i]->needs_global_locks())
-	    s.probes[i]->body->visit (&cup.vcv_needs_global_locks);
-	}
-      s.op->assert_0_indent();
-
-      for (unsigned i=0; i<s.probes.size(); i++)
-        {
-          assert_no_interrupts();
-          s.up->emit_probe (s.probes[i]);
-        }
-      s.op->assert_0_indent();
 
       // Let's find some stats for the embedded pp strings.  Maybe they
       // are small and uniform enough to justify putting char[MAX]'s into
@@ -6898,9 +7841,11 @@ translate_pass (systemtap_session& s)
             clog << "*" << endl;                                                \
         }
 
+      s.op->newline();
       s.op->newline() << "struct stap_probe {";
-      s.op->newline(1) << "size_t index;";
+      s.op->newline(1) << "const size_t index;";
       s.op->newline() << "void (* const ph) (struct context*);";
+      s.op->newline() << "unsigned cond_enabled:1;"; // just one bit required
       s.op->newline() << "#if defined(STP_TIMING) || defined(STP_ALIBI)";
       CALCIT(location);
       CALCIT(derivation);
@@ -6917,25 +7862,45 @@ translate_pass (systemtap_session& s)
       s.op->newline() << "#define STAP_PROBE_INIT_NAME(PN)";
       s.op->newline() << "#endif";
       s.op->newline() << "#define STAP_PROBE_INIT(I, PH, PP, PN, L, D) "
-                      << "{ .index=(I), .ph=(PH), .pp=(PP), "
+                      << "{ .index=(I), .ph=(PH), .cond_enabled=1, .pp=(PP), "
                       << "STAP_PROBE_INIT_NAME(PN) "
                       << "STAP_PROBE_INIT_TIMING(L, D) "
                       << "}";
-      s.op->newline(-1) << "} static const stap_probes[] = {";
+      s.op->newline(-1) << "} static stap_probes[];";
+      s.op->assert_0_indent();
+#undef CALCIT
+
+      // Run a varuse_collecting_visitor over probes that need global
+      // variable locks.  We'll use this information later in
+      // emit_locks()/emit_unlocks().
+      for (unsigned i=0; i<s.probes.size(); i++)
+	{
+        assert_no_interrupts();
+        s.probes[i]->session_index = i;
+        if (s.probes[i]->needs_global_locks())
+	    s.probes[i]->body->visit (&cup.vcv_needs_global_locks);
+	}
+      s.op->assert_0_indent();
+
+      for (unsigned i=0; i<s.probes.size(); i++)
+        {
+          assert_no_interrupts();
+          s.up->emit_probe (s.probes[i]);
+        }
+      s.op->assert_0_indent();
+
+      s.op->newline() << "static struct stap_probe stap_probes[] = {";
       s.op->indent(1);
       for (unsigned i=0; i<s.probes.size(); ++i)
         {
           derived_probe* p = s.probes[i];
-          p->session_index = i;
-          s.op->newline() << "STAP_PROBE_INIT(" << i << ", &" << p->name << ", "
+          s.op->newline() << "STAP_PROBE_INIT(" << i << ", &" << p->name() << ", "
                           << lex_cast_qstring (*p->sole_location()) << ", "
                           << lex_cast_qstring (*p->script_location()) << ", "
                           << lex_cast_qstring (p->tok->location) << ", "
                           << lex_cast_qstring (p->derived_locations()) << "),";
         }
       s.op->newline(-1) << "};";
-      s.op->assert_0_indent();
-#undef CALCIT
 
       if (s.runtime_usermode_p())
         {
@@ -6947,6 +7912,14 @@ translate_pass (systemtap_session& s)
           s.op->assert_0_indent();
         }
 
+      for (map<string,functiondecl*>::iterator it = s.functions.begin(); it != s.functions.end(); it++)
+        {
+          assert_no_interrupts();
+          s.op->newline();
+          s.up->emit_function (it->second);
+        }
+
+      s.op->assert_0_indent();
       s.op->newline();
       s.up->emit_module_init ();
       s.op->assert_0_indent();

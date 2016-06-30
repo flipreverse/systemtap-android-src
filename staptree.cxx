@@ -1,5 +1,5 @@
 // parse tree functions
-// Copyright (C) 2005-2013 Red Hat Inc.
+// Copyright (C) 2005-2015 Red Hat Inc.
 //
 // This file is part of systemtap, and is free software.  You can
 // redistribute it and/or modify it under the terms of the GNU General
@@ -11,6 +11,7 @@
 #include "parse.h"
 #include "util.h"
 #include "session.h"
+#include "stringtable.h"
 
 #include <iostream>
 #include <typeinfo>
@@ -22,8 +23,6 @@
 #include <cstring>
 
 using namespace std;
-
-
 
 visitable::~visitable ()
 {
@@ -75,9 +74,7 @@ arrayindex::arrayindex ():
 {
 }
 
-
-functioncall::functioncall ():
-  referent (0)
+functioncall::functioncall ()
 {
 }
 
@@ -95,64 +92,78 @@ symboldecl::~symboldecl ()
 
 probe_point::probe_point (std::vector<component*> const & comps):
   components(comps), optional (false), sufficient (false),
-  condition (0)
+  well_formed (false), condition (0)
 {
 }
 
 // NB: shallow-copy of compoonents & condition!
 probe_point::probe_point (const probe_point& pp):
   components(pp.components), optional (pp.optional), sufficient (pp.sufficient),
-  condition (pp.condition)
+  well_formed (pp.well_formed), condition (pp.condition)
 {
 }
 
 
 probe_point::probe_point ():
-  optional (false), sufficient (false), condition (0)
+  optional (false), sufficient (false), well_formed (false), condition (0)
 {
 }
 
+bool
+probe_point::from_globby_comp(const std::string& comp)
+{
+  vector<component*>::const_iterator it;
+  for (it = components.begin(); it != components.end(); it++)
+    if ((*it)->functor == comp)
+      return (*it)->from_glob;
+  return false;
+}
 
 unsigned probe::last_probeidx = 0;
 
 probe::probe ():
-  body (0), base (0), tok (0), systemtap_v_conditional (0), privileged (false)
+  body (0), base (0), tok (0), systemtap_v_conditional (0), privileged (false),
+  id (last_probeidx ++)
 {
-  this->name = string ("probe_") + lex_cast(last_probeidx ++);
 }
 
 
 // Copy constructor, but with overriding probe-point.  To be used when
 // mapping script-level probe points to another one, early during pass
 // 2.  There should be no symbol resolution done yet.
-probe::probe(probe* p, probe_point* l)
+probe::probe(probe* p, probe_point* l):
+  locations (1, l), body (deep_copy_visitor::deep_copy (p->body)),
+  base (p), tok (p->tok), systemtap_v_conditional (p->systemtap_v_conditional),
+  privileged (p->privileged), id (last_probeidx ++)
 {
-  this->base = p;
-  this->name = string ("probe_") + lex_cast(last_probeidx ++);
-  this->tok = p->tok;
-  this->locations.push_back(l);
-  this->body = deep_copy_visitor::deep_copy(p->body);
-  this->privileged = p->privileged;
-  this->systemtap_v_conditional = p->systemtap_v_conditional;
   assert (p->locals.size() == 0);
   assert (p->unused_locals.size() == 0);
 }
 
 
+string
+probe::name () const
+{
+  return string ("probe_") + lex_cast(id);
+}
+
+
 probe_point::component::component ():
-  arg (0), tok(0)
+  arg (0), from_glob(false), tok(0)
 {
 }
 
 
-probe_point::component::component (std::string const & f, literal * a):
-  functor(f), arg(a), tok(0)
+probe_point::component::component (interned_string f,
+  literal * a, bool from_glob):
+    functor(f), arg(a), from_glob(from_glob), tok(0)
 {
 }
 
 
 vardecl::vardecl ():
-  arity_tok(0), arity (-1), maxsize(0), init(NULL), synthetic(false), wrap(false)
+  arity_tok(0), arity (-1), maxsize(0), init(NULL), synthetic(false), wrap(false),
+  char_ptr_arg(false)
 {
 }
 
@@ -169,10 +180,13 @@ vardecl::set_arity (int a, const token* t)
   if (arity != a && arity >= 0)
     {
       semantic_error err (ERR_SRC, _F("inconsistent arity (%s vs %d)",
-                             lex_cast(arity).c_str(), a), t?:tok);
+                                      lex_cast(arity).c_str(), a), t?:tok);
       if (arity_tok)
-	err.chain = new SEMANTIC_ERROR (_F("arity %s first inferred here",
+        {
+          semantic_error chain(ERR_SRC, _F("arity %s first inferred here",
                                            lex_cast(arity).c_str()), arity_tok);
+          err.set_chain(chain);
+        }
       throw err;
     }
 
@@ -198,7 +212,7 @@ vardecl::compatible_arity (int a)
 
 
 functiondecl::functiondecl ():
-  body (0), synthetic (false), mangle_oldstyle (false)
+  body (0), synthetic (false), mangle_oldstyle (false), priority(1)
 {
 }
 
@@ -209,7 +223,7 @@ functiondecl::join (systemtap_session& s)
     throw SEMANTIC_ERROR (_("internal error, joining a non-synthetic function"), tok);
   if (!s.functions.insert (make_pair (name, this)).second)
     throw SEMANTIC_ERROR (_F("synthetic function '%s' conflicts with an existing function",
-                             name.c_str()), tok);
+                             name.to_string().c_str()), tok);
   tok->location.file->functions.push_back (this);
 }
 
@@ -222,7 +236,7 @@ literal_number::literal_number (int64_t v, bool hex)
 }
 
 
-literal_string::literal_string (const string& v)
+literal_string::literal_string (interned_string v)
 {
   value = v;
   type = pe_string;
@@ -250,6 +264,7 @@ target_symbol::assert_no_components(const std::string& tapset, bool pretty_ok)
   if (components.empty())
     return;
 
+  const string& name = this->name;
   switch (components[0].type)
     {
     case comp_literal_array_index:
@@ -271,20 +286,50 @@ target_symbol::assert_no_components(const std::string& tapset, bool pretty_ok)
 }
 
 
+size_t
+target_symbol::pretty_print_depth () const
+{
+  if (! components.empty ())
+    {
+      const component& last = components.back ();
+      if (last.type == comp_pretty_print)
+	return last.member.length ();
+    }
+  return 0;
+}
+
+
+bool
+target_symbol::check_pretty_print (bool lvalue) const
+{
+  if (pretty_print_depth () == 0)
+    return false;
+
+  if (lvalue)
+    throw SEMANTIC_ERROR(_("cannot write to pretty-printed variable"), tok);
+
+  return true;
+}
+
+
 void target_symbol::chain (const semantic_error &er)
 {
   semantic_error* e = new semantic_error(er);
   if (!e->tok1)
     e->tok1 = this->tok;
-  assert (e->chain == 0);
-  e->chain = this->saved_conversion_error;
+  assert (e->get_chain() == 0);
+  if (this->saved_conversion_error)
+    {
+      e->set_chain(*this->saved_conversion_error);
+      delete this->saved_conversion_error;
+    }
   this->saved_conversion_error = e;
 }
 
 
 string target_symbol::sym_name ()
 {
-  return name.substr(1);
+  return (string)name.substr(1);
 }
 
 
@@ -293,7 +338,7 @@ string atvar_op::sym_name ()
   if (cu_name == "")
     return target_name;
   else
-    return target_name.substr(0, target_name.length() - cu_name.length() - 1);
+    return (string)target_name.substr(0, target_name.length() - cu_name.length() - 1);
 }
 
 
@@ -363,7 +408,10 @@ void array_in::print (ostream& o) const
   for (unsigned i=0; i<operand->indexes.size(); i++)
     {
       if (i > 0) o << ", ";
-      operand->indexes[i]->print (o);
+      if (operand->indexes[i])
+        operand->indexes[i]->print (o);
+      else
+        o << "*";
     }
   o << "] in ";
   operand->base->print (o);
@@ -448,6 +496,16 @@ void cast_op::print (ostream& o) const
 }
 
 
+void autocast_op::print (ostream& o) const
+{
+  if (addressof)
+    o << "&";
+  o << '(' << *operand << ')';
+  for (unsigned i = 0; i < components.size(); ++i)
+    o << components[i];
+}
+
+
 void defined_op::print (ostream& o) const
 {
   o << "@defined(" << *operand << ")";
@@ -468,7 +526,7 @@ void perf_op::print (ostream& o) const
 
 void vardecl::print (ostream& o) const
 {
-  o << name;
+  o << unmangled_name;
   if(wrap)
     o << "%";
   if (maxsize > 0)
@@ -485,7 +543,7 @@ void vardecl::print (ostream& o) const
 
 void vardecl::printsig (ostream& o) const
 {
-  o << name;
+  o << unmangled_name;
   if(wrap)
      o << "%";
   if (maxsize > 0)
@@ -503,7 +561,7 @@ void vardecl::printsig (ostream& o) const
 
 void functiondecl::print (ostream& o) const
 {
-  o << "function " << name << " (";
+  o << "function " << unmangled_name << " (";
   for (unsigned i=0; i<formal_args.size(); i++)
     o << (i>0 ? ", " : "") << *formal_args[i];
   o << ")" << endl;
@@ -513,7 +571,7 @@ void functiondecl::print (ostream& o) const
 
 void functiondecl::printsig (ostream& o) const
 {
-  o << name << ":" << type << " (";
+  o << unmangled_name << ":" << type << " (";
   for (unsigned i=0; i<formal_args.size(); i++)
     o << (i>0 ? ", " : "")
       << *formal_args[i]
@@ -522,13 +580,71 @@ void functiondecl::printsig (ostream& o) const
   o << ")";
 }
 
+embedded_tags_visitor::embedded_tags_visitor(bool all_tags)
+{
+  // populate the set of tags that could appear in embedded code/expressions
+  available_tags.insert("/* guru */");
+  available_tags.insert("/* unprivileged */");
+  available_tags.insert("/* myproc-unprivileged */");
+  if (all_tags)
+    {
+      available_tags.insert("/* pure */");
+      available_tags.insert("/* unmangled */");
+      available_tags.insert("/* unmodified-fnargs */");
+      available_tags.insert("/* stable */");
+    }
+}
+
+bool embedded_tags_visitor::tagged_p (const std::string& tag)
+{
+  return tags.count(tag);
+}
+
+void embedded_tags_visitor::find_tags_in_code (const string& s)
+{
+  set<string>::iterator tag;
+  for (tag = available_tags.begin(); tag != available_tags.end(); ++tag)
+      if(s.find(*tag) != string::npos)
+        tags.insert(*tag);
+}
+
+void embedded_tags_visitor::visit_embeddedcode (embeddedcode *s)
+{
+  find_tags_in_code(s->code);
+}
+
+void embedded_tags_visitor::visit_embedded_expr (embedded_expr *e)
+{
+  find_tags_in_code(e->code);
+}
+
+void functiondecl::printsigtags (ostream& o, bool all_tags) const
+{
+  this->printsig(o);
+
+  // Visit the function's body to see if there's any embedded_code or
+  // embeddedexpr that have special tags (e.g. /* guru */)
+  embedded_tags_visitor etv(all_tags);
+  this->body->visit(&etv);
+
+  set<string, bool>::const_iterator tag;
+  for (tag = etv.available_tags.begin(); tag != etv.available_tags.end(); ++tag)
+    if (etv.tagged_p(*tag))
+      o << " " << *tag;
+}
 
 void arrayindex::print (ostream& o) const
 {
   base->print (o);
   o << "[";
   for (unsigned i=0; i<indexes.size(); i++)
-    o << (i>0 ? ", " : "") << *indexes[i];
+    {
+      o << (i>0 ? ", " : "");
+      if (indexes[i]==0)
+        o << "*";
+      else
+        o << *indexes[i];
+    }
   o << "]";
 }
 
@@ -543,10 +659,20 @@ void functioncall::print (ostream& o) const
 
 
 print_format*
-print_format::create(const token *t)
+print_format::create(const token *t, const char *n)
 {
   bool stream, format, delim, newline, _char;
-  const char *n = t->content.c_str();
+  interned_string type;
+  string str_type;
+
+  if (n == NULL)
+    {
+      type = t->content;
+      str_type = type;
+      n = str_type.c_str();
+    }
+  else
+    type = n;
 
   stream = true;
   format = delim = newline = _char = false;
@@ -589,7 +715,7 @@ print_format::create(const token *t)
 	return NULL;
     }
 
-  print_format *pf = new print_format(stream, format, delim, newline, _char);
+  print_format *pf = new print_format(stream, format, delim, newline, _char, type);
   pf->tok = t;
   return pf;
 }
@@ -609,7 +735,7 @@ print_format::components_to_string(vector<format_component> const & components)
       if (i->type == conv_literal)
 	{
 	  assert(!i->literal_string.empty());
-	  for (string::const_iterator j = i->literal_string.begin();
+	  for (interned_string::const_iterator j = i->literal_string.begin();
 	       j != i->literal_string.end(); ++j)
 	    {
               // See also: c_unparser::visit_literal_string and lex_cast_qstring
@@ -708,14 +834,15 @@ print_format::string_to_components(string const & str)
   curr.clear();
 
   string::const_iterator i = str.begin();
-
+  string literal_str;
+  
   while (i != str.end())
     {
       if (*i != '%')
 	{
 	  assert (curr.type == conv_unspecified || curr.type == conv_literal);
 	  curr.type = conv_literal;
-	  curr.literal_string += *i;
+          literal_str += *i;
 	  ++i;
 	  continue;
 	}
@@ -725,7 +852,7 @@ print_format::string_to_components(string const & str)
 	  // *i == '%' and *(i+1) == '%'; append only one '%' to the literal string
 	  assert (curr.type == conv_unspecified || curr.type == conv_literal);
 	  curr.type = conv_literal;
-	  curr.literal_string += '%';
+	  literal_str += '%';
           i += 2;
 	  continue;
 	}
@@ -736,7 +863,9 @@ print_format::string_to_components(string const & str)
 	    {
 	      // Flush any component we were previously accumulating
 	      assert (curr.type == conv_literal);
-	      res.push_back(curr);
+              curr.literal_string = literal_str;
+              res.push_back(curr);
+              literal_str.clear();
 	      curr.clear();
 	    }
 	}
@@ -903,7 +1032,9 @@ print_format::string_to_components(string const & str)
 	throw PARSE_ERROR(_("invalid or missing conversion specifier"));
 
       ++i;
+      curr.literal_string = literal_str;
       res.push_back(curr);
+      literal_str.clear();
       curr.clear();
     }
 
@@ -911,7 +1042,11 @@ print_format::string_to_components(string const & str)
   if (!curr.is_empty())
     {
       if (curr.type == conv_literal)
-	res.push_back(curr);
+        {
+          curr.literal_string = literal_str;
+          res.push_back(curr);
+          // no need to clear curr / literal_str; we're leaving
+        }
       else
 	throw PARSE_ERROR(_("trailing incomplete print format conversion"));
     }
@@ -922,11 +1057,11 @@ print_format::string_to_components(string const & str)
 
 void print_format::print (ostream& o) const
 {
-  o << tok->content << "(";
+  o << print_format_type << "(";
   if (print_with_format)
     o << lex_cast_qstring (raw_components);
   if (print_with_delim)
-    o << lex_cast_qstring (delimiter.literal_string);
+    o << lex_cast_qstring (delimiter);
   if (hist)
     hist->print(o);
   for (vector<expression*>::const_iterator i = args.begin();
@@ -1016,7 +1151,7 @@ void block::print (ostream& o) const
 {
   o << "{" << endl;
   for (unsigned i=0; i<statements.size(); i++)
-    o << *statements [i] << endl;
+    o << *statements [i] << ";" << endl;
   o << "}";
 }
 
@@ -1072,6 +1207,19 @@ void foreach_loop::print (ostream& o) const
     }
   o << "] in ";
   base->print (o);
+  if (!array_slice.empty())
+    {
+      o << "[";
+      for (unsigned i=0; i<array_slice.size(); i++)
+        {
+          if (i > 0) o << ", ";
+          if (array_slice[i])
+            array_slice[i]->print (o);
+          else
+            o << "*";
+        }
+      o << "]";
+    }
   if (sort_direction != 0 && sort_column == 0)
     {
       switch (sort_aggr)
@@ -1229,6 +1377,18 @@ void probe_point::print (ostream& o, bool print_extras) const
     {
       if (i>0) o << ".";
       probe_point::component* c = components[i];
+      if (!c)
+        {
+          // We might like to excise this weird 0 pointer, just in
+          // case some recursion during the error-handling path, but
+          // can't, because what we have here is a const *this.
+          static int been_here = 0;
+          if (been_here == 0) {
+            been_here ++;
+            throw SEMANTIC_ERROR (_("internal error: missing probe point component"));
+          } else
+            continue; // ... sad panda decides to skip the bad boy
+        }
       o << c->functor;
       if (c->arg)
         o << "(" << *c->arg << ")";
@@ -1263,7 +1423,7 @@ void probe_alias::printsig (ostream& o) const
       o << (i>0 ? " = " : "");
       alias_names[i]->print (o);
     }
-  o << " = ";
+  o << (epilogue_style ? " += " : " = ");
   for (unsigned i=0; i<locations.size(); i++)
     {
       if (i > 0) o << ", ";
@@ -1506,6 +1666,13 @@ cast_op::visit (visitor* u)
 
 
 void
+autocast_op::visit (visitor* u)
+{
+  u->visit_autocast_op(this);
+}
+
+
+void
 atvar_op::visit (visitor* u)
 {
   u->visit_atvar_op(this);
@@ -1563,6 +1730,13 @@ hist_op::visit (visitor *u)
   u->visit_hist_op (this);
 }
 
+
+bool
+expression::is_symbol(symbol *& sym_out)
+{
+  sym_out = NULL;
+  return false;
+}
 
 bool
 indexable::is_symbol(symbol *& sym_out)
@@ -1849,6 +2023,13 @@ traversing_visitor::visit_cast_op (cast_op* e)
 }
 
 void
+traversing_visitor::visit_autocast_op (autocast_op* e)
+{
+  e->operand->visit (this);
+  e->visit_components (this);
+}
+
+void
 traversing_visitor::visit_atvar_op (atvar_op* e)
 {
   e->visit_components (this);
@@ -1878,7 +2059,8 @@ void
 traversing_visitor::visit_arrayindex (arrayindex* e)
 {
   for (unsigned i=0; i<e->indexes.size(); i++)
-    e->indexes[i]->visit (this);
+    if (e->indexes[i])
+      e->indexes[i]->visit (this);
 
   e->base->visit(this);
 }
@@ -1913,22 +2095,264 @@ traversing_visitor::visit_hist_op (hist_op* e)
 
 
 void
+expression_visitor::visit_literal_string (literal_string* e)
+{
+  traversing_visitor::visit_literal_string (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_literal_number (literal_number* e)
+{
+  traversing_visitor::visit_literal_number (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_embedded_expr (embedded_expr* e)
+{
+  traversing_visitor::visit_embedded_expr (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_binary_expression (binary_expression* e)
+{
+  traversing_visitor::visit_binary_expression (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_unary_expression (unary_expression* e)
+{
+  traversing_visitor::visit_unary_expression (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_pre_crement (pre_crement* e)
+{
+  traversing_visitor::visit_pre_crement (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_post_crement (post_crement* e)
+{
+  traversing_visitor::visit_post_crement (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_logical_or_expr (logical_or_expr* e)
+{
+  traversing_visitor::visit_logical_or_expr (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_logical_and_expr (logical_and_expr* e)
+{
+  traversing_visitor::visit_logical_and_expr (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_array_in (array_in* e)
+{
+  traversing_visitor::visit_array_in (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_regex_query (regex_query* e)
+{
+  traversing_visitor::visit_regex_query (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_comparison (comparison* e)
+{
+  traversing_visitor::visit_comparison (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_concatenation (concatenation* e)
+{
+  traversing_visitor::visit_concatenation (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_ternary_expression (ternary_expression* e)
+{
+  traversing_visitor::visit_ternary_expression (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_assignment (assignment* e)
+{
+  traversing_visitor::visit_assignment (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_symbol (symbol* e)
+{
+  traversing_visitor::visit_symbol (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_target_symbol (target_symbol* e)
+{
+  traversing_visitor::visit_target_symbol (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_arrayindex (arrayindex* e)
+{
+  traversing_visitor::visit_arrayindex (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_functioncall (functioncall* e)
+{
+  traversing_visitor::visit_functioncall (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_print_format (print_format* e)
+{
+  traversing_visitor::visit_print_format (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_stat_op (stat_op* e)
+{
+  traversing_visitor::visit_stat_op (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_hist_op (hist_op* e)
+{
+  traversing_visitor::visit_hist_op (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_cast_op (cast_op* e)
+{
+  traversing_visitor::visit_cast_op (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_autocast_op (autocast_op* e)
+{
+  traversing_visitor::visit_autocast_op (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_atvar_op (atvar_op* e)
+{
+  traversing_visitor::visit_atvar_op (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_defined_op (defined_op* e)
+{
+  traversing_visitor::visit_defined_op (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_entry_op (entry_op* e)
+{
+  traversing_visitor::visit_entry_op (e);
+  visit_expression (e);
+}
+
+void
+expression_visitor::visit_perf_op (perf_op* e)
+{
+  traversing_visitor::visit_perf_op (e);
+  visit_expression (e);
+}
+
+
+void
 functioncall_traversing_visitor::visit_functioncall (functioncall* e)
 {
   traversing_visitor::visit_functioncall (e);
+  this->enter_functioncall(e);
+}
 
-  // prevent infinite recursion
-  if (traversed.find (e->referent) == traversed.end ())
+void
+functioncall_traversing_visitor::enter_functioncall (functioncall* e)
+{
+  for (unsigned i = 0; i < e->referents.size(); i++)
     {
-      traversed.insert (e->referent);
-      // recurse
-      functiondecl* last_current_function = current_function;
-      current_function = e->referent;
-      e->referent->body->visit (this);
-      current_function = last_current_function;
+      functiondecl* referent = e->referents[i];
+      // prevent infinite recursion
+      if (nested.find (referent) == nested.end ())
+        {
+          if (seen.find(referent) == seen.end())
+            seen.insert (referent);
+          nested.insert (referent);
+          // recurse
+          functiondecl* last_current_function = current_function;
+          current_function = referent;
+          referent->body->visit (this);
+          current_function = last_current_function;
+          nested.erase (referent);
+        }
+      else { this->note_recursive_functioncall(e); }
     }
 }
 
+void
+functioncall_traversing_visitor::note_recursive_functioncall (functioncall*)
+{
+}
+
+void
+varuse_collecting_visitor::visit_if_statement (if_statement *s)
+{
+  assert(!current_lvalue_read);
+  current_lvalue_read = true;
+  s->condition->visit (this);
+  current_lvalue_read = false;
+
+  s->thenblock->visit (this);
+  if (s->elseblock)
+    s->elseblock->visit (this);
+}
+
+
+void
+varuse_collecting_visitor::visit_for_loop (for_loop *s)
+{
+  if (s->init) s->init->visit (this);
+
+  assert(!current_lvalue_read);
+  current_lvalue_read = true;
+  s->cond->visit (this);
+  current_lvalue_read = false;
+
+  if (s->incr) s->incr->visit (this);
+  s->block->visit (this);
+}
 
 void
 varuse_collecting_visitor::visit_try_block (try_block *s)
@@ -1944,11 +2368,59 @@ varuse_collecting_visitor::visit_try_block (try_block *s)
   // since that would count s->catch_error_var as a read also.
 }
 
+void
+varuse_collecting_visitor::visit_functioncall (functioncall* e)
+{
+  // NB: don't call functioncall_traversing_visitor::visit_functioncall(). We
+  // replicate functionality here but split argument visiting from actual
+  // function visiting.
+
+  bool last_lvalue_read = current_lvalue_read;
+
+  // arguments are used
+  current_lvalue_read = true;
+  traversing_visitor::visit_functioncall(e);
+
+  // but function body shouldn't all be marked used
+  current_lvalue_read = false;
+  functioncall_traversing_visitor::enter_functioncall(e);
+
+  current_lvalue_read = last_lvalue_read;
+}
+
+void
+varuse_collecting_visitor::visit_return_statement (return_statement *s)
+{
+  assert(!current_lvalue_read);
+  current_lvalue_read = true;
+  functioncall_traversing_visitor::visit_return_statement(s);
+  current_lvalue_read = false;
+}
+
 
 void
 varuse_collecting_visitor::visit_embeddedcode (embeddedcode *s)
 {
   assert (current_function); // only they get embedded code
+
+  /* We need to lock globals that are accessed through embedded C code */
+  for (unsigned i = 0; i < session.globals.size(); i++)
+    {
+      vardecl* v = session.globals[i];
+      string name = v->unmangled_name;
+      if (s->code.find("/* pragma:read:" + name + " */") != string::npos)
+        {
+          if (v->type == pe_stats)
+            throw SEMANTIC_ERROR(_("Aggregates not available in embedded-C"), s->tok);
+          read.insert(v);
+        }
+      if (s->code.find("/* pragma:write:" + name + " */") != string::npos)
+        {
+          if (v->type == pe_stats)
+            throw SEMANTIC_ERROR(_("Aggregates not available in embedded-C"), s->tok);
+          written.insert(v);
+        }
+    }
 
   // Don't allow embedded C functions in unprivileged mode unless
   // they are tagged with /* unprivileged */ or /* myproc-unprivileged */
@@ -1992,6 +2464,25 @@ varuse_collecting_visitor::visit_embeddedcode (embeddedcode *s)
 void
 varuse_collecting_visitor::visit_embedded_expr (embedded_expr *e)
 {
+  /* We need to lock globals that are accessed through embedded C code */
+  for (unsigned i = 0; i < session.globals.size(); i++)
+    {
+      vardecl* v = session.globals[i];
+      string name = v->unmangled_name;
+      if (e->code.find("/* pragma:read:" + name + " */") != string::npos)
+        {
+          if (v->type == pe_stats)
+            throw SEMANTIC_ERROR(_("Aggregates not available in embedded-C"), e->tok);
+          read.insert(v);
+        }
+      if (e->code.find("/* pragma:write:" + name + " */") != string::npos)
+        {
+          if (v->type == pe_stats)
+            throw SEMANTIC_ERROR(_("Aggregates not available in embedded-C"), e->tok);
+          written.insert(v);
+        }
+    }
+
   // Don't allow embedded C expressions in unprivileged mode unless
   // they are tagged with /* unprivileged */ or /* myproc-unprivileged */
   // or we're in a usermode runtime.
@@ -2065,6 +2556,17 @@ varuse_collecting_visitor::visit_cast_op (cast_op *e)
 }
 
 void
+varuse_collecting_visitor::visit_autocast_op (autocast_op *e)
+{
+  // As with target_symbols, unresolved cast assignments need to preserved
+  // for later error handling.
+  if (is_active_lvalue (e))
+    embedded_seen = true;
+
+  functioncall_traversing_visitor::visit_autocast_op (e);
+}
+
+void
 varuse_collecting_visitor::visit_defined_op (defined_op *e)
 {
   // XXX
@@ -2129,6 +2631,20 @@ varuse_collecting_visitor::visit_assignment (assignment *e)
 }
 
 void
+varuse_collecting_visitor::visit_ternary_expression (ternary_expression* e)
+{
+  // NB: don't call base class's implementation. We do the work here already.
+
+  bool last_lvalue_read = current_lvalue_read;
+  current_lvalue_read = true;
+  e->cond->visit (this);
+  current_lvalue_read = last_lvalue_read;
+
+  e->truevalue->visit (this);
+  e->falsevalue->visit (this);
+}
+
+void
 varuse_collecting_visitor::visit_symbol (symbol *e)
 {
   if (e->referent == 0)
@@ -2168,6 +2684,16 @@ varuse_collecting_visitor::visit_symbol (symbol *e)
 void
 varuse_collecting_visitor::visit_arrayindex (arrayindex *e)
 {
+  // NB: don't call parent implementation, we do the work here.
+
+  // First let's visit the indexes separately
+  bool old_lvalue_read = current_lvalue_read;
+  current_lvalue_read = true;
+  for (unsigned i=0; i<e->indexes.size(); i++)
+    if (e->indexes[i])
+      e->indexes[i]->visit (this);
+  current_lvalue_read = old_lvalue_read;
+
   // Hooking this callback is necessary because of the hacky
   // statistics representation.  For the expression "i[4] = 5", the
   // incoming lvalue will point to this arrayindex.  However, the
@@ -2188,7 +2714,8 @@ varuse_collecting_visitor::visit_arrayindex (arrayindex *e)
 
   if (current_lrvalue == e) current_lrvalue = value;
   if (current_lvalue == e) current_lvalue = value;
-  functioncall_traversing_visitor::visit_arrayindex (e);
+
+  e->base->visit(this);
 
   current_lrvalue = last_lrvalue;
   current_lvalue = last_lvalue;
@@ -2216,6 +2743,8 @@ varuse_collecting_visitor::visit_post_crement (post_crement *e)
 void
 varuse_collecting_visitor::visit_foreach_loop (foreach_loop* s)
 {
+  assert(!current_lvalue_read);
+
   // NB: we duplicate so don't bother call
   // functioncall_traversing_visitor::visit_foreach_loop (s);
 
@@ -2241,6 +2770,15 @@ varuse_collecting_visitor::visit_foreach_loop (foreach_loop* s)
       current_lvalue = last_lvalue;
     }
 
+  // visit the additional specified array slice
+  current_lvalue_read = true;
+  for (unsigned i=0; i<s->array_slice.size(); i++)
+    {
+      if (s->array_slice[i])
+        s->array_slice[i]->visit (this);
+    }
+  current_lvalue_read = false;
+
   // The value is an lvalue too
   if (s->value)
     {
@@ -2251,7 +2789,11 @@ varuse_collecting_visitor::visit_foreach_loop (foreach_loop* s)
     }
 
   if (s->limit)
-    s->limit->visit (this);
+    {
+      current_lvalue_read = true;
+      s->limit->visit (this);
+      current_lvalue_read = false;
+    }
 
   s->block->visit (this);
 }
@@ -2265,13 +2807,13 @@ varuse_collecting_visitor::visit_delete_statement (delete_statement* s)
   // optimization pass is not smart enough to remove an unneeded
   // "delete" yet, so we pose more like a *crement ("lrvalue").  This
   // should protect the underlying value from optimizional mischief.
+  assert(!current_lvalue_read);
   expression* last_lrvalue = current_lrvalue;
-  bool last_lvalue_read = current_lvalue_read;
   current_lrvalue = s->value; // leave a mark for ::visit_symbol
   current_lvalue_read = true;
   functioncall_traversing_visitor::visit_delete_statement (s);
   current_lrvalue = last_lrvalue;
-  current_lvalue_read = last_lvalue_read;
+  current_lvalue_read = false;
 }
 
 bool
@@ -2506,6 +3048,12 @@ throwing_visitor::visit_atvar_op (atvar_op* e)
 
 void
 throwing_visitor::visit_cast_op (cast_op* e)
+{
+  throwone (e->tok);
+}
+
+void
+throwing_visitor::visit_autocast_op (autocast_op* e)
 {
   throwone (e->tok);
 }
@@ -2797,6 +3345,14 @@ update_visitor::visit_cast_op (cast_op* e)
 }
 
 void
+update_visitor::visit_autocast_op (autocast_op* e)
+{
+  replace (e->operand);
+  e->visit_components (this);
+  provide (e);
+}
+
+void
 update_visitor::visit_atvar_op (atvar_op* e)
 {
   e->visit_components (this);
@@ -3049,7 +3605,6 @@ void
 deep_copy_visitor::visit_target_symbol (target_symbol* e)
 {
   target_symbol* n = new target_symbol(*e);
-  n->referent = NULL; // don't copy!
   update_visitor::visit_target_symbol(n);
 }
 
@@ -3057,6 +3612,12 @@ void
 deep_copy_visitor::visit_cast_op (cast_op* e)
 {
   update_visitor::visit_cast_op(new cast_op(*e));
+}
+
+void
+deep_copy_visitor::visit_autocast_op (autocast_op* e)
+{
+  update_visitor::visit_autocast_op(new autocast_op(*e));
 }
 
 void
@@ -3093,7 +3654,7 @@ void
 deep_copy_visitor::visit_functioncall (functioncall* e)
 {
   functioncall* n = new functioncall(*e);
-  n->referent = NULL; // don't copy!
+  n->referents.clear(); // don't copy!
   update_visitor::visit_functioncall(n);
 }
 

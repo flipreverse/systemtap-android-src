@@ -1,5 +1,5 @@
 // systemtap remote execution
-// Copyright (C) 2010-2011 Red Hat Inc.
+// Copyright (C) 2010-2015 Red Hat Inc.
 //
 // This file is part of systemtap, and is free software.  You can
 // redistribute it and/or modify it under the terms of the GNU General
@@ -510,10 +510,16 @@ class stapsh : public remote {
 
         if (!rc)
           {
-            long flags = fcntl(fdout, F_GETFL) | O_NONBLOCK;
-            fcntl(fdout, F_SETFL, flags);
+            long flags;
+            if ((flags = fcntl(fdout, F_GETFL)) == -1
+              || fcntl(fdout, F_SETFL, flags | O_NONBLOCK) == -1)
+              {
+                clog << _("failed to change to non-blocking mode") << endl;
+                rc = 1;
+              }
           }
-        else
+
+        if (rc)
           // If run failed for any reason, then this
           // connection is effectively dead to us.
           close();
@@ -577,7 +583,11 @@ class stapsh : public remote {
             for (vector<string>::iterator it = this->options.begin();
                 it != this->options.end(); ++it)
               {
-                send_command("option " + *it + "\n");
+                int rc = send_command("option " + *it + "\n");
+                if (rc != 0)
+                  throw runtime_error(_F("could not set option %s: "
+                                         "send_command returned %d",
+                                         it->c_str(), rc));
                 string reply = get_reply();
                 if (reply != "OK\n")
                   throw runtime_error(_F("could not set option %s: %s",
@@ -1166,7 +1176,11 @@ ssh_remote::create(systemtap_session& s, const string& target)
       host.erase(i);
     }
 
+#if __cplusplus >= 201103L /* -std=c++11 */
+  unique_ptr<ssh_remote> p (new ssh_remote(s));
+#else
   auto_ptr<ssh_remote> p (new ssh_remote(s));
+#endif
   int rc = p->connect(host, port);
   if (rc == 0)
     return p.release();

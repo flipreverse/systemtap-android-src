@@ -1,5 +1,5 @@
 // context tapset
-// Copyright (C) 2005-2013 Red Hat Inc.
+// Copyright (C) 2005-2014 Red Hat Inc.
 // Copyright (C) 2006 Intel Corporation.
 //
 // This file is part of systemtap, and is free software.  You can
@@ -15,7 +15,7 @@
  * Description: Returns the execname of a target process (or group of processes).
  */
 function execname:string ()
-%{ /* pure */ /* unprivileged */
+%{ /* pure */ /* unprivileged */ /* stable */
 	strlcpy (STAP_RETVALUE, current->comm, MAXSTRINGLEN);
 %}
 
@@ -25,8 +25,21 @@ function execname:string ()
  * Description: This function returns the ID of a target process.
  */
 function pid:long ()
-%{ /* pure */ /* unprivileged */
+%{ /* pure */ /* unprivileged */ /* stable */
 	STAP_RETVALUE = current->tgid;
+%}
+
+/**
+ * sfunction ns_pid - Returns the ID of a target process as seen in a pid namespace
+ *
+ * Description: This function returns the ID of a target process as seen in
+ * the target pid namespace.
+ */
+function ns_pid:long ()
+%{ /* pure */ /* unprivileged */ /* stable */
+  int64_t rc = from_target_pid_ns(current, PID);
+  if (rc < 0) STAP_ERROR ("cannot resolve id in namespace");
+  else STAP_RETURN (rc);
 %}
 
 /**
@@ -35,8 +48,21 @@ function pid:long ()
  * Description: This function returns the thread ID of the target process.
  */
 function tid:long ()
-%{ /* pure */ /* unprivileged */
+%{ /* pure */ /* unprivileged */ /* stable */
 	STAP_RETVALUE = current->pid;
+%}
+
+/**
+ * sfunction ns_tid - Returns the thread ID of a target process as seen in a pid namespace
+ *
+ * Description: This function returns the thread ID of a target process as seen
+ * in  the target pid namespace if provided, or the stap process namespace.
+ */
+function ns_tid:long ()
+%{ /* pure */ /* unprivileged */ /* stable */
+  int64_t rc = from_target_pid_ns(current, TID);
+  if (rc < 0) STAP_ERROR ("cannot resolve id in namespace");
+  else STAP_RETURN (rc);
 %}
 
 /**
@@ -45,12 +71,24 @@ function tid:long ()
  * Description: This function return the process ID of the target proccess's parent process.
  */
 function ppid:long()
-%{ /* pure */ /* unprivileged */
+%{ /* pure */ /* unprivileged */ /* stable */
 #if defined(STAPCONF_REAL_PARENT)
 	STAP_RETVALUE = current->real_parent->tgid;
 #else
 	STAP_RETVALUE = current->parent->tgid;
 #endif
+%}
+
+/**
+ * sfunction ns_ppid - Returns the process ID of a target process's parent process as seen in a pid namespace
+ *
+ * Description: This function return the process ID of the target proccess's parent process as seen in  the target pid namespace if provided, or the stap process namespace.
+ */
+function ns_ppid:long()
+%{ /* pure */ /* unprivileged */ /* stable */
+  int64_t rc = from_target_pid_ns(current->parent, PID);
+  if (rc < 0) STAP_ERROR ("cannot resolve id in namespace");
+  else STAP_RETURN (rc);
 %}
 
 /**
@@ -60,7 +98,7 @@ function ppid:long()
  * current process.
  */
 function pgrp:long ()
-%{ /* pure */ /* unprivileged */
+%{ /* pure */ /* unprivileged */ /* stable */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 24)
 	struct signal_struct *ss = kread( &(current->signal) );
 	STAP_RETVALUE = kread ( &(ss->pgrp) );
@@ -71,6 +109,19 @@ function pgrp:long ()
 %}
 
 /**
+ * sfunction ns_pgrp - Returns the process group ID of the current process as seen in a pid namespace
+ *
+ * Description: This function returns the process group ID of the
+ * current process as seen in  the target pid namespace if provided, or the stap process namespace.
+ */
+function ns_pgrp:long ()
+%{ /* pure */ /* unprivileged */ /* stable */
+  int64_t rc = from_target_pid_ns(current, PGRP);
+  if (rc < 0) STAP_ERROR ("cannot resolve id in namespace");
+  else STAP_RETURN (rc);
+%}
+
+/**
  * sfunction sid - Returns the session ID of the current process
  *
  * Description: The session ID of a process is the process group ID
@@ -78,7 +129,7 @@ function pgrp:long ()
  *  since Kernel 2.6.0.
  */
 function sid:long ()
-%{ /* pure */ /* unprivileged */
+%{ /* pure */ /* unprivileged */ /* stable */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 24)
 	struct signal_struct *ss = kread( &(current->signal) );
 	STAP_RETVALUE = kread ( &(ss->session) );
@@ -89,13 +140,27 @@ function sid:long ()
 %}
 
 /**
+ * sfunction ns_sid - Returns the session ID of the current process as seen in a pid namespace
+ *
+ * Description: The namespace-aware session ID of a process is the process group ID
+ * of the session leader as seen in  the target pid namespace if provided, or the stap process namespace. Session ID is stored in the signal_struct
+ *  since Kernel 2.6.0.
+ */
+function ns_sid:long ()
+%{ /* pure */ /* unprivileged */ /* stable */
+  int64_t rc = from_target_pid_ns(current, SID);
+  if (rc < 0) STAP_ERROR ("cannot resolve id in namespace");
+  else STAP_RETURN (rc);
+%}
+
+/**
  * sfunction pexecname - Returns the execname of a target process's parent process
  * 
  * Description: This function returns the execname of a target
  * process's parent procces.
  */
 function pexecname:string ()
-%{ /* pure */ /* unprivileged */
+%{ /* pure */ /* unprivileged */ /* stable */
 #if defined(STAPCONF_REAL_PARENT)
 	strlcpy (STAP_RETVALUE, current->real_parent->comm, MAXSTRINGLEN);
 #else
@@ -109,11 +174,11 @@ function pexecname:string ()
  * Description: This function returns the group ID of a target process.
  */
 function gid:long ()
-%{ /* pure */ /* unprivileged */
+%{ /* pure */ /* unprivileged */ /* stable */
 #ifdef STAPCONF_TASK_UID
 	STAP_RETVALUE = current->gid;
 #else
-#ifdef CONFIG_UIDGID_STRICT_TYPE_CHECKS
+#if defined(CONFIG_USER_NS) || (LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0))
 	STAP_RETVALUE = from_kgid_munged(current_user_ns(), current_gid());
 #else
 	STAP_RETVALUE = current_gid();
@@ -122,16 +187,28 @@ function gid:long ()
 %}
 
 /**
+ * sfunction ns_gid - Returns the group ID of a target process as seen in a user namespace
+ *
+ * Description: This function returns the group ID of a target process as seen in the target user namespace if provided, or the stap process namespace.
+ */
+function ns_gid:long ()
+%{ /* pure */ /* unprivileged */ /* stable */
+  int64_t rc = from_target_user_ns(current, GID);
+  if (rc < 0) STAP_ERROR ("cannot resolve id in namespace");
+  else STAP_RETURN (rc);
+%}
+
+/**
  * sfunction egid - Returns the effective gid of a target process
- * 
+ *
  * Description: This function returns the effective gid of a target process
  */
 function egid:long ()
-%{ /* pure */ /* unprivileged */
+%{ /* pure */ /* unprivileged */ /* stable */
 #ifdef STAPCONF_TASK_UID
 	STAP_RETVALUE = current->egid;
 #else
-#ifdef CONFIG_UIDGID_STRICT_TYPE_CHECKS
+#if defined(CONFIG_USER_NS) || (LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0))
 	STAP_RETVALUE = from_kgid_munged(current_user_ns(), current_egid());
 #else
 	STAP_RETVALUE = current_egid();
@@ -140,16 +217,28 @@ function egid:long ()
 %}
 
 /**
+ * sfunction ns_egid - Returns the effective gid of a target process as seen in a user namespace
+ *
+ * Description: This function returns the effective gid of a target process as seen in the target user namespace if provided, or the stap process namespace
+ */
+function ns_egid:long ()
+%{ /* pure */ /* unprivileged */ /* stable */
+  int64_t rc = from_target_user_ns(current, EGID);
+  if (rc < 0) STAP_ERROR ("cannot resolve id in namespace");
+  else STAP_RETURN (rc);
+%}
+
+/**
  * sfunction uid - Returns the user ID of a target process
- * 
+ *
  * Description: This function returns the user ID of the target process.
  */
 function uid:long ()
-%{ /* pure */ /* unprivileged */
+%{ /* pure */ /* unprivileged */ /* stable */
 #ifdef STAPCONF_TASK_UID
 	STAP_RETVALUE = current->uid;
 #else
-#ifdef CONFIG_UIDGID_STRICT_TYPE_CHECKS
+#if defined(CONFIG_USER_NS) || (LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0))
         STAP_RETVALUE = from_kuid_munged(current_user_ns(), current_uid());
 #else
         STAP_RETVALUE = current_uid();
@@ -158,23 +247,46 @@ function uid:long ()
 %}
 
 /**
+ * sfunction ns_uid - Returns the user ID of a target process as seen in a user namespace
+ *
+ * Description: This function returns the user ID of the target process as seen in the target user namespace if provided, or the stap process namespace.
+ */
+function ns_uid:long ()
+%{ /* pure */ /* unprivileged */ /* stable */
+  int64_t rc = from_target_user_ns(current, UID);
+  if (rc < 0) STAP_ERROR ("cannot resolve id in namespace");
+  else STAP_RETURN (rc);
+%}
+
+/**
  * sfunction euid - Return the effective uid of a target process
  *
  * Description: Returns the effective user ID of the target process.
  */
 function euid:long ()
-%{ /* pure */ /* unprivileged */
+%{ /* pure */ /* unprivileged */ /* stable */
 #ifdef STAPCONF_TASK_UID
 	STAP_RETVALUE = current->euid;
 #else
-#ifdef CONFIG_UIDGID_STRICT_TYPE_CHECKS
-        STAP_RETVALUE = from_kuid_munged(current_user_ns(), current_euid());
+#if defined(CONFIG_USER_NS) || (LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0))
+  STAP_RETVALUE = from_kuid_munged(&init_user_ns, current_euid());
 #else
 	STAP_RETVALUE = current_euid();
 #endif
 #endif
 %}
 
+/**
+ * sfunction ns_euid - Returns the effective user ID of a target process as seen in a user namespace
+ *
+ * Description: This function returns the effective user ID of the target process as seen in the target user namespace if provided, or the stap process namespace.
+ */
+function ns_euid:long ()
+%{ /* pure */ /* unprivileged */ /* stable */
+  int64_t rc = from_target_user_ns(current, EUID);
+  if (rc < 0) STAP_ERROR ("cannot resolve id in namespace");
+  else STAP_RETURN (rc);
+%}
 
 /**
  * sfunction is_myproc - Determines if the current probe point has occurred in the user's own process
@@ -183,7 +295,7 @@ function euid:long ()
  * point has occurred in the user's own process.
  */
 function is_myproc:long ()
-%{ /* pure */ /* unprivileged */
+%{ /* pure */ /* unprivileged */ /* stable */
         STAP_RETVALUE = is_myproc();
 %}
 
@@ -207,7 +319,7 @@ function cpuid:long ()
  * Description: This function returns the current cpu number.
  */
 function cpu:long ()
-%{ /* pure */ /* unprivileged */
+%{ /* pure */ /* unprivileged */ /* stable */
 	STAP_RETVALUE = smp_processor_id();
 %}
 
@@ -220,7 +332,7 @@ function cpu:long ()
  * when called from a begin or end probe.
  */
 function registers_valid:long ()
-%{ /* pure */ /* unprivileged */
+%{ /* pure */ /* unprivileged */ /* stable */
 	STAP_RETVALUE = (c->user_mode_p
 			    ? (CONTEXT->uregs != NULL)
 			    : (CONTEXT->kregs != NULL));
@@ -232,7 +344,7 @@ function registers_valid:long ()
  * Return 1 if the probe point occurred in user-mode.
  */
 function user_mode:long ()
-%{ /* pure */ /* unprivileged */
+%{ /* pure */ /* unprivileged */ /* stable */
   STAP_RETVALUE = CONTEXT->user_mode_p ? 1 : 0;
 %}
 
@@ -243,7 +355,7 @@ function user_mode:long ()
  * returns 0 otherwise.
  */
 function is_return:long ()
-%{ /* pure */
+%{ /* pure */ /* stable */
 	if (CONTEXT->probe_type == stp_probe_type_kretprobe
 	    || CONTEXT->probe_type == stp_probe_type_uretprobe)
 		STAP_RETVALUE = 1;
@@ -266,7 +378,7 @@ function is_return:long ()
  * target() returns the pid for the executed command specified by -c
  */
 function target:long ()
-%{ /* pure */ /* unprivileged */
+%{ /* pure */ /* unprivileged */ /* stable */
         STAP_RETVALUE = _stp_target;
 %}
 
@@ -278,8 +390,33 @@ function target:long ()
  * or set by stap -m <module_name>.
  */
 function module_name:string ()
-%{ /* pure */ /* unprivileged */
+%{ /* pure */ /* unprivileged */ /* stable */
 	strlcpy(STAP_RETVALUE, THIS_MODULE->name, MAXSTRINGLEN);
+%}
+
+/**
+ * sfunction module_size - The module size of the current script
+ *
+ * Description: This function returns the sizes of various sections
+ * of the stap module.
+ */
+function module_size:string() %{
+    int ctx = num_online_cpus() * sizeof(struct context);
+    snprintf(STAP_RETVALUE, MAXSTRINGLEN, "%ludata/%lutext/%uctx/%unet/%ualloc kb",
+#ifdef STAPCONF_MODULE_LAYOUT
+	(unsigned long) (THIS_MODULE->core_layout.size - THIS_MODULE->core_layout.text_size)/1024,
+	(unsigned long) (THIS_MODULE->core_layout.text_size)/1024,
+#else
+#ifndef STAPCONF_GRSECURITY
+        (unsigned long) (THIS_MODULE->core_size - THIS_MODULE->core_text_size)/1024,
+        (unsigned long) (THIS_MODULE->core_text_size)/1024,
+#else
+        (unsigned long) (THIS_MODULE->core_size_rw - THIS_MODULE->core_size_rx)/1024,
+        (unsigned long) (THIS_MODULE->core_size_rx)/1024,
+#endif
+#endif
+        ctx/1024, _stp_allocated_net_memory/1024,
+        (_stp_allocated_memory - _stp_allocated_net_memory - ctx)/1024);
 %}
 
 /**
@@ -291,7 +428,7 @@ function module_name:string ()
  * the system.
  */
 function stp_pid:long ()
-%{ /* pure */
+%{ /* pure */ /* stable */
         STAP_RETVALUE = _stp_pid;
 %}
 
@@ -331,7 +468,7 @@ function remote_uri:string () {
  * Description: This function returns the size of the kernel stack.
  */
 function stack_size:long ()
-%{ /* pure */
+%{ /* pure */ /* stable */
         STAP_RETVALUE = THREAD_SIZE;
 %}
 
@@ -342,7 +479,7 @@ function stack_size:long ()
  * currently used in the kernel stack.
  */
 function stack_used:long ()
-%{ /* pure */
+%{ /* pure */ /* stable */
 	char a;
         STAP_RETVALUE = THREAD_SIZE - ((long)&a & (THREAD_SIZE-1));
 %}
@@ -354,7 +491,7 @@ function stack_used:long ()
  * currently available in the kernel stack.
  */
 function stack_unused:long ()
-%{ /* pure */
+%{ /* pure */ /* stable */
 	char a;
         STAP_RETVALUE = (long)&a & (THREAD_SIZE-1);
 %}
@@ -368,7 +505,7 @@ function stack_unused:long ()
  * like symname() and symdata().
  */
 function addr:long ()
-%{ /* pure */
+%{ /* pure */ /* stable */
   if (CONTEXT->user_mode_p) {
     STAP_RETVALUE = (intptr_t)(CONTEXT->uregs ? REG_IP(CONTEXT->uregs) : 0);
   } else {
@@ -387,7 +524,7 @@ function addr:long ()
  * where it entered the kernel.
  */
 function uaddr:long ()
-%{ /* pure */ /* myproc-unprivileged */
+%{ /* pure */ /* myproc-unprivileged */ /* stable */
   struct pt_regs *uregs;
 
   if (CONTEXT->user_mode_p)
@@ -418,12 +555,12 @@ function uaddr:long ()
 function cmdline_args:string(n:long, m:long, delim:string)
 {
   __args = "";
-  __mm = @cast(task_current(), "task_struct", "kernel<linux/sched.h>")->mm;
+  __mm = task_current()->mm;
   if (__mm == 0)
     return "";
 
-  __arg_start = @cast(__mm, "mm_struct", "kernel<linux/sched.h>")->arg_start;
-  __arg_end = @cast(__mm, "mm_struct", "kernel<linux/sched.h>")->arg_end;
+  __arg_start = __mm->arg_start;
+  __arg_end = __mm->arg_end;
   if (__arg_start == 0 || __arg_end == 0)
     return "";
 
@@ -432,7 +569,7 @@ function cmdline_args:string(n:long, m:long, delim:string)
          (m<0 || __nr<=m); // caller still interested?
        __nr++) { 
 
-    __arg = user_string2(__arg_start, ""); // argv[__nr], unquoted
+    __arg = user_string(__arg_start, ""); // argv[__nr], unquoted
     __arg_start += strlen(__arg) + 1; // skip over for next iteration
 
     if (__nr == n)     // caller starting to get interested?

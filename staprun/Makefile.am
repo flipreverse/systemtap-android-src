@@ -1,7 +1,9 @@
 # Makefile.am --- automake input file for systemtap runtime tools
 
-AM_CFLAGS = -Wall -Werror -Wunused -W -Wformat=2 -Wno-format-nonliteral
-AM_CXXFLAGS = -Wall -Werror -Wunused -W -Wformat=2 -Wno-format-nonliteral
+AUTOMAKE_OPTIONS = subdir-objects
+
+AM_CFLAGS = -Wall -Wextra -Werror -Wunused -W -Wformat=2
+AM_CXXFLAGS = -Wall -Wextra -Werror -Wunused -W -Wformat=2
 AM_CPPFLAGS = -D_GNU_SOURCE
 AM_CPPFLAGS += -I$(srcdir)/../includes
 AM_CPPFLAGS += -I$(builddir)/../includes/sys
@@ -14,11 +16,18 @@ AM_LDFLAGS = @PIELDFLAGS@
 bin_PROGRAMS = staprun stap-merge stapsh
 pkglibexec_PROGRAMS = stapio
 
+# Tighten -Wno-format-nonliteral to just where it's needed.
+# See the automake manual secton: "Per-Object Flags Emulation"
+#   https://www.gnu.org/software/automake/manual/html_node/Per_002dObject-Flags.html
+noinst_LIBRARIES = libstrfloctime.a
+libstrfloctime_a_SOURCES = strfloctime.c
+libstrfloctime_a_CFLAGS = $(AM_CFLAGS) -Wno-format-nonliteral
+
 staprun_SOURCES = staprun.c staprun_funcs.c ctl.c common.c ../privilege.cxx ../util.cxx
 staprun_CFLAGS = $(AM_CFLAGS) -DSINGLE_THREADED
 staprun_CXXFLAGS = $(AM_CXXFLAGS) -DSINGLE_THREADED
 staprun_CPPFLAGS = $(AM_CPPFLAGS)
-staprun_LDADD = $(staprun_LIBS)
+staprun_LDADD = libstrfloctime.a $(staprun_LIBS)
 staprun_LDFLAGS =  $(AM_LDFLAGS)
 if BUILD_ELFUTILS
 staprun_CPPFLAGS += -I../include-elfutils
@@ -33,8 +42,12 @@ staprun_CXXFLAGS += $(nss_CFLAGS)
 staprun_LDADD += $(nss_LIBS)
 endif
 
-stapio_SOURCES = stapio.c mainloop.c common.c ctl.c relay.c relay_old.c
-stapio_LDADD = -lpthread
+if HAVE_MONITOR_LIBS
+AM_CFLAGS += $(jsonc_LIBS) $(ncurses_LIBS)
+endif
+
+stapio_SOURCES = stapio.c mainloop.c common.c ctl.c relay.c relay_old.c monitor.c
+stapio_LDADD = libstrfloctime.a -lpthread
 
 man_MANS = staprun.8
 

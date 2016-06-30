@@ -6,6 +6,7 @@ if {![dyninst_p]} {
     return
 }
 
+set effective_uid [exec /usr/bin/id -u]
 foreach file [lsort [glob -nocomplain $srcdir/$self/*.stp]] {
     set test $self/[file tail $file]
     verbose -log "Running $file ($runtime)"
@@ -23,6 +24,7 @@ foreach file [lsort [glob -nocomplain $srcdir/$self/*.stp]] {
 	buildok/alias_suffixes06.stp -
 	buildok/atomic.stp -
 	buildok/aux_syscalls-embedded.stp -
+	buildok/context-embedded-ns.stp -
 	buildok/context-embedded.stp -
 	buildok/context-symbols-embedded.stp -
 	buildok/context-unwind-embedded.stp -
@@ -55,6 +57,7 @@ foreach file [lsort [glob -nocomplain $srcdir/$self/*.stp]] {
 	buildok/ipmib-detailed.stp -
 	buildok/ipmib-embedded.stp -
 	buildok/iterate_histogram_buckets.stp -
+	buildok/json-detailed.stp -
 	buildok/kprocess-all-probes.stp -
 	buildok/kprocess-detailed.stp -
 	buildok/kprocess-embedded.stp -
@@ -71,6 +74,7 @@ foreach file [lsort [glob -nocomplain $srcdir/$self/*.stp]] {
 	buildok/nd_syscalls-arch-detailed.stp -
 	buildok/nd_syscalls-detailed.stp -
 	buildok/nd_syscalls2-detailed.stp -
+	buildok/netfilter-glob.stp -
 	buildok/netfilter01.stp -
 	buildok/netfilter02.stp -
 	buildok/netfilter03.stp -
@@ -98,6 +102,7 @@ foreach file [lsort [glob -nocomplain $srcdir/$self/*.stp]] {
 	buildok/proc_mem-embedded.stp -
 	buildok/process_test.stp -
 	buildok/procfs01.stp -
+	buildok/profiletimer.stp -
 	buildok/queue_stats-embedded.stp -
 	buildok/rcu.stp -
 	buildok/rpc-all-probes.stp -
@@ -129,6 +134,8 @@ foreach file [lsort [glob -nocomplain $srcdir/$self/*.stp]] {
 	buildok/syscalls2-detailed.stp -
 	buildok/systemtap_privilege.stp -
 	buildok/task-embedded.stp -
+	buildok/task_ns.stp -
+	buildok/task_rlimit_test.stp -
 	buildok/task_test.stp -
 	buildok/task_time-embedded.stp -
 	buildok/tcp-all-probes.stp -
@@ -179,6 +186,16 @@ foreach file [lsort [glob -nocomplain $srcdir/$self/*.stp]] {
 	    # failures when running with the dyninst runtime (scripts
 	    # that use utrace-like probes)
 	    if {$rc != 0} { setup_kfail 14708 *-*-* } }
+
+	buildok/stap_staticmarkers-detailed.stp {
+	    # Use setup_kfail ROOT_ONLY for tests that must be run as
+	    # root.
+	    #
+	    # In the case of stap_staticmarkers-detailed.stp, it
+	    # probes "staprun", which is only readable by root.
+	    if {$rc != 0 && $effective_uid != 0} {
+		setup_kfail ROOT_ONLY *-*-* }
+	}
     }
 
     if {$rc == 0} { pass "$test ($runtime)" } else { fail "$test ($runtime)" }

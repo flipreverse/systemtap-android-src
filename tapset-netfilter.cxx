@@ -1,5 +1,5 @@
 // tapset for netfilter hooks
-// Copyright (C) 2012 Red Hat Inc.
+// Copyright (C) 2012-2014 Red Hat Inc.
 //
 // This file is part of systemtap, and is free software.  You can
 // redistribute it and/or modify it under the terms of the GNU General
@@ -54,10 +54,9 @@ public:
 
 struct netfilter_var_expanding_visitor: public var_expanding_visitor
 {
-  netfilter_var_expanding_visitor(systemtap_session& s, const string& pn);
+  netfilter_var_expanding_visitor(systemtap_session& s);
 
   systemtap_session& sess;
-  string probe_name;
   set<string> context_vars;
 
   void visit_target_symbol (target_symbol* e);
@@ -205,7 +204,7 @@ netfilter_derived_probe::netfilter_derived_probe (systemtap_session &s, probe* p
     }
 
   // Expand local variables in the probe body
-  netfilter_var_expanding_visitor v (s, name);
+  netfilter_var_expanding_visitor v (s);
   v.replace (this->body);
 
   // Create probe-local vardecls, before symbol resolution might make
@@ -232,6 +231,7 @@ netfilter_derived_probe::join_group (systemtap_session& s)
   if (! s.netfilter_derived_probes)
     s.netfilter_derived_probes = new netfilter_derived_probe_group ();
   s.netfilter_derived_probes->enroll (this);
+  this->group = s.netfilter_derived_probes;
 }
 
 
@@ -264,10 +264,28 @@ netfilter_derived_probe_group::emit_module_decls (systemtap_session& s)
       netfilter_derived_probe *np = probes[i];
       s.op->newline() << "static unsigned int enter_netfilter_probe_" << np->nf_index;
 
-      // Previous to kernel 2.6.22, the hookfunction definition takes a struct sk_buff **skb,
-      // whereas currently it uses a *skb. We need emit the right version so this will
-      // compile on RHEL5, for example.
-      s.op->newline() << "#if LINUX_VERSION_CODE > KERNEL_VERSION(2,6,22)";
+      // Previous to kernel 2.6.22, the hookfunction definition takes
+      // a struct sk_buff **skb, whereas currently it uses a *skb. We
+      // need emit the right version so this will compile on RHEL5,
+      // for example.
+      s.op->newline() << "#if defined(STAPCONF_NETFILTER_V44)";
+      s.op->newline() << "(void *priv, struct sk_buff *nf_skb, const struct nf_hook_state *nf_state)";
+      s.op->newline() << "{";
+      s.op->newline() << "#elif defined(STAPCONF_NETFILTER_V41)";
+      s.op->newline() << "(const struct nf_hook_ops *nf_ops, struct sk_buff *nf_skb, const struct nf_hook_state *nf_state)";
+      s.op->newline() << "{";
+      s.op->newline() << "#elif defined(STAPCONF_NETFILTER_V313)";
+
+      s.op->newline() << "(const struct nf_hook_ops *nf_ops, struct sk_buff *nf_skb, const struct net_device *nf_in, const struct net_device *nf_out, int (*nf_okfn)(struct sk_buff *))";
+      s.op->newline() << "{";
+
+      s.op->newline() << "#elif defined(STAPCONF_NETFILTER_V313B)";
+
+      s.op->newline() << "(const struct nf_hook_ops *nf_ops, struct sk_buff *nf_skb, const struct net_device *nf_in, const struct net_device *nf_out, const struct nf_hook_state *nf_state)";
+      s.op->newline() << "{";
+
+      s.op->newline() << "#elif LINUX_VERSION_CODE > KERNEL_VERSION(2,6,22)";
+
       s.op->newline() << "(unsigned int nf_hooknum, struct sk_buff *nf_skb, const struct net_device *nf_in, const struct net_device *nf_out, int (*nf_okfn)(struct sk_buff *))";
       s.op->newline() << "{";
 
@@ -280,13 +298,27 @@ netfilter_derived_probe_group::emit_module_decls (systemtap_session& s)
       s.op->newline(-1) << "#endif";
       s.op->newline(1) << "const struct stap_probe * const stp = & stap_probes[" << np->session_index << "];";
       s.op->newline() << "int nf_verdict = NF_ACCEPT;"; // default NF_ACCEPT, to be used by $verdict context var
+      s.op->newline() << "#if defined(STAPCONF_NETFILTER_V44)";
+      s.op->newline() << "unsigned int nf_hooknum = nf_state->hook;";
+      s.op->newline() << "#elif defined(STAPCONF_NETFILTER_V313) || defined(STAPCONF_NETFILTER_V313B) || defined(STAPCONF_NETFILTER_V41)";
+      s.op->newline() << "unsigned int nf_hooknum = nf_ops->hooknum;";
+      s.op->newline() << "#endif";
+      s.op->newline() << "#if defined(STAPCONF_NETFILTER_V41) || defined(STAPCONF_NETFILTER_V44)";
+      s.op->newline() << "struct net_device *nf_in = nf_state->in;";
+      s.op->newline() << "struct net_device *nf_out = nf_state->out;";
+      s.op->newline() << "#endif";
+      s.op->newline() << "#if defined(STAPCONF_NETFILTER_V44)";
+      s.op->newline() << "int (*nf_okfn)(struct net *, struct sock *, struct sk_buff *) = nf_state->okfn;";
+      s.op->newline() << "#elif defined(STAPCONF_NETFILTER_V41)";
+      s.op->newline() << "int (*nf_okfn)(struct sock *, struct sk_buff *) = nf_state->okfn;";
+      s.op->newline() << "#endif";
       common_probe_entryfn_prologue (s, "STAP_SESSION_RUNNING", "stp",
                                      "stp_probe_type_netfilter",
                                      false);
 
       // Copy or pretend-to-touch each incoming parameter.
 
-      string c_p = "c->probe_locals." + lex_cast(np->name); // this is where the $context vars show up
+      string c_p = "c->probe_locals." + lex_cast(np->name()); // this is where the $context vars show up
       // NB: PR14137: this should be the potentially shared name,
       // since the generated probe handler body refers to that name.
 
@@ -303,7 +335,7 @@ netfilter_derived_probe_group::emit_module_decls (systemtap_session& s)
       else
         s.op->newline() << "(void) nf_in;";
       if (np->context_vars.find("__nf_out") != np->context_vars.end())
-        s.op->newline() << c_p + "." + s.up->c_localname("__nf_in") + " = (int64_t)(uintptr_t) nf_out;";
+        s.op->newline() << c_p + "." + s.up->c_localname("__nf_out") + " = (int64_t)(uintptr_t) nf_out;";
       else
         s.op->newline() << "(void) nf_out;";
       if (np->context_vars.find("__nf_verdict") != np->context_vars.end())
@@ -314,7 +346,7 @@ netfilter_derived_probe_group::emit_module_decls (systemtap_session& s)
       // Invoke the probe handler
       s.op->newline() << "(*stp->ph) (c);";
 
-      common_probe_entryfn_epilogue (s, false);
+      common_probe_entryfn_epilogue (s, false, otf_safe_context(s));
 
       if (np->context_vars.find("__nf_verdict") != np->context_vars.end())
         s.op->newline() << "if (c != NULL) nf_verdict = (int) "+c_p+"." + s.up->c_localname("__nf_verdict") + ";";
@@ -325,7 +357,9 @@ netfilter_derived_probe_group::emit_module_decls (systemtap_session& s)
       // now emit the nf_hook_ops struct for this probe.
       s.op->newline() << "static struct nf_hook_ops netfilter_opts_" << np->nf_index << " = {";
       s.op->newline() << ".hook = enter_netfilter_probe_" << np->nf_index << ",";
+      s.op->newline() << "#ifndef STAPCONF_NETFILTER_V44";
       s.op->newline() << ".owner = THIS_MODULE,";
+      s.op->newline() << "#endif";
 
       // XXX: if these strings/numbers are not range-limited / validated before we get here,
       // ie during the netfilter_derived_probe ctor, then we will emit potential trash here,
@@ -382,9 +416,8 @@ netfilter_derived_probe_group::emit_module_exit (systemtap_session& s)
 }
 
 
-netfilter_var_expanding_visitor::netfilter_var_expanding_visitor (systemtap_session& s,
-                                                                  const string& pn):
-  sess (s), probe_name (pn)
+netfilter_var_expanding_visitor::netfilter_var_expanding_visitor (systemtap_session& s):
+  sess (s)
 {
 }
 
@@ -459,9 +492,9 @@ netfilter_builder::build(systemtap_session & sess,
     literal_map_t const & parameters,
     vector<derived_probe *> & finished_results)
 {
-  string hook;                // no default
-  string pf; // no default
-  string priority = "0";      // Default: somewhere in the middle
+  interned_string hook;                // no default
+  interned_string pf; // no default
+  interned_string priority = "0";      // Default: somewhere in the middle
 
   if(!get_param(parameters, TOK_HOOK, hook))
     throw SEMANTIC_ERROR (_("missing hooknum"));

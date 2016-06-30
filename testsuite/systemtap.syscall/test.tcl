@@ -27,9 +27,12 @@ proc bgerror {error} {
 trap {syscall_cleanup_and_exit} SIGINT
 
 proc run_one_test {filename flags bits suite} {
-    global syscall_dir current_dir test_script
+    global syscall_dir current_dir test_module
 
     set testname [file tail [string range $filename 0 end-2]]
+
+    # execname() returns the first 15 chars of the test exe name.
+    set re_testname [string range $testname 0 14]
 
     if {[catch {exec mktemp -d [pwd]/staptestXXXXXX} syscall_dir]} {
 	send_log "$bits-bit $testname $suite : Failed to create temporary directory: $syscall_dir"
@@ -38,7 +41,8 @@ proc run_one_test {filename flags bits suite} {
 	return
     }
 
-    set res [target_compile $filename $syscall_dir/$testname executable $flags]
+    set flags "$flags additional_flags=-lrt"
+    set res [target_compile $filename $syscall_dir/$testname executable $flags ]
     if { $res != "" } {
 	send_log "$bits-bit $testname $suite : no corresponding devel environment found\n"
 	untested "$bits-bit $testname $suite"
@@ -46,8 +50,10 @@ proc run_one_test {filename flags bits suite} {
 	return
     }
 
-    set sys_prog "[file dirname [file normalize $filename]]/${test_script}"
-    set cmd "stap --skip-badvars -c $syscall_dir/${testname} ${sys_prog}"
+    # Use -R here, in case a previous staprun hangs up or leaves the
+    # syscall.ko module in memory, which would block all subsequent
+    # invocations.
+    set cmd "staprun -R ${test_module} -c $syscall_dir/${testname}"
     
     # Extract additional C flags needed to compile
     set add_flags ""
@@ -68,7 +74,7 @@ proc run_one_test {filename flags bits suite} {
     set ind 0
     foreach line [split $output "\n"] {
 	if {[regsub {//staptest//} $line {} line]} {
-	    set line "$testname: [string trimleft $line]"
+	    set line "$re_testname: [string trimleft $line]"
 
 	    # We need to quote all these metacharacters
 	    regsub -all {\(} $line {\\(} line
@@ -123,12 +129,12 @@ proc run_one_test {filename flags bits suite} {
     } else {
 	send_log "$testname FAILED. output of \"$cmd\" was:"
 	send_log "\n------------------------------------------\n"
-	send_log $output
+	send_log "$output"
 	send_log "\n------------------------------------------\n"
 	send_log "RESULTS: (\'*\' = MATCHED EXPECTED)\n"
 	set i 0
 	foreach line [split $output "\n"] {
-	    if {[regexp "${testname}: " $line]} {
+	    if {[regexp "${re_testname}: " $line]} {
 		if {[regexp $results($i) $line]} {
 		    send_log "*$line\n"
 		    incr i

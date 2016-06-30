@@ -217,7 +217,7 @@ widgets (void)
   printf ("|%35W|\n", &mywidget);
   printf ("|%-35W|\n", &mywidget);
 
-  return;
+  return 0;
 }
 
 
@@ -248,6 +248,20 @@ datetime (void)
 #endif
 
 
+#if defined (LIBPLT1) // decls for LIBPLT2 pieces
+void * fatal (const char *ptr);
+void * xmalloc (size_t size);
+char * savestring (const char *ptr);
+int open2 (char *str1, char *str2, int flags);
+int open3 (char *str1, char *str2, int flags);
+char * basename2 (char *prog);
+int critters (void);
+int widgets (void);
+int datetime (void);
+#endif
+
+
+
 #if defined (LIBPLT1) || defined (NOLIBPLT)
 void
 zenme ()
@@ -264,9 +278,12 @@ zenme ()
 #endif
 
 #if defined (NOLIBPLT) || defined (ONLY_MAIN)
+void zenme (void);
+
 int
 main ()
 {
   zenme ();
+  return 0;
 }
 #endif

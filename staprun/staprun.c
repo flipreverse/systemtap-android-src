@@ -2,7 +2,7 @@
  *
  * staprun.c - SystemTap module loader
  *
- * Copyright (C) 2005-2013 Red Hat, Inc.
+ * Copyright (C) 2005-2014 Red Hat, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -21,6 +21,7 @@
 
 #define _XOPEN_SOURCE
 #define _BSD_SOURCE
+#define _DEFAULT_SOURCE
 #include "staprun.h"
 #include "../privilege.h"
 #include "../runtime/k_syms.h"
@@ -48,10 +49,6 @@ static int stap_module_inserted = -1;
 static void term_signal_handler(int signum __attribute ((unused)))
 {
 	if (stap_module_inserted == 0) {
-		// We have to close the control channel so that
-		// remove_module() can open it back up (which it does
-		// to make sure the module is a systemtap module).
-		close_ctl_channel();
 		remove_module(modname, 1);
 		free(modname);
 	}
@@ -188,7 +185,7 @@ static int insert_stap_module(privilege_t *user_credentials)
 
 	/* Add the _stp_bufsize option.  */
 	if (snprintf_chk(special_options, sizeof (special_options),
-			 "_stp_bufsize=%d", buffer_size))
+			 "_stp_bufsize=%d", (int)buffer_size))
 		return -1;
 
         fips_mode_fd = open("/proc/sys/crypto/fips_enabled", O_RDONLY);
@@ -433,7 +430,7 @@ int main(int argc, char **argv)
 	if (optind < argc) {
 		if (attach_mod) {
 			err("Cannot have module options with attach (-A).\n");
-			usage(argv[0]);
+			usage(argv[0],1);
 		} else {
 			unsigned start_idx = 0;
 			while (optind < argc && start_idx + 1 < MAXMODOPTIONS)
@@ -444,13 +441,21 @@ int main(int argc, char **argv)
 
 	if (modpath == NULL || *modpath == '\0') {
 		err("Need a module name or path to load.\n");
-		usage(argv[0]);
+		usage(argv[0],1);
 	}
 
 	if (geteuid() != 0) {
 		err("The effective user ID of staprun must be set to the root user.\n"
 		    "  Check permissions on staprun and ensure it is a setuid root program.\n");
 		exit(1);
+	}
+
+	char verbose_level[33];
+	sprintf(verbose_level, "%d", verbose);
+	rc = setenv("SYSTEMTAP_VERBOSE", verbose_level, 0);
+	if (rc) {
+		_perr("SYSTEMTAP_VERBOSE setenv failed");
+		exit(-1);
 	}
 
 	if (init_staprun())
@@ -466,14 +471,14 @@ int main(int argc, char **argv)
            us to extend argv[], with all the C fun that entails. */
 #ifdef HAVE_OPENAT
         if (relay_basedir_fd >= 0) {
-                char ** new_argv = calloc(sizeof(char *),argc+1);
+                char ** new_argv = calloc(sizeof(char *),argc+2);
                 const int new_Foption_size = 10; /* -FNNNNN */
                 char * new_Foption = malloc(new_Foption_size);
                 int i;
 
                 if (new_argv && new_Foption) {
                         snprintf (new_Foption, new_Foption_size, "-F%d", relay_basedir_fd);
-                        for (i=0; argv[i] != NULL; i++)
+                        for (i=0; i < argc && argv[i] != NULL; i++)
                                 new_argv[i] = argv[i];
                         new_argv[i++] = new_Foption; /* overwrite the NULL */
                         new_argv[i++] = NULL; /* ensconce a new NULL */

@@ -1,7 +1,7 @@
 // memory/vm related tapset
 // Copyright (C) 2005, 2006 IBM Corp.
 // Copyright (C) 2006 Intel Corporation.
-// Copyright (C) 2010 Red Hat Inc.
+// Copyright (C) 2014 Red Hat Inc.
 //
 // This file is part of systemtap, and is free software.  You can
 // redistribute it and/or modify it under the terms of the GNU General
@@ -64,8 +64,8 @@ function vm_fault_contains:long (value:long, test:long)
  *
  * Context: The process which triggered the fault
  */
-probe vm.pagefault = kernel.function("__handle_mm_fault@mm/memory.c") ?,
-                     kernel.function("handle_mm_fault@mm/memory.c") ?
+probe vm.pagefault = kernel.function("handle_mm_fault@mm/memory.c").call !,
+		     kernel.function("__handle_mm_fault@mm/memory.c").call
 {
 	name = "pagefault"
 	write_access = (@defined($flags)
@@ -84,8 +84,8 @@ probe vm.pagefault = kernel.function("__handle_mm_fault@mm/memory.c") ?,
  * nor major fault.
  */
 probe vm.pagefault.return =
-		kernel.function("__handle_mm_fault@mm/memory.c").return ?,
-		kernel.function("handle_mm_fault@mm/memory.c").return ?
+		kernel.function("handle_mm_fault@mm/memory.c").return !,
+		kernel.function("__handle_mm_fault@mm/memory.c").return
 {
 	name = "pagefault"
 	fault_type = $return
@@ -125,7 +125,7 @@ function addr_to_node:long(addr:long) %{ /* pure */
 %}
 
 // Return whether a page to be copied is a zero page.
-function _IS_ZERO_PAGE:long(from:long, vaddr:long) %{ /* pure */
+@__private30 function _IS_ZERO_PAGE:long(from:long, vaddr:long) %{ /* pure */
     STAP_RETVALUE = (STAP_ARG_from == (long) ZERO_PAGE(STAP_ARG_vaddr));
 %}
 
@@ -186,7 +186,9 @@ probe vm.write_shared_copy =  kernel.function("cow_user_page") ?,
  * Context:
  *  The process calling mmap.
  */
-probe vm.mmap = kernel.function("vm_mmap")?, kernel.function("do_mmap")?, kernel.function("do_mmap2")?
+probe vm.mmap = kernel.function("vm_mmap") !,
+		kernel.function("do_mmap_pgoff") !,
+		kernel.function("do_mmap") ?, kernel.function("do_mmap2") ?
 {
     name = "mmap"
     address = $addr
@@ -243,12 +245,12 @@ probe vm.oom_kill = kernel.function("oom_kill_process") !,
     task = $p
 }
 
-function GFP_KERNEL:long()
-%{ /* pure */ /* unprivileged */
+@__private30 function GFP_KERNEL:long()
+%{ /* pure */ /* stable */ /* unprivileged */
 	STAP_RETVALUE = GFP_KERNEL;
 %}
 
-function __gfp_flag_str:string(gfp_flag:long)
+@__private30 function __gfp_flag_str:string(gfp_flag:long)
 %{
 	long gfp_flag = STAP_ARG_gfp_flag;
 	STAP_RETVALUE[0] = '\0';

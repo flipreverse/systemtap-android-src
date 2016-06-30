@@ -1,5 +1,5 @@
 // Copyright (C) Andrew Tridgell 2002 (original file)
-// Copyright (C) 2006-2011 Red Hat Inc. (systemtap changes)
+// Copyright (C) 2006-2014 Red Hat Inc. (systemtap changes)
 //
 // This program is free software; you can redistribute it and/or
 // modify it under the terms of the GNU General Public License as
@@ -24,6 +24,7 @@
 #include <fstream>
 #include <cassert>
 #include <ext/stdio_filebuf.h>
+#include <algorithm>
 
 extern "C" {
 #include <elf.h>
@@ -307,7 +308,7 @@ getmemusage ()
 
 void
 tokenize(const string& str, vector<string>& tokens,
-	 const string& delimiters = " ")
+	 const string& delimiters)
 {
   // Skip delimiters at beginning.
   string::size_type lastPos = str.find_first_not_of(delimiters, 0);
@@ -329,7 +330,7 @@ tokenize(const string& str, vector<string>& tokens,
 // last delimiter and allow internal empty tokens
 void
 tokenize_full(const string& str, vector<string>& tokens,
-	      const string& delimiters = " ")
+	      const string& delimiters)
 {
   // Check for an empty string or a string of length 1. Neither can have the requested
   // components.
@@ -496,6 +497,15 @@ string find_executable(const string& name, const string& sysroot,
 }
 
 
+bool is_fully_resolved(const string& path, const string& sysroot,
+		       const map<string, string>& sysenv,
+		       const string& env_path)
+{
+  return !path.empty()
+      && !contains_glob_chars(path)
+      && path.find('/') != string::npos
+      && path == find_executable(path, sysroot, sysenv, env_path);
+}
 
 const string cmdstr_quoted(const string& cmd)
 {
@@ -527,6 +537,18 @@ const string cmdstr_quoted(const string& cmd)
 	return quoted_cmd;
 }
 
+const string
+detox_path(const string& str)
+{
+  ostringstream hash;
+  for (int i=0; i<int(str.length()); i++)
+    if (isalnum(str[i]))
+      hash << str[i];
+    else
+      hash << "_";
+  hash << "_";
+  return hash.str();
+}
 
 const string
 cmdstr_join(const vector<string>& cmds)
@@ -540,6 +562,21 @@ cmdstr_join(const vector<string>& cmds)
     cmd << " " << cmdstr_quoted(cmds[i]);
 
   return cmd.str();
+}
+
+
+const string
+join(const vector<string>& vec, const string &delim)
+{
+  if (vec.empty())
+    throw runtime_error(_("join called with an empty vector!"));
+
+  stringstream join_str;
+  join_str << vec[0];
+  for (size_t i = 1; i < vec.size(); ++i)
+    join_str << delim << vec[i];
+
+  return join_str.str();
 }
 
 
@@ -624,7 +661,8 @@ class spawned_pids_t {
 };
 static spawned_pids_t spawned_pids;
 
-
+/* Returns exit code of pid if terminated nicely, or 128+signal if terminated
+ * not nicely, or -1 if waitpid() failed. So if ret >= 0, it's the rc/signal */
 int
 stap_waitpid(int verbose, pid_t pid)
 {
@@ -637,7 +675,7 @@ stap_waitpid(int verbose, pid_t pid)
       spawned_pids.erase(pid);
       ret = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
       if (verbose > 1)
-        clog << _F("Spawn waitpid result (0x%x): %d", status, ret) << endl;
+        clog << _F("Spawn waitpid result (0x%x): %d", (unsigned)status, ret) << endl;
     }
   else
     {
@@ -867,6 +905,48 @@ stap_system_read(int verbose, const vector<string>& args, ostream& out)
 }
 
 
+std::pair<bool,int>
+stap_fork_read(int verbose, ostream& out)
+{
+  int pipefd[2];
+  if (pipe(pipefd) != 0)
+    return make_pair(false, -1);
+
+  fflush(stdout); cout.flush();
+
+  if (verbose > 1)
+    clog << _("Forking subprocess...") << endl;
+
+  pid_t child = fork();
+  PROBE1(stap, stap_system__fork, child);
+  // child < 0: fork failure
+  if (child < 0)
+    {
+      if (verbose > 1)
+        clog << _F("Fork error (%d): %s", child, strerror(errno)) << endl;
+      close(pipefd[0]);
+      close(pipefd[1]);
+      return make_pair(false, -1);
+    }
+  // child == 0: we're the child
+  else if (child == 0)
+    {
+      close(pipefd[0]);
+      fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
+      return make_pair(true, pipefd[1]);
+    }
+
+  // child > 0: we're the parent
+  spawned_pids.insert(child);
+
+  // read everything from the child
+  close(pipefd[1]);
+  stdio_filebuf<char> in(pipefd[0], ios_base::in);
+  out << &in;
+  return make_pair(false, stap_waitpid(verbose, child));
+}
+
+
 // Send a signal to our spawned commands
 int
 kill_stap_spawn(int sig)
@@ -990,7 +1070,39 @@ string unescape_glob_chars (const string& str)
   return op;
 }
 
+bool identifier_string_needs_escape (const string& str)
+{
+  for (unsigned i = 0; i < str.size (); i++)
+    {
+      char this_char = str[i];
+      if (! isalnum (this_char) && this_char != '_')
+	return true;
+    }
 
+  return false;
+}
+
+string escaped_indentifier_string (const string &str)
+{
+  if (! identifier_string_needs_escape (str))
+    return str;
+
+  string op;
+  for (unsigned i = 0; i < str.size (); i++)
+    {
+      char this_char = str[i];
+      if (! isalnum (this_char) && this_char != '_')
+	{
+	  char b[32];
+	  sprintf (b, "_%x_", (unsigned int) this_char);
+	  op += b;
+        }
+      else
+	op += this_char;
+    }
+
+  return op;
+}
 
 string
 normalize_machine(const string& machine)
@@ -1005,7 +1117,8 @@ normalize_machine(const string& machine)
   // But: RHBZ669082 reminds us that this renaming post-dates some
   // of the kernel versions we know and love.  So in buildrun.cxx
   // we undo this renaming for ancient powerpc.
-
+  //
+  // NB repeated: see also stap-env (stap_get_arch)
   if (machine == "i486") return "i386";
   else if (machine == "i586") return "i386";
   else if (machine == "i686") return "i386";
@@ -1019,6 +1132,7 @@ normalize_machine(const string& machine)
   else if (machine.substr(0,3) == "sh2") return "sh";
   else if (machine.substr(0,3) == "sh3") return "sh";
   else if (machine.substr(0,3) == "sh4") return "sh";
+  // NB repeated: see also stap-env (stap_get_arch)
   return machine;
 }
 
@@ -1098,6 +1212,23 @@ get_self_path()
   return string(file);
 }
 
+bool
+is_valid_pid (pid_t pid, string& err_msg)
+{
+  err_msg = "";
+  if (pid <= 0)
+    {
+      err_msg = _F("cannot probe pid %d: Invalid pid", pid);
+      return false;
+    }
+  else if (kill(pid, 0) == -1)
+    {
+      err_msg = _F("cannot probe pid %d: %s", pid, strerror(errno));
+      return false;
+    }
+  return true;
+}
+
 // String sorter using the Levenshtein algorithm
 // TODO: Performance may be improved by adding a maximum distance
 // parameter which would abort the operation if we know the final
@@ -1120,10 +1251,16 @@ levenshtein(const string& a, const string& b)
       if (a[i-1] == b[j-1]) // match
         d(i,j) = d(i-1, j-1);
       else // penalties open for adjustments
-        d(i,j) = min(min(
-            d(i-1,j-1) + 1,  // substitution
-            d(i-1,j)   + 1), // deletion
-            d(i,j-1)   + 1); // insertion
+        {
+          unsigned subpen = 2; // substitution penalty
+          // check if they are upper/lowercase related
+          if (tolower(a[i-1]) == tolower(b[j-1]))
+            subpen = 1; // half penalty
+          d(i,j) = min(min(
+              d(i-1,j-1) + subpen,  // substitution
+              d(i-1,j)   + 2), // deletion
+              d(i,j-1)   + 2); // insertion
+        }
     }
   }
 
@@ -1144,6 +1281,9 @@ levenshtein_suggest(const string& target,        // string to match against
   for (set<string>::const_iterator it = elems.begin();
                                       it != elems.end(); ++it)
     {
+      if (it->empty()) // skip empty strings
+        continue;
+
       // Approximate levenshtein by size-difference only; real score
       // is at least this high
       unsigned min_score = labs(target.size() - it->size());
@@ -1200,6 +1340,23 @@ levenshtein_suggest(const string& target,        // string to match against
 
   return suggestions;
 }
+
+string
+levenshtein_suggest(const string& target,        // string to match against
+                    const set<interned_string>& elems,// elements to suggest from
+                    unsigned max,                // max elements to print
+                    unsigned threshold)          // max leven score to print
+{
+  set<string> elems2;
+  for (set<interned_string>::const_iterator it = elems.begin();
+       it != elems.end();
+       it++)
+    elems2.insert(it->to_string());
+  
+  return levenshtein_suggest (target, elems2, max, threshold);
+  
+}
+
 
 #ifndef HAVE_PPOLL
 // This is a poor-man's ppoll, only used carefully by readers that need to be

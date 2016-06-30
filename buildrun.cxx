@@ -1,5 +1,5 @@
 // build/run probes
-// Copyright (C) 2005-2013 Red Hat Inc.
+// Copyright (C) 2005-2016 Red Hat Inc.
 //
 // This file is part of systemtap, and is free software.  You can
 // redistribute it and/or modify it under the terms of the GNU General
@@ -27,8 +27,13 @@ extern "C" {
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
+#include <sys/resource.h>
 }
 
+// A bit of obfuscation for Gentoo's sake.
+// We *need* -Werror for stapconf to work correctly.
+// https://bugs.gentoo.org/show_bug.cgi?id=522908
+#define WERROR ("-W" "error")
 
 using namespace std;
 
@@ -60,7 +65,14 @@ run_make_cmd(systemtap_session& s, vector<string>& make_cmd,
 
   // Exploit SMP parallelism, if available.
   long smp = sysconf(_SC_NPROCESSORS_ONLN);
-  if (smp >= 1)
+  if (smp <= 0) smp = 1;
+  // PR16276: but only if we're not running severely nproc-rlimited
+  struct rlimit rlim;
+  int rlimit_rc = getrlimit(RLIMIT_NPROC, &rlim);
+  const unsigned int severely_limited = smp*30; // WAG at number of gcc+make etc. nested processes
+  bool nproc_limited = (rlimit_rc == 0 && (rlim.rlim_max <= severely_limited || 
+                                           rlim.rlim_cur <= severely_limited));
+  if (smp >= 1 && !nproc_limited)
     make_cmd.push_back("-j" + lex_cast(smp+1));
 
   if (strverscmp (s.kernel_base_release.c_str(), "2.6.29") < 0)
@@ -202,7 +214,7 @@ compile_dyninst (systemtap_session& s)
   cmd.push_back("gcc");
   cmd.push_back("--std=gnu99");
   cmd.push_back("-Wall");
-  cmd.push_back("-Werror");
+  cmd.push_back(WERROR);
   cmd.push_back("-Wno-unused");
   cmd.push_back("-Wno-strict-aliasing");
 
@@ -232,6 +244,9 @@ compile_dyninst (systemtap_session& s)
       cmd.push_back("-ftime-report");
       cmd.push_back("-Q");
     }
+
+  // Add any custom kbuild flags
+  cmd.insert(cmd.end(), s.kbuildflags.begin(), s.kbuildflags.end());
 
   int rc = stap_system (s.verbose, cmd);
   if (rc)
@@ -271,9 +286,15 @@ compile_pass (systemtap_session& s)
   // Support O= (or KBUILD_OUTPUT) option
   o << "_KBUILD_CFLAGS := $(call flags,KBUILD_CFLAGS)" << endl;
 
-  o << "stap_check_gcc = $(shell " << superverbose << " if $(CC) $(1) -S -o /dev/null -xc /dev/null > /dev/null 2>&1; then echo \"$(1)\"; else echo \"$(2)\"; fi)" << endl;
-  o << "CHECK_BUILD := $(CC) $(NOSTDINC_FLAGS) $(KBUILD_CPPFLAGS) $(CPPFLAGS) $(LINUXINCLUDE) $(_KBUILD_CFLAGS) $(CFLAGS_KERNEL) $(EXTRA_CFLAGS) $(CFLAGS) -DKBUILD_BASENAME=\\\"" << s.module_name << "\\\"" << (s.omit_werror ? "" : " -Werror") << " -S -o /dev/null -xc " << endl;
-  o << "stap_check_build = $(shell " << superverbose << " if $(CHECK_BUILD) $(1) " << redirecterrors << " ; then echo \"$(2)\"; else echo \"$(3)\"; fi)" << endl;
+  o << "stap_check_gcc = $(shell " << superverbose
+    << " if $(CC) $(1) -S -o /dev/null -xc /dev/null > /dev/null 2>&1; then "
+    << "echo \"$(1)\"; else echo \"$(2)\"; fi)" << endl;
+  o << "CHECK_BUILD := $(CC) $(NOSTDINC_FLAGS) $(KBUILD_CPPFLAGS) $(CPPFLAGS) "
+    << "$(LINUXINCLUDE) $(_KBUILD_CFLAGS) $(CFLAGS_KERNEL) $(EXTRA_CFLAGS) "
+    << "$(CFLAGS) -DKBUILD_BASENAME=\\\"" << s.module_name << "\\\" "
+    << WERROR << " -S -o /dev/null -xc " << endl;
+  o << "stap_check_build = $(shell " << superverbose << " if $(CHECK_BUILD) $(1) "
+    << redirecterrors << " ; then echo \"$(2)\"; else echo \"$(3)\"; fi)" << endl;
 
   o << "SYSTEMTAP_RUNTIME = \"" << s.runtime_path << "\"" << endl;
 
@@ -291,8 +312,11 @@ compile_pass (systemtap_session& s)
   //      mflags-y += -Iinclude/asm-x86/mach-default
   // but that path does not exist in an O= build tree.
   o << module_cflags << " += -Iinclude2/asm/mach-default" << endl;
+  o << module_cflags << " += -I" + s.kernel_build_tree << endl;
   if (s.kernel_source_tree != "")
     o << module_cflags << " += -I" + s.kernel_source_tree << endl;
+  for (unsigned i = 0; i < s.kernel_extra_cflags.size(); i++)
+    o << module_cflags << " += " + s.kernel_extra_cflags[i] << endl;
 
   // NB: don't try
   // o << module_cflags << " += -Iusr/include" << endl;
@@ -300,8 +324,9 @@ compile_pass (systemtap_session& s)
 
   o << "STAPCONF_HEADER := " << s.tmpdir << "/" << s.stapconf_name << endl;
   o << "$(STAPCONF_HEADER):" << endl;
-  o << "\t@echo -n > $@" << endl;
+  o << "\t@> $@" << endl;
   output_autoconf(s, o, "autoconf-hrtimer-rel.c", "STAPCONF_HRTIMER_REL", NULL);
+  output_exportconf(s, o, "hrtimer_get_res", "STAPCONF_HRTIMER_GET_RES");
   output_autoconf(s, o, "autoconf-generated-compile.c", "STAPCONF_GENERATED_COMPILE", NULL);
   output_autoconf(s, o, "autoconf-hrtimer-getset-expires.c", "STAPCONF_HRTIMER_GETSET_EXPIRES", NULL);
   output_autoconf(s, o, "autoconf-inode-private.c", "STAPCONF_INODE_PRIVATE", NULL);
@@ -315,11 +340,17 @@ compile_pass (systemtap_session& s)
   output_autoconf(s, o, "autoconf-uaccess.c", "STAPCONF_LINUX_UACCESS_H", NULL);
   output_autoconf(s, o, "autoconf-oneachcpu-retry.c", "STAPCONF_ONEACHCPU_RETRY", NULL);
   output_autoconf(s, o, "autoconf-dpath-path.c", "STAPCONF_DPATH_PATH", NULL);
+  output_exportconf(s, o, "synchronize_kernel", "STAPCONF_SYNCHRONIZE_KERNEL");
+  output_exportconf(s, o, "synchronize_rcu", "STAPCONF_SYNCHRONIZE_RCU");
   output_exportconf(s, o, "synchronize_sched", "STAPCONF_SYNCHRONIZE_SCHED");
   output_autoconf(s, o, "autoconf-task-uid.c", "STAPCONF_TASK_UID", NULL);
+  output_autoconf(s, o, "autoconf-from_kuid_munged.c", "STAPCONF_FROM_KUID_MUNGED", NULL);
+  output_exportconf(s, o, "get_mm_exe_file", "STAPCONF_GET_MM_EXE_FILE");
   output_dual_exportconf(s, o, "alloc_vm_area", "free_vm_area", "STAPCONF_VM_AREA");
   output_autoconf(s, o, "autoconf-procfs-owner.c", "STAPCONF_PROCFS_OWNER", NULL);
   output_autoconf(s, o, "autoconf-alloc-percpu-align.c", "STAPCONF_ALLOC_PERCPU_ALIGN", NULL);
+  output_autoconf(s, o, "autoconf-x86-fs.c", "STAPCONF_X86_FS", NULL);
+  output_autoconf(s, o, "autoconf-x86-xfs.c", "STAPCONF_X86_XFS", NULL);
   output_autoconf(s, o, "autoconf-x86-gs.c", "STAPCONF_X86_GS", NULL);
   output_autoconf(s, o, "autoconf-grsecurity.c", "STAPCONF_GRSECURITY", NULL);
   output_autoconf(s, o, "autoconf-trace-printk.c", "STAPCONF_TRACE_PRINTK", NULL);
@@ -370,6 +401,12 @@ compile_pass (systemtap_session& s)
   output_autoconf(s, o, "autoconf-relay-umode_t.c", "STAPCONF_RELAY_UMODE_T", NULL);
   output_autoconf(s, o, "autoconf-fs_supers-hlist.c", "STAPCONF_FS_SUPERS_HLIST", NULL);
   output_autoconf(s, o, "autoconf-compat_sigaction.c", "STAPCONF_COMPAT_SIGACTION", NULL);
+  output_autoconf(s, o, "autoconf-netfilter.c", "STAPCONF_NETFILTER_V313", NULL);
+  output_autoconf(s, o, "autoconf-netfilter-313b.c", "STAPCONF_NETFILTER_V313B", NULL);
+  output_autoconf(s, o, "autoconf-netfilter-4_1.c", "STAPCONF_NETFILTER_V41", NULL);
+  output_autoconf(s, o, "autoconf-netfilter-4_4.c", "STAPCONF_NETFILTER_V44", NULL);
+  output_autoconf(s, o, "autoconf-smpcall-5args.c", "STAPCONF_SMPCALL_5ARGS", NULL);
+  output_autoconf(s, o, "autoconf-smpcall-4args.c", "STAPCONF_SMPCALL_4ARGS", NULL);
 
   // used by tapset/timestamp_monotonic.stp
   output_exportconf(s, o, "cpu_clock", "STAPCONF_CPU_CLOCK");
@@ -391,6 +428,8 @@ compile_pass (systemtap_session& s)
 
   // used by runtime/stp_utrace.c
   output_exportconf(s, o, "task_work_add", "STAPCONF_TASK_WORK_ADD_EXPORTED");
+  output_exportconf(s, o, "wake_up_state", "STAPCONF_WAKE_UP_STATE_EXPORTED");
+  output_exportconf(s, o, "try_to_wake_up", "STAPCONF_TRY_TO_WAKE_UP_EXPORTED");
   output_exportconf(s, o, "signal_wake_up_state", "STAPCONF_SIGNAL_WAKE_UP_STATE_EXPORTED");
   output_exportconf(s, o, "signal_wake_up", "STAPCONF_SIGNAL_WAKE_UP_EXPORTED");
   output_exportconf(s, o, "__lock_task_sighand", "STAPCONF___LOCK_TASK_SIGHAND_EXPORTED");
@@ -402,6 +441,17 @@ compile_pass (systemtap_session& s)
   output_exportconf(s, o, "vzalloc", "STAPCONF_VZALLOC");
   output_exportconf(s, o, "vzalloc_node", "STAPCONF_VZALLOC_NODE");
   output_exportconf(s, o, "vmalloc_node", "STAPCONF_VMALLOC_NODE");
+
+  // RHBZ1233912 - s390 temporary workaround for non-atomic udelay()
+  output_exportconf(s, o, "udelay_simple", "STAPCONF_UDELAY_SIMPLE");
+
+  output_autoconf(s, o, "autoconf-tracepoint-strings.c", "STAPCONF_TRACEPOINT_STRINGS", NULL);
+  output_autoconf(s, o, "autoconf-timerfd.c", "STAPCONF_TIMERFD_H", NULL);
+
+  output_autoconf(s, o, "autoconf-module_layout.c",
+		  "STAPCONF_MODULE_LAYOUT", NULL);
+  output_autoconf(s, o, "autoconf-mod_kallsyms.c",
+		  "STAPCONF_MOD_KALLSYMS", NULL);
 
   o << module_cflags << " += -include $(STAPCONF_HEADER)" << endl;
 
@@ -421,6 +471,9 @@ compile_pass (systemtap_session& s)
   // -Os, otherwise -O2 is the default.
   o << "EXTRA_CFLAGS += -freorder-blocks" << endl; // improve on -Os
 
+  // Generate eh_frame for self-backtracing
+  o << "EXTRA_CFLAGS += -fasynchronous-unwind-tables" << endl;
+
   // We used to allow the user to override default optimization when so
   // requested by adding a -O[0123s] so they could determine the
   // time/space/speed tradeoffs themselves, but we cannot guantantee that
@@ -434,8 +487,11 @@ compile_pass (systemtap_session& s)
   // XXX this doesn't validate varargs, per gcc bug #41633
   o << "EXTRA_CFLAGS += $(call cc-option,-Wframe-larger-than=512)" << endl;
 
+  // gcc 5.0.0-0.13.fc23 ipa-icf seems to consume gigacpu on stap-generated code
+  o << "EXTRA_CFLAGS += $(call cc-option,-fno-ipa-icf)" << endl;
+
   // Assumes linux 2.6 kbuild
-  o << "EXTRA_CFLAGS += -Wno-unused" << (s.omit_werror ? "" : " -Werror") << endl;
+  o << "EXTRA_CFLAGS += -Wno-unused " << WERROR << endl;
   #if CHECK_POINTER_ARITH_PR5947
   o << "EXTRA_CFLAGS += -Wpointer-arith" << endl;
   #endif
@@ -448,6 +504,7 @@ compile_pass (systemtap_session& s)
   o << s.module_name << "-y := ";
   for (unsigned i=0; i<s.auxiliary_outputs.size(); i++)
     {
+      if (s.auxiliary_outputs[i]->trailer_p) continue;
       string srcname = s.auxiliary_outputs[i]->filename;
       assert (srcname != "" && srcname.rfind('/') != string::npos);
       string objname = srcname.substr(srcname.rfind('/')+1); // basename
@@ -467,6 +524,17 @@ compile_pass (systemtap_session& s)
     objname[objname.size()-1] = 'o'; // now objname
     o << " " + objname;
   }
+  // and once again, for the trailer type auxiliary outputs.
+  for (unsigned i=0; i<s.auxiliary_outputs.size(); i++)
+    {
+      if (! s.auxiliary_outputs[i]->trailer_p) continue;
+      string srcname = s.auxiliary_outputs[i]->filename;
+      assert (srcname != "" && srcname.rfind('/') != string::npos);
+      string objname = srcname.substr(srcname.rfind('/')+1); // basename
+      assert (objname != "" && objname[objname.size()-1] == 'c');
+      objname[objname.size()-1] = 'o'; // now objname
+      o << " " + objname;
+    }
   o << endl;
 
   // add all stapconf dependencies
@@ -649,7 +717,7 @@ uprobes_pass (systemtap_session& s)
 static
 vector<string>
 make_dyninst_run_command (systemtap_session& s, const string& remotedir,
-			  const string& version)
+			  const string&)
 {
   vector<string> cmd;
   cmd.push_back(getenv("SYSTEMTAP_STAPDYN") ?: BINDIR "/stapdyn");
@@ -737,6 +805,12 @@ make_run_command (systemtap_session& s, const string& remotedir,
       staprun_cmd.push_back(lex_cast(s.target_pid));
     }
 
+  if (s.target_namespaces_pid)
+    {
+      staprun_cmd.push_back("-N");
+      staprun_cmd.push_back(lex_cast(s.target_namespaces_pid));
+    }
+
   if (s.buffer_size)
     {
       staprun_cmd.push_back("-b");
@@ -760,7 +834,10 @@ make_run_command (systemtap_session& s, const string& remotedir,
   if (s.load_only)
     staprun_cmd.push_back(s.output_file.empty() ? "-L" : "-D");
 
-  if(!s.modname_given && (strverscmp("1.6", version.c_str()) <= 0))
+  // Note that if this system requires signed modules, we can't rename
+  // it after it has been signed.
+  if (!s.modname_given && (strverscmp("1.6", version.c_str()) <= 0)
+      && s.mok_fingerprints.empty())
     staprun_cmd.push_back("-R");
 
   if (!s.size_option.empty())
@@ -776,6 +853,12 @@ make_run_command (systemtap_session& s, const string& remotedir,
         staprun_cmd.push_back("always");
       else
         staprun_cmd.push_back("never");
+    }
+
+  if (s.monitor)
+    {
+      staprun_cmd.push_back("-M");
+      staprun_cmd.push_back(lex_cast(s.monitor_interval));
     }
 
   staprun_cmd.push_back((remotedir.empty() ? s.tmpdir : remotedir)
@@ -813,12 +896,18 @@ make_tracequeries(systemtap_session& s, const map<string,string>& contents)
   string makefile(dir + "/Makefile");
   ofstream omf(makefile.c_str());
   // force debuginfo generation, and relax implicit functions
-  omf << "EXTRA_CFLAGS := -g -Wno-implicit-function-declaration" << (s.omit_werror ? "" : " -Werror") << endl;
+  omf << "EXTRA_CFLAGS := -g -Wno-implicit-function-declaration " << WERROR << endl;
   // RHBZ 655231: later rhel6 kernels' module-signing kbuild logic breaks out-of-tree modules
   omf << "CONFIG_MODULE_SIG := n" << endl;
 
+  // PR18389: disable GCC's Identical Code Folding, since the stubs may look identical
+  omf << "EXTRA_CFLAGS += $(call cc-option,-fno-ipa-icf)" << endl;
+
+  omf << "EXTRA_CFLAGS += -I" + s.kernel_build_tree << endl;
   if (s.kernel_source_tree != "")
     omf << "EXTRA_CFLAGS += -I" + s.kernel_source_tree << endl;
+  for (unsigned i = 0; i < s.kernel_extra_cflags.size(); i++)
+    omf << "EXTRA_CFLAGS += " + s.kernel_extra_cflags[i] << endl;
 
   omf << "obj-m := " << endl;
   // write out each header-specific source file into a separate file

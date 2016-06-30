@@ -47,7 +47,7 @@ enum {
 
 /* Try to be slightly paranoid. Only returns 1 if the task isn't
    starting, exiting or (coopted by) a kernel thread. */
-function _stp_valid_task:long(tsk:long)
+@__private30 function _stp_valid_task:long(tsk:long)
 %{
   struct task_struct *tsk = (struct task_struct *)(long)STAP_ARG_tsk;
 
@@ -61,56 +61,52 @@ function _stp_valid_task:long(tsk:long)
   CATCH_DEREF_FAULT();
 %}
 
-function _MM_FILEPAGES:long()
-%{ /* pure */ /* unprivileged */
+@__private30 function _MM_FILEPAGES:long()
+%{ /* pure */ /* stable */ /* unprivileged */
   STAP_RETVALUE = MM_FILEPAGES;
 %}
 
-function _MM_ANONPAGES:long()
-%{ /* pure */ /* unprivileged */
+@__private30 function _MM_ANONPAGES:long()
+%{ /* pure */ /* stable */ /* unprivileged */
   STAP_RETVALUE = MM_ANONPAGES;
 %}
 
-function _stp_get_mm_counter:long(mm:long, member:long)
+@__private30 function _stp_get_mm_counter:long(mm_ptr:long, member:long)
 {
+    mm = & @mm(mm_ptr)
     /* kernels >= 2.6.34, 3.0 (2.6.40 fedora) and later always use atomics */
-    if (@defined(&@cast(mm, "mm_struct", "kernel<linux/sched.h>")->rss_stat)) {
+    if (@defined(&@mm(0)->rss_stat)) {
 %( kernel_v >= "2.6.40" || CONFIG_NR_CPUS >= CONFIG_SPLIT_PTLOCK_CPUS %?
-	val = atomic_long_read(&@cast(mm, "mm_struct",
-			"kernel<linux/sched.h>")->rss_stat->count[member])
+	val = atomic_long_read(&mm->rss_stat->count[member])
 %:
-	val = @cast(mm, "mm_struct",
-		    "kernel<linux/sched.h>")->rss_stat->count[member]
+	val = mm->rss_stat->count[member]
 %)
 	if (val < 0)
 	    return 0
     }
     /* kernels < 2.6.34 && kernels >= 2.6.12 */
-    else if (@defined(&@cast(mm, "mm_struct",
-			     "kernel<linux/sched.h>")->_file_rss)) {
+    else if (@defined(&@mm(0)->_file_rss)) {
 	if (member == _MM_FILEPAGES()) {
 %( CONFIG_NR_CPUS >= CONFIG_SPLIT_PTLOCK_CPUS %?
-	    val = atomic_long_read(&@cast(mm, "mm_struct",
-				   "kernel<linux/sched.h>")->_file_rss)
+	    val = atomic_long_read(&mm->_file_rss)
 %:
-	    val = @cast(mm, "mm_struct", "kernel<linux/sched.h>")->_file_rss
+	    val = mm->_file_rss
 %)
 	}
 	else if (member == _MM_ANONPAGES()) {
 %( CONFIG_NR_CPUS >= CONFIG_SPLIT_PTLOCK_CPUS %?
-	    val = atomic_long_read(&@cast(mm, "mm_struct",
-				   "kernel<linux/sched.h>")->_anon_rss)
+	    val = atomic_long_read(&mm->_anon_rss)
 %:
-	    val = @cast(mm, "mm_struct", "kernel<linux/sched.h>")->_anon_rss
+	    val = mm->_anon_rss
 %)
 	}
     }
     /* kernels < 2.6.12 */
     else {
 	if (member == _MM_FILEPAGES())
-	    val = @cast(mm, "mm_struct", "kernel<linux/sched.h>")->rss
+	    val = mm->rss
 	else if (member == _MM_ANONPAGES())
-	    val = @cast(mm, "mm_struct", "kernel<linux/sched.h>")->anon_rss
+	    val = mm->anon_rss
     }
     return val
 }
@@ -126,15 +122,15 @@ function proc_mem_size:long ()
 {
    task = task_current()
    if (_stp_valid_task(task)) {
-     mm = @cast(task, "task_struct", "kernel<linux/sched.h>")->mm
+     mm = task->mm
      if (mm != 0)
-       return @cast(mm, "mm_struct", "kernel<linux/sched.h>")->total_vm
+       return mm->total_vm
    }
    return 0
 }
 
 /**
- * sfunction proc_mem_size_pid - Total program virtual memory size in pages
+ * sfunction proc_mem_size - Total program virtual memory size in pages
  *
  * @pid: The pid of process to examine
  *
@@ -142,16 +138,28 @@ function proc_mem_size:long ()
  * given process, or zero when that process doesn't exist or the
  * number of pages couldn't be retrieved.
  */
+function proc_mem_size:long (pid:long)
+{
+  task = pid2task(pid)
+  if (_stp_valid_task(task)) {
+    mm = task->mm
+    if (mm != 0)
+      return mm->total_vm
+  }
+  return 0
+}
+%(systemtap_v <= "3.0" %?
 function proc_mem_size_pid:long (pid:long)
 {
   task = pid2task(pid)
   if (_stp_valid_task(task)) {
-    mm = @cast(task, "task_struct", "kernel<linux/sched.h>")->mm
+    mm = task->mm
     if (mm != 0)
-      return @cast(mm, "mm_struct", "kernel<linux/sched.h>")->total_vm
+      return mm->total_vm
   }
   return 0
 }
+%)
 
 /**
  * sfunction proc_mem_rss - Program resident set size in pages
@@ -164,7 +172,7 @@ function proc_mem_rss:long ()
 {
   task = task_current()
   if (_stp_valid_task(task)) {
-    mm = @cast(task, "task_struct", "kernel<linux/sched.h>")->mm
+    mm = task->mm
     if (mm != 0)
       return (_stp_get_mm_counter(mm, _MM_FILEPAGES())
 	      + _stp_get_mm_counter(mm, _MM_ANONPAGES()))
@@ -173,7 +181,7 @@ function proc_mem_rss:long ()
 }
 
 /**
- * sfunction proc_mem_rss_pid - Program resident set size in pages
+ * sfunction proc_mem_rss - Program resident set size in pages
  *
  * @pid: The pid of process to examine
  *
@@ -181,17 +189,30 @@ function proc_mem_rss:long ()
  * process, or zero when the process doesn't exist or the number of
  * pages couldn't be retrieved.
  */
-function proc_mem_rss_pid:long (pid:long)
+function proc_mem_rss:long (pid:long)
 {
   task = pid2task(pid)
   if (_stp_valid_task(task)) {
-    mm = @cast(task, "task_struct", "kernel<linux/sched.h>")->mm
+    mm = task->mm
     if (mm != 0)
         return (_stp_get_mm_counter(mm, _MM_FILEPAGES())
                 + _stp_get_mm_counter(mm, _MM_ANONPAGES()))
   }
   return 0
 }
+%(systemtap_v <= "3.0" %?
+function proc_mem_rss_pid:long (pid:long)
+{
+  task = pid2task(pid)
+  if (_stp_valid_task(task)) {
+    mm = task->mm
+    if (mm != 0)
+        return (_stp_get_mm_counter(mm, _MM_FILEPAGES())
+                + _stp_get_mm_counter(mm, _MM_ANONPAGES()))
+  }
+  return 0
+}
+%)
 
 /**
  * sfunction proc_mem_shr - Program shared pages (from shared mappings)
@@ -204,7 +225,7 @@ function proc_mem_shr:long ()
 {
   task = task_current()
   if (_stp_valid_task(task)) {
-    mm = @cast(task, "task_struct", "kernel<linux/sched.h>")->mm
+    mm = task->mm
     if (mm != 0)
       return _stp_get_mm_counter(mm, _MM_FILEPAGES())
   }
@@ -212,7 +233,7 @@ function proc_mem_shr:long ()
 }
 
 /**
- * sfunction proc_mem_shr_pid - Program shared pages (from shared mappings)
+ * sfunction proc_mem_shr - Program shared pages (from shared mappings)
  *
  * @pid: The pid of process to examine
  *
@@ -220,18 +241,30 @@ function proc_mem_shr:long ()
  * given process, or zero when the process doesn't exist or the
  * number of pages couldn't be retrieved.
  */
-function proc_mem_shr_pid:long (pid:long)
+function proc_mem_shr:long (pid:long)
 {
   task = pid2task(pid)
   if (_stp_valid_task(task)) {
-    mm = @cast(task, "task_struct", "kernel<linux/sched.h>")->mm
+    mm = task->mm
     if (mm != 0)
       return _stp_get_mm_counter(mm, _MM_FILEPAGES())
   }
   return 0
 }
+%(systemtap_v <= "3.0" %?
+function proc_mem_shr_pid:long (pid:long)
+{
+  task = pid2task(pid)
+  if (_stp_valid_task(task)) {
+    mm = task->mm
+    if (mm != 0)
+      return _stp_get_mm_counter(mm, _MM_FILEPAGES())
+  }
+  return 0
+}
+%)
 
-function _stp_mem_txt_adjust:long (start_code:long, end_code:long)
+@__private30 function _stp_mem_txt_adjust:long (start_code:long, end_code:long)
 %{ /* pure */
   unsigned long start_code = (unsigned long) STAP_ARG_start_code;
   unsigned long end_code = (unsigned long) STAP_ARG_end_code;
@@ -250,10 +283,10 @@ function proc_mem_txt:long ()
 {
   task = task_current()
   if (_stp_valid_task(task)) {
-    mm = @cast(task, "task_struct", "kernel<linux/sched.h>")->mm
+    mm = task->mm
     if (mm != 0) {
-      s = @cast(mm, "mm_struct", "kernel<linux/sched.h>")->start_code
-      e = @cast(mm, "mm_struct", "kernel<linux/sched.h>")->end_code
+      s = mm->start_code
+      e = mm->end_code
       return _stp_mem_txt_adjust(s, e)
     }
   }
@@ -261,7 +294,7 @@ function proc_mem_txt:long ()
 }
 
 /**
- * sfunction proc_mem_txt_pid - Program text (code) size in pages
+ * sfunction proc_mem_txt - Program text (code) size in pages
  *
  * @pid: The pid of process to examine
  *
@@ -269,19 +302,34 @@ function proc_mem_txt:long ()
  * or zero when the process doesn't exist or the number of pages
  * couldn't be retrieved.
  */
-function proc_mem_txt_pid:long (pid:long)
+function proc_mem_txt:long (pid:long)
 {
   task = pid2task(pid)
   if (_stp_valid_task(task)) {
-    mm = @cast(task, "task_struct", "kernel<linux/sched.h>")->mm
+    mm = task->mm
     if (mm != 0) {
-      s = @cast(mm, "mm_struct", "kernel<linux/sched.h>")->start_code
-      e = @cast(mm, "mm_struct", "kernel<linux/sched.h>")->end_code
+      s = mm->start_code
+      e = mm->end_code
       return _stp_mem_txt_adjust (s, e)
     }
   }
   return 0
 }
+%(systemtap_v <= "3.0" %?
+function proc_mem_txt_pid:long (pid:long)
+{
+  task = pid2task(pid)
+  if (_stp_valid_task(task)) {
+    mm = task->mm
+    if (mm != 0) {
+      s = mm->start_code
+      e = mm->end_code
+      return _stp_mem_txt_adjust (s, e)
+    }
+  }
+  return 0
+}
+%)
 
 /**
  * sfunction proc_mem_data - Program data size (data + stack) in pages
@@ -294,18 +342,17 @@ function proc_mem_data:long ()
 {
   task = task_current()
   if (_stp_valid_task(task)) {
-    mm = @cast(task, "task_struct", "kernel<linux/sched.h>")->mm
+    mm = task->mm
     if (mm != 0) {
-      t = @cast(mm, "mm_struct", "kernel<linux/sched.h>")->total_vm
-      s = @cast(mm, "mm_struct", "kernel<linux/sched.h>")->shared_vm
-      return (t - s)
+      return (@defined(&@mm(0)->data_vm) ? (mm->data_vm + mm->stack_vm)
+	      : (mm->total_vm - mm->shared_vm))
     }
   }
   return 0
 }
 
 /**
- * sfunction proc_mem_data_pid - Program data size (data + stack) in pages
+ * sfunction proc_mem_data - Program data size (data + stack) in pages
  *
  * @pid: The pid of process to examine
  *
@@ -313,30 +360,43 @@ function proc_mem_data:long ()
  * in pages, or zero when the process doesn't exist or the number of
  * pages couldn't be retrieved.
  */
-function proc_mem_data_pid:long (pid:long)
+function proc_mem_data:long (pid:long)
 {
   task = pid2task(pid)
   if (_stp_valid_task(task)) {
-    mm = @cast(task, "task_struct", "kernel<linux/sched.h>")->mm
+    mm = task->mm
     if (mm != 0) {
-      t = @cast(mm, "mm_struct", "kernel<linux/sched.h>")->total_vm
-      s = @cast(mm, "mm_struct", "kernel<linux/sched.h>")->shared_vm
-      return t - s
+      return (@defined(&@mm(0)->data_vm) ? (mm->data_vm + mm->stack_vm)
+	      : (mm->total_vm - mm->shared_vm))
     }
   }
   return 0
 }
+%(systemtap_v <= "3.0" %?
+function proc_mem_data_pid:long (pid:long)
+{
+  task = pid2task(pid)
+  if (_stp_valid_task(task)) {
+    mm = task->mm
+    if (mm != 0) {
+      return (@defined(&@mm(0)->data_vm) ? (mm->data_vm + mm->stack_vm)
+	      : (mm->total_vm - mm->shared_vm))
+    }
+  }
+  return 0
+}
+%)
 
 /**
  * sfunction mem_page_size - Number of bytes in a page for this architecture
  */
 function mem_page_size:long ()
-%{ /* pure */ /* unprivileged */
+%{ /* pure */ /* stable */ /* unprivileged */
    STAP_RETVALUE = PAGE_SIZE;
 %}
 
 // Return a 5 character wide string " x.yyp", " xx.yp", " xxxp", "xxxxp".
-function _stp_number_to_string_postfix:string (x:long, y:long, p:string)
+@__private30 function _stp_number_to_string_postfix:string (x:long, y:long, p:string)
 {
   if (x < 10)
     return sprintf("%d.%.2d%s", x, y * 100 / 1024, p);
@@ -394,7 +454,7 @@ function pages_to_string:string (pages:long)
 }
 
 /**
- * sfunction proc_mem_string - Human readable string of current proc memory usage
+ * sfunction proc_mem_string - Human readable string of process memory usage
  *
  * Description: Returns a human readable string showing the size, rss,
  * shr, txt and data of the memory used by the current process.
@@ -411,7 +471,7 @@ function proc_mem_string:string ()
 }
 
 /**
- * sfunction proc_mem_string_pid - Human readable string of process memory usage
+ * sfunction proc_mem_string - Human readable string of process memory usage
  *
  * @pid: The pid of process to examine
  *
@@ -419,12 +479,23 @@ function proc_mem_string:string ()
  * shr, txt and data of the memory used by the given process.
  * For example "size: 301m, rss: 11m, shr: 8m, txt: 52k, data: 2248k".
  */
+function proc_mem_string:string (pid:long)
+{
+  return sprintf ("size: %s, rss: %s, shr: %s, txt: %s, data: %s",
+                  pages_to_string(proc_mem_size(pid)),
+                  pages_to_string(proc_mem_rss(pid)),
+                  pages_to_string(proc_mem_shr(pid)),
+                  pages_to_string(proc_mem_txt(pid)),
+                  pages_to_string(proc_mem_data(pid)));
+}
+%(systemtap_v <= "3.0" %?
 function proc_mem_string_pid:string (pid:long)
 {
   return sprintf ("size: %s, rss: %s, shr: %s, txt: %s, data: %s",
-                  pages_to_string(proc_mem_size_pid(pid)),
-                  pages_to_string(proc_mem_rss_pid(pid)),
-                  pages_to_string(proc_mem_shr_pid(pid)),
-                  pages_to_string(proc_mem_txt_pid(pid)),
-                  pages_to_string(proc_mem_data_pid(pid)));
+                  pages_to_string(proc_mem_size(pid)),
+                  pages_to_string(proc_mem_rss(pid)),
+                  pages_to_string(proc_mem_shr(pid)),
+                  pages_to_string(proc_mem_txt(pid)),
+                  pages_to_string(proc_mem_data(pid)));
 }
+%)

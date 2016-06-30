@@ -2,7 +2,7 @@
 // Copyright (C) 2006-2007 IBM Corp.
 // Copyright (C) 2007 Intel Corporation.
 // Copyright (C) 2007 Bull S.A.S
-// Copyright (C) 2010,2011 Red Hat Inc.
+// Copyright (C) 2010,2014 Red Hat Inc.
 //
 // This file is part of systemtap, and is free software.  You can
 // redistribute it and/or modify it under the terms of the GNU General
@@ -38,22 +38,15 @@
  *15 :nfsd.proc3.rename.tfh
  */
 
-/*Get file handler from struct svc_fh */
-function __svc_fh:string(fh :long) %{  /* pure */
-	struct svc_fh * fhp = (struct svc_fh *) (long)(STAP_ARG_fh);
-	struct knfsd_fh *fh = &fhp->fh_handle;
-
-	snprintf(STAP_RETVALUE, MAXSTRINGLEN,
-			"%d: %08x %08x %08x %08x %08x %08x",
-			kread(&(fh->fh_size)),
-			kread(&(fh->fh_base.fh_pad[0])),
-			kread(&(fh->fh_base.fh_pad[1])),
-			kread(&(fh->fh_base.fh_pad[2])),
-			kread(&(fh->fh_base.fh_pad[3])),
-			kread(&(fh->fh_base.fh_pad[4])),
-			kread(&(fh->fh_base.fh_pad[5])));
-	CATCH_DEREF_FAULT();
-%}
+/* Get file handle data from struct svc_fh. */
+@__private30 function __svc_fh:string(fhp:long)
+{
+	svc_fh = &@cast(fhp, "svc_fh", "kernel:nfsd")->fh_handle
+	return sprintf("%d: %08x %08x %08x %08x %08x %08x", svc_fh->fh_size,
+		       svc_fh->fh_base->fh_pad[0], svc_fh->fh_base->fh_pad[1],
+		       svc_fh->fh_base->fh_pad[2], svc_fh->fh_base->fh_pad[3],
+		       svc_fh->fh_base->fh_pad[4], svc_fh->fh_base->fh_pad[5])
+}
 
 function nfs3_cmode:string(cmode:long) %{ /* pure */
 	int cmode = (int)(long)STAP_ARG_cmode;
@@ -146,6 +139,52 @@ function ftype:string(type:long) %{ /* pure */
 	}
 %}
 
+@__private30 function __rqstp_uid:long(rqstp:long)
+%{ /* pure */
+	// Notice we're using the 'init_user_ns' here, not
+	// 'current_user_ns()'. This matches up with the use in
+	// net/sunrpc/auth_generic.c.
+	struct svc_rqst *rqstp
+		= (struct svc_rqst *)(unsigned long)STAP_ARG_rqstp;
+#ifndef STAPCONF_LINUX_UIDGID_H
+	uid_t cr_uid = KUIDT_INIT(kread(&(rqstp->rq_cred.cr_uid)));
+#else
+	kuid_t cr_uid;
+	/* Make sure the cr_uid struct is valid to read. */
+	(void)kderef_buffer(NULL, &(rqstp->rq_cred.cr_uid), sizeof(kuid_t));
+	cr_uid = KUIDT_INIT(__kuid_val(rqstp->rq_cred.cr_uid));
+#endif
+#if defined(CONFIG_USER_NS) || (LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0))
+	STAP_RETVALUE = from_kuid_munged(&init_user_ns, cr_uid);
+#else
+	STAP_RETVALUE = cr_uid;
+#endif
+	CATCH_DEREF_FAULT();
+%}
+
+@__private30 function __rqstp_gid:long(rqstp:long)
+%{ /* pure */
+	// Notice we're using the 'init_user_ns' here, not
+	// 'current_user_ns()'. This matches up with the use in
+	// net/sunrpc/auth_generic.c.
+	struct svc_rqst *rqstp
+		= (struct svc_rqst *)(unsigned long)STAP_ARG_rqstp;
+#ifndef STAPCONF_LINUX_UIDGID_H
+	gid_t cr_gid = KGIDT_INIT(kread(&(rqstp->rq_cred.cr_gid)));
+#else
+	kgid_t cr_gid;
+	/* Make sure the cr_gid struct is valid to read. */
+	(void)kderef_buffer(NULL, &(rqstp->rq_cred.cr_gid), sizeof(kgid_t));
+	cr_gid = KGIDT_INIT(__kgid_val(rqstp->rq_cred.cr_gid));
+#endif
+#if defined(CONFIG_USER_NS) || (LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0))
+	STAP_RETVALUE = from_kgid_munged(&init_user_ns, cr_gid);
+#else
+	STAP_RETVALUE = cr_gid;
+#endif
+	CATCH_DEREF_FAULT();
+%}
+
 /**
  * probe nfsd.dispatch - NFS server receives an operation from client 
  *
@@ -190,6 +229,7 @@ probe nfsd.proc.entries = nfsd.proc.lookup,
 probe nfsd.proc.return = nfsd.proc.lookup.return,
                          nfsd.proc.read.return,
                          nfsd.proc.write.return,
+                         nfsd.proc.commit.return,
                          nfsd.proc.remove.return,
                          nfsd.proc.rename.return,
                          nfsd.proc.create.return
@@ -230,8 +270,8 @@ probe nfsd.proc2.lookup = kernel.function("nfsd_proc_lookup") !,
 	filelen = $argp->len
 	filename = kernel_string_n($argp->name, $argp->len)
 
-	uid = $rqstp->rq_cred->cr_uid
-	gid = $rqstp->rq_cred->cr_gid
+	uid = __rqstp_uid($rqstp)
+	gid = __rqstp_gid($rqstp)
 
 	name = "nfsd.proc2.lookup"
 	argstr = sprintf("%s", kernel_string_n($argp->name, $argp->len))
@@ -259,8 +299,8 @@ probe nfsd.proc3.lookup = kernel.function("nfsd3_proc_lookup") !,
 	filelen = $argp->len
 	filename  = kernel_string_n($argp->name, $argp->len)
 
-	uid = $rqstp->rq_cred->cr_uid
-	gid = $rqstp->rq_cred->cr_gid
+	uid = __rqstp_uid($rqstp)
+	gid = __rqstp_gid($rqstp)
 
 	name = "nfsd.proc3.lookup"
 	argstr = sprintf("%s", kernel_string_n($argp->name, $argp->len))
@@ -306,8 +346,8 @@ probe nfsd.proc4.lookup = kernel.function("nfsd4_lookup").call !,
 	filelen = $lookup->lo_len
 	filename  = kernel_string_n($lookup->lo_name, $lookup->lo_len)
 
-	uid = $rqstp->rq_cred->cr_uid
-	gid = $rqstp->rq_cred->cr_gid
+	uid = __rqstp_uid($rqstp)
+	gid = __rqstp_gid($rqstp)
 
 	name = "nfsd.proc4.lookup"
 	argstr = sprintf("%s", kernel_string_n($lookup->lo_name, $lookup->lo_len))
@@ -364,8 +404,8 @@ probe nfsd.proc2.read = kernel.function("nfsd_proc_read") !,
 	vec = @choose_defined($rqstp->rq_vec, $argp->vec)
 	vlen = $argp->vlen
 
-	uid = $rqstp->rq_cred->cr_uid
-	gid = $rqstp->rq_cred->cr_gid
+	uid = __rqstp_uid($rqstp)
+	gid = __rqstp_gid($rqstp)
 
 	name = "nfsd.proc2.read"
 	argstr = sprintf("%d,%d",count,offset)
@@ -398,8 +438,8 @@ probe nfsd.proc3.read = kernel.function("nfsd3_proc_read") !,
 	vec = @choose_defined($rqstp->rq_vec, $argp->vec)
 	vlen = $argp->vlen
 
-	uid = $rqstp->rq_cred->cr_uid
-	gid = $rqstp->rq_cred->cr_gid
+	uid = __rqstp_uid($rqstp)
+	gid = __rqstp_gid($rqstp)
 
 	name = "nfsd.proc3.read"
 	argstr = sprintf("%d,%d",count,offset)
@@ -432,8 +472,8 @@ probe nfsd.proc4.read = kernel.function("nfsd4_read").call !,
 	vec = $rqstp->rq_vec
 	vlen = $read->rd_vlen
 
-	uid = $rqstp->rq_cred->cr_uid
-	gid = $rqstp->rq_cred->cr_gid
+	uid = __rqstp_uid($rqstp)
+	gid = __rqstp_gid($rqstp)
 
 	name = "nfsd.proc4.read"
 	argstr = sprintf("%d,%d",count,offset)
@@ -494,8 +534,8 @@ probe nfsd.proc2.write = kernel.function("nfsd_proc_write") !,
 	vlen = $argp->vlen
 	stable = 1			# hardcoded in nfsd_proc_write()
 
-	uid = $rqstp->rq_cred->cr_uid
-	gid = $rqstp->rq_cred->cr_gid
+	uid = __rqstp_uid($rqstp)
+	gid = __rqstp_gid($rqstp)
 
 	name = "nfsd.proc2.write"
 	argstr = sprintf("%d,%d",count,offset)
@@ -531,8 +571,8 @@ probe nfsd.proc3.write = kernel.function("nfsd3_proc_write") !,
 	vlen = $argp->vlen
 	stable = $argp->stable
 
-	uid = $rqstp->rq_cred->cr_uid
-	gid = $rqstp->rq_cred->cr_gid
+	uid = __rqstp_uid($rqstp)
+	gid = __rqstp_gid($rqstp)
 
 	name = "nfsd.proc3.write"
 	argstr = sprintf("%d,%d",count,offset)
@@ -567,8 +607,8 @@ probe nfsd.proc4.write = kernel.function("nfsd4_write").call !,
 	vlen = @choose_defined($write->wr_vlen, 0)
 	stable = $write->wr_stable_how
 
-	uid = $rqstp->rq_cred->cr_uid
-	gid = $rqstp->rq_cred->cr_gid
+	uid = __rqstp_uid($rqstp)
+	gid = __rqstp_gid($rqstp)
 
 	name = "nfsd.proc4.write"
 	argstr = sprintf("%d,%d",count,offset)
@@ -625,8 +665,8 @@ probe nfsd.proc3.commit = kernel.function("nfsd3_proc_commit") !,
 	count = $argp->count 
 	offset = $argp->offset 
 
-	uid = $rqstp->rq_cred->cr_uid
-	gid = $rqstp->rq_cred->cr_gid
+	uid = __rqstp_uid($rqstp)
+	gid = __rqstp_gid($rqstp)
 
 	name = "nfsd.proc3.commit"
 	argstr = sprintf("%d,%d",count,offset)
@@ -656,8 +696,8 @@ probe nfsd.proc4.commit = kernel.function("nfsd4_commit").call !,
 	count = $commit->co_count 
 	offset = $commit->co_offset 
 
-	uid = $rqstp->rq_cred->cr_uid
-	gid = $rqstp->rq_cred->cr_gid
+	uid = __rqstp_uid($rqstp)
+	gid = __rqstp_gid($rqstp)
 
 	name = "nfsd.proc4.commit"
 	argstr = sprintf("%d,%d",count,offset)
@@ -712,8 +752,8 @@ probe nfsd.proc2.create = kernel.function("nfsd_proc_create") !,
 	filename  = kernel_string_n($argp->name, $argp->len)
 	createmode = 0			# gets computed by nfsd_proc_create
 
-	uid = $rqstp->rq_cred->cr_uid
-	gid = $rqstp->rq_cred->cr_gid
+	uid = __rqstp_uid($rqstp)
+	gid = __rqstp_gid($rqstp)
 
 	name = "nfsd.proc2.create"
 	argstr = sprintf("%s", kernel_string_n($argp->name, $argp->len))
@@ -742,8 +782,8 @@ probe nfsd.proc3.create = kernel.function("nfsd3_proc_create") !,
 	filename  = kernel_string_n($argp->name, $argp->len)
 	createmode = $argp->createmode
 	
-	uid = $rqstp->rq_cred->cr_uid
-	gid = $rqstp->rq_cred->cr_gid
+	uid = __rqstp_uid($rqstp)
+	gid = __rqstp_gid($rqstp)
 
 	name = "nfsd.proc3.create"
 	argstr = sprintf("%s (mode=%s)",
@@ -775,8 +815,8 @@ probe nfsd.proc4.create = kernel.function("nfsd4_create").call !,
 	filename  = kernel_string_n($create->cr_name, $create->cr_namelen)
 	createmode = $create->cr_type
 
-	uid = $rqstp->rq_cred->cr_uid
-	gid = $rqstp->rq_cred->cr_gid
+	uid = __rqstp_uid($rqstp)
+	gid = __rqstp_gid($rqstp)
 
 	name = "nfsd.proc4.create"
 	argstr = sprintf("%s (type=%s)", 
@@ -830,8 +870,8 @@ probe nfsd.proc2.remove = kernel.function("nfsd_proc_remove") !,
 	filelen = $argp->len
 	filename  = kernel_string_n($argp->name, $argp->len)
 
-	uid = $rqstp->rq_cred->cr_uid
-	gid = $rqstp->rq_cred->cr_gid
+	uid = __rqstp_uid($rqstp)
+	gid = __rqstp_gid($rqstp)
 
 	name = "nfsd.proc2.remove"
 	argstr = sprintf("%s", kernel_string_n($argp->name, $argp->len))
@@ -859,8 +899,8 @@ probe nfsd.proc3.remove = kernel.function("nfsd3_proc_remove") !,
 	filelen = $argp->len
 	filename  = kernel_string_n($argp->name, $argp->len)
 	
-	uid = $rqstp->rq_cred->cr_uid
-	gid = $rqstp->rq_cred->cr_gid
+	uid = __rqstp_uid($rqstp)
+	gid = __rqstp_gid($rqstp)
 
 	name = "nfsd.proc3.remove"
 	argstr = sprintf("%s", kernel_string_n($argp->name, $argp->len))
@@ -887,8 +927,8 @@ probe nfsd.proc4.remove = kernel.function("nfsd4_remove").call !,
 	filelen = $remove->rm_namelen
 	filename  = kernel_string_n($remove->rm_name, $remove->rm_namelen)
 
-	uid = $rqstp->rq_cred->cr_uid
-	gid = $rqstp->rq_cred->cr_gid
+	uid = __rqstp_uid($rqstp)
+	gid = __rqstp_gid($rqstp)
 
 	name = "nfsd.proc4.remove"
 	argstr = sprintf("%s", 
@@ -946,8 +986,8 @@ probe nfsd.proc2.rename = kernel.function("nfsd_proc_rename") !,
 	tlen = $argp->tlen
 	tname = kernel_string_n($argp->tname, $argp->tlen)
 
-	uid = $rqstp->rq_cred->cr_uid
-	gid = $rqstp->rq_cred->cr_gid
+	uid = __rqstp_uid($rqstp)
+	gid = __rqstp_gid($rqstp)
 
 	name = "nfsd.proc2.rename"
 	argstr = sprintf("%s to %s", 
@@ -980,8 +1020,8 @@ probe nfsd.proc3.rename = kernel.function("nfsd3_proc_rename") !,
 	tlen = $argp->tlen
 	tname = kernel_string_n($argp->tname, $argp->tlen)
 
-	uid = $rqstp->rq_cred->cr_uid
-	gid = $rqstp->rq_cred->cr_gid
+	uid = __rqstp_uid($rqstp)
+	gid = __rqstp_gid($rqstp)
 
 	name = "nfsd.proc3.rename"
 	argstr = sprintf("%s to %s", 
@@ -1014,8 +1054,8 @@ probe nfsd.proc4.rename = kernel.function("nfsd4_rename").call !,
 	tlen = $rename->rn_tnamelen
 	tname = kernel_string_n($rename->rn_tname, $rename->rn_tnamelen)
 
-	uid = $rqstp->rq_cred->cr_uid
-	gid = $rqstp->rq_cred->cr_gid
+	uid = __rqstp_uid($rqstp)
+	gid = __rqstp_gid($rqstp)
 
 	name = "nfsd.proc4.rename"
 	argstr = sprintf("%s to %s", 
@@ -1043,7 +1083,7 @@ probe nfsd.entries = nfsd.open,
                      nfsd.createv3,
                      nfsd.unlink,
                      nfsd.rename,
-                     nfsd.close
+                     nfsd.close ?
 {}
 
 probe nfsd.return = nfsd.open.return,
@@ -1054,7 +1094,8 @@ probe nfsd.return = nfsd.open.return,
                     nfsd.create.return,
                     nfsd.createv3.return,
                     nfsd.unlink.return,
-                    nfsd.rename.return
+                    nfsd.rename.return,
+		    nfsd.close.return ?
 {}
 
 /**
@@ -1092,15 +1133,31 @@ probe nfsd.open.return = kernel.function("nfsd_open").return !,
  * probe nfsd.close - NFS server closing a file for client
  *
  * @filename: file name
+ *
+ * This probe point does not exist in kernels starting with 4.2.
  */
-probe nfsd.close = kernel.function("nfsd_close") !,
-                   module("nfsd").function("nfsd_close") ?
+probe nfsd.close = __nfsd.call_close ?, __nfsd.inlined_close ?
 {
 	client_ip ="N/A"
-	filename = __file_filename($filp)
-
 	name = "nfsd.close"
 	argstr = sprintf("%s",filename)
+}
+/*
+ * Why split nfsd.close up into '__nfsd.call_close' and
+ * '__nfds.inlined_close'? We need the '@choose_defined()' since
+ * SystemTap has trouble accessing the arguments of inlined functions
+ * (PR 1155). But, if we only used '@choose_defined()', we wouldn't
+ * automatically notice a change in the argument name.
+ */
+probe __nfsd.call_close = kernel.function("nfsd_close").call !,
+			  module("nfsd").function("nfsd_close").call ?
+{
+	filename = __file_filename($filp)
+}
+probe __nfsd.inlined_close = kernel.function("nfsd_close").inline !,
+			     module("nfsd").function("nfsd_close").inline ?
+{
+	filename = __file_filename(@choose_defined($filp, 0))
 }
 
 probe nfsd.close.return = kernel.function("nfsd_close").return !,

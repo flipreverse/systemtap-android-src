@@ -42,7 +42,8 @@
 \item[]}
 {\end{list}}
 
-\usepackage{babel}
+\usepackage[english]{babel}
+
 \makeatother
 \begin{document}
 
@@ -578,6 +579,18 @@ global var1[=<value>], var2[=<value>]
 \end{verbatim}
 \end{vindent}
 
+The scope of a global variable may be limited to a tapset or
+user script file using private keyword. The global keyword is optional when
+defining a private global variable. Following declaration marks var1 and var2
+private globals.
+
+\begin{vindent}
+\begin{verbatim}
+private global var1[=<value>]
+private var2[=<value>]
+\end{verbatim}
+\end{vindent}
+
 \subsubsection{Unused variables}
 \index{unused variables}
 
@@ -594,7 +607,7 @@ General syntax:
 
 \begin{vindent}
 \begin{verbatim}
-function <name>[:<type>] ( <arg1>[:<type>], ... ) { <stmts> }
+function <name>[:<type>] ( <arg1>[:<type>], ... )[:<priority>] { <stmts> }
 \end{verbatim}
 \end{vindent}
 SystemTap scripts may define subroutines to factor out common work. Functions
@@ -628,6 +641,71 @@ function thatfn:string(arg1:long, arg2) {
 Functions may call others or themselves recursively, up to a fixed nesting
 limit. See Section~\ref{sub:SystemTap-safety}.
 
+Functions may be marked private using the private keyword to limit their scope
+to the tapset or user script file they are defined in. An example definition of
+a private function follows:
+
+\begin{vindent}
+\begin{verbatim}
+private function three:long () { return 3 }
+\end{verbatim}
+\end{vindent}
+
+Functions terminating without reaching an explicit return statement will
+return an implicit 0 or \verb+""+, determined by type inference.
+
+Functions may be overloaded during both runtime and compile time.
+
+Runtime overloading allows the executed function to be selected while the
+module is running based on runtime conditions and is achieved using the
+"next" statement in script functions and \texttt{STAP\_NEXT} macro for embedded-C
+functions. For example,
+
+\begin{vindent}
+\begin{verbatim}
+function f() { if (condition) next; print("first function") }
+function f() %{ STAP_NEXT; print("second function") %}
+function f() { print("third function") }
+\end{verbatim}
+\end{vindent}
+
+During a functioncall f(), the execution will transfer to the third function
+if condition evaluates to true and print "third function". Note that the second
+function is unconditionally nexted.
+
+Parameter overloading allows the function to be executed to be selected
+at compile time based on the number of arguments provided to the
+functioncall. For example,
+
+\begin{vindent}
+\begin{verbatim}
+function g() { print("first function") }
+function g(x) { print("second function") }
+g() -> "first function"
+g(1) -> "second function"
+\end{verbatim}
+\end{vindent}
+
+Note that runtime overloading does not occur in the above example, as exactly
+one function will be resolved for the functioncall. The use of a next statement
+inside a function while no more overloads remain will trigger a runtime exception
+Runtime overloading will only occur if the functions have the same arity,
+functions with the same name but different number of parameters are completely
+unrelated.
+
+Execution order is determined by a priority value which may be specified.
+If no explicit priority is specified, user script functions are given a
+higher priority than library functions. User script functions and library
+functions are assigned a default priority value of 0 and 1 respectively.
+Functions with the same priority are executed in declaration order. For example,
+
+\begin{vindent}
+\begin{verbatim}
+function f():3 { if (condition) next; print("first function") }
+function f():1 { if (condition) next; print("second function") }
+function f():2 { print("third function") }
+\end{verbatim}
+\end{vindent}
 
 \subsection{Embedded C\label{sub:Embedded-C}}
 \index{embedded C}
@@ -659,7 +737,7 @@ Here is an example of the various permitted methods of embedded C code inclusion
 
 /* Reads the char value stored at a given address: */ 
 function __read_char:long(addr:long) %{ /* pure */
-         STAP_RETVALUE = kderef(sizeof(char), STAP_ARG_addr);
+         STAP_RETURN(kderef(sizeof(char), STAP_ARG_addr));
          CATCH_DEREF_FAULT ();
 %} /* <-- function body */
 
@@ -677,7 +755,7 @@ General syntax:
 
 \begin{vindent}
 \begin{verbatim}
-function <name>:<type> ( <arg1>:<type>, ... ) %{ <C_stmts> %}
+function <name>:<type> ( <arg1>:<type>, ... )[:<priority>] %{ <C_stmts> %}
 \end{verbatim}
 \end{vindent}
 Embedded C code is permitted in a function body.
@@ -712,28 +790,41 @@ name = kread(&(dev->name));
 The memory locations reserved for input and output values are provided
 to a function using macros named
 \texttt{STAP\_ARG\_foo}\index{STAP_ARG_} (for arguments named
-\texttt{foo}) and \texttt{STAP\_RETVALUE}\index{STAP_RETVALUE}. The
-following are examples.
+\texttt{foo}) and \texttt{STAP\_RETVALUE}\index{STAP_RETVALUE}.
+Errors may be signalled with \texttt{STAP\_ERROR}. Output may be written
+with \texttt{STAP\_PRINTF}. The function may return                       early with \texttt{STAP\_RETURN}.  Here are some examples:
 
 \begin{vindent}
 \begin{verbatim}
-function add_one (val:long) %{
-    STAP_RETVALUE = STAP_ARG_val + 1;
+function integer_ops:long (val) %{
+  STAP_PRINTF("%d\n", STAP_ARG_val);
+  STAP_RETVALUE = STAP_ARG_val + 1;
+  if (STAP_RETVALUE == 4)
+      STAP_ERROR("wrong guess: %d", (int) STAP_RETVALUE);
+  if (STAP_RETVALUE == 3)
+      STAP_RETURN(0);
+  STAP_RETVALUE ++;
 %}
-function add_one_str:string (val:string) %{
-    strlcpy (STAP_RETVALUE, STAP_ARG_val, MAXSTRINGLEN);
-    strlcat (STAP_RETVALUE, "one", MAXSTRINGLEN);
+function string_ops:string (val) %{
+  strlcpy (STAP_RETVALUE, STAP_ARG_val, MAXSTRINGLEN);
+  strlcat (STAP_RETVALUE, "one", MAXSTRINGLEN);
+  if (strcmp (STAP_RETVALUE, "three-two-one"))
+      STAP_RETURN("parameter should be three-two-");
+%}
+function no_ops () %{
+    STAP_RETURN(); /* function inferred with no return value */
 %}
 \end{verbatim}
 \end{vindent}
 
-The function argument and return value types should be stated;
-the translator does not analyze the embedded C code within the function.
-You should examine
-C code generated for ordinary script language functions to write compatible
-embedded-C. Note that all SystemTap functions and probes run with interrupts
-disabled, thus you cannot call functions that might sleep within the embedded
-C.
+The function argument and return value types should be stated if the
+translator cannot infer them from usage.  The translator does not
+analyze the embedded C code within the function.
+
+You should examine C code generated for ordinary script language
+functions to write compatible embedded-C.  Usually, all SystemTap
+functions and probes run with interrupts disabled, thus you cannot
+call functions that might sleep within the embedded C.
 
 \subsection{Embedded C pragma comments}
 
@@ -743,6 +834,10 @@ and safety properties.
 \begin{itemize}
 \item \verb+/* pure */+ means that the C code has no side effects and
   may be elided entirely if its value is not used by script code.
+\item \verb+/* stable */+ means that the C code always has the same value
+  (in any given probe handler invocation), so repeated calls may be
+  automatically replaced by memoized values. Such functions must take
+  no parameters, and also be \verb+/* pure */+.
 \item \verb+/* unprivileged */+ means that the C code is so safe that
   even unprivileged users are permitted to use it. (This is useful, in
   particular, to define an embedded-C function inside a tapset that
@@ -761,10 +856,37 @@ and safety properties.
   \verb+THIS->foo+ and \verb+THIS->__retvalue+ respectively inside the
   function. This is useful for quickly migrating code written for
   SystemTap version 1.7 and earlier.
+\item \verb+/* unmodified-fnargs */+ in an embedded-C function, means
+  that the function arguments are not modified inside the function body.
 \item \verb+/* string */+ in embedded-C expressions only, means that
   the expression has \verb+const char *+ type and should be treated as
   a string value, instead of the default long numeric.
 \end{itemize}
+
+\subsection{Accessing script level global variables}
+
+Script level global variables may be accessed in embedded-C functions and
+blocks. To read or write the global variable \textbf{var}, the
+\verb+/* pragma:read:var */+ or \verb+/* pragma:write:var */+
+marker must be first placed in the embedded-C function or block. This provides
+the macros \verb+STAP_GLOBAL_GET_*+ and \verb+STAP_GLOBAL_SET_*+
+macros to allow reading and writing, respectively. For example:
+\begin{vindent}
+\begin{verbatim}
+global var
+global var2[100]
+function increment() %{
+    /* pragma:read:var */ /* pragma:write:var */
+    /* pragma:read:var2 */ /* pragma:write:var2 */
+    STAP_GLOBAL_SET_var(STAP_GLOBAL_GET_var()+1); //var++
+    STAP_GLOBAL_SET_var2(1, 1, STAP_GLOBAL_GET_var2(1, 1)+1); //var2[1,1]++
+%}
+\end{verbatim}
+\end{vindent}
+Variables may be read and set in both embedded-C functions and expressions.
+Strings returned from embedded-C code are decayed to pointers. Variables must
+also be assigned at script level to allow for type inference. Map assignment
+does not return the value written, so chaining does not work.
 
 \section{Probe points\label{sec:Probe-Points}}
 \index{probe points}
@@ -833,6 +955,32 @@ The following is the general syntax.
 \begin{vindent}
 \begin{verbatim}
 kernel.function("no_such_function") ?
+\end{verbatim}
+\end{vindent}
+
+\subsubsection{Brace expansion}
+\index{braceexpansion}
+Brace expansion is a mechanism which allows a list of probe points to be
+generated. It is very similar to shell expansion. A component may be surrounded
+by a pair of curly braces to indicate that the comma-separated sequence of
+one or more subcomponents will each constitute a new probe point. The braces
+may be arbitrarily nested. The ordering of expanded results is based on
+product order.
+
+The question mark (?), exclamation mark (!) indicators and probe point conditions
+may not be placed in any expansions that are before the last component.
+
+The following is an example of brace expansion.
+
+\begin{vindent}
+\begin{verbatim}
+syscall.{write,read}
+# Expands to
+syscall.write, syscall.read
+
+{kernel,module("nfs")}.function("nfs*")!
+# Expands to
+kernel.function("nfs*")!, module("nfs").function("nfs*")!
 \end{verbatim}
 \end{vindent}
 
@@ -1873,12 +2021,12 @@ it generates an error. The following subsections list these operators.
 \index{unary}
 \texttt{+ - ! \textasciitilde{} ++ -{}-}
 
-\subsubsection{Binary numeric, string comparison, or regular expression matching operators}
+\subsubsection{Numeric \& string comparison, regular expression matching operators}
 \index{comparison}
 \texttt{< > <= >= == !=} \verb+=~+ \verb+!~+
 
-The regular expression matching (\verb+=~+ and \verb+!~+) is currently
-an experimental feature. The second operand must be a string literal
+The regular expression matching (\verb+=~+ and \verb+!~+) is a
+recent feature. The second operand must be a string literal
 containing a syntactically valid regular expression. The regular
 expression syntax supports most of the features of POSIX Extended
 Regular Expressions, except for subexpression reuse (\verb+\1+)
@@ -2152,9 +2300,9 @@ The following code adapts to the presence of a kernel CONFIG option.
 \end{vindent}
 
 
-\subsection{Preprocessor macros (experimental)}
+\subsection{Preprocessor macros}
 
-This is an experimental feature whose semantics are subject to change.
+This feature lets scripts eliminate some types of repetition.
 
 \subsubsection{Local macros}
 
@@ -2364,7 +2512,8 @@ The \texttt{if} command has the same syntax and semantics as used in C.
 \subsection{next}
 \index{next}
 The \texttt{next} statement returns immediately from the enclosing probe
-handler.
+handler. When used in functions, the execution will be immediately transferred
+to the next overloaded function.
 
 
 \subsection{; (null statement)}

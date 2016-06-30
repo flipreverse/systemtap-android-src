@@ -1,5 +1,5 @@
 // tapset for kernel static markers
-// Copyright (C) 2005-2010 Red Hat Inc.
+// Copyright (C) 2005-2014 Red Hat Inc.
 // Copyright (C) 2005-2007 Intel Corporation.
 //
 // This file is part of systemtap, and is free software.  You can
@@ -74,12 +74,11 @@ public:
 
 struct mark_var_expanding_visitor: public var_expanding_visitor
 {
-  mark_var_expanding_visitor(systemtap_session& s, const string& pn,
+  mark_var_expanding_visitor(systemtap_session& s,
                              vector <struct mark_arg *> &mark_args):
-    sess (s), probe_name (pn), mark_args (mark_args),
+    sess (s), mark_args (mark_args),
     target_symbol_seen (false) {}
   systemtap_session& sess;
-  string probe_name;
   vector <struct mark_arg *> &mark_args;
   bool target_symbol_seen;
 
@@ -92,7 +91,7 @@ struct mark_var_expanding_visitor: public var_expanding_visitor
 void
 mark_var_expanding_visitor::visit_target_symbol_arg (target_symbol* e)
 {
-  string argnum_s = e->name.substr(4,e->name.length()-4);
+  string argnum_s = (string)e->name.substr(4,e->name.length()-4);
   int argnum = atoi (argnum_s.c_str());
 
   if (argnum < 1 || argnum > (int)mark_args.size())
@@ -140,9 +139,7 @@ mark_var_expanding_visitor::visit_target_symbol_context (target_symbol* e)
  else if (e->name == "$$vars" || e->name == "$$parms")
   {
      //copy from tracepoint
-     token* pf_tok = new token(*e->tok);
-     pf_tok->content = "sprintf";
-     print_format* pf = print_format::create(pf_tok);
+     print_format* pf = print_format::create(e->tok, "sprintf");
 
      for (unsigned i = 0; i < mark_args.size(); ++i)
         {
@@ -221,7 +218,7 @@ mark_derived_probe::mark_derived_probe (systemtap_session &s,
   parse_probe_format();
 
   // Now expand the local variables in the probe body
-  mark_var_expanding_visitor v (sess, name, mark_args);
+  mark_var_expanding_visitor v (sess, mark_args);
   v.replace (this->body);
   target_symbol_seen = v.target_symbol_seen;
   if (target_symbol_seen)
@@ -237,7 +234,7 @@ mark_derived_probe::mark_derived_probe (systemtap_session &s,
       }
 
   if (sess.verbose > 2)
-    clog << "marker-based " << name << " mark=" << probe_name << " fmt='" << probe_format
+    clog << "marker-based " << name() << " mark=" << probe_name << " fmt='" << probe_format
          << "'" << endl;
 }
 
@@ -403,6 +400,7 @@ mark_derived_probe::join_group (systemtap_session& s)
       s.embeds.push_back(ec);
     }
   s.mark_derived_probes->enroll (this);
+  this->group = s.mark_derived_probes;
 }
 
 
@@ -518,7 +516,7 @@ mark_derived_probe_group::emit_module_decls (systemtap_session& s)
   s.op->newline() << "(*smp->probe->ph) (c);";
   s.op->newline() << "c->ips.kmark.mark_va_list = NULL;";
 
-  common_probe_entryfn_epilogue (s, true);
+  common_probe_entryfn_epilogue (s, true, otf_safe_context(s));
   s.op->newline(-1) << "}";
 
   return;
@@ -571,6 +569,9 @@ private:
     mark_cache_const_iterator_pair_t;
   mark_cache_t mark_cache;
 
+  string suggest_marks(systemtap_session& sess,
+                       const string& mark);
+
 public:
   mark_builder(): cache_initialized(false) {}
 
@@ -592,6 +593,30 @@ public:
 };
 
 
+string
+mark_builder::suggest_marks(systemtap_session& sess,
+                           const string& mark)
+{
+  if (mark.empty() || mark_cache.empty())
+    return "";
+
+  set<string> marks;
+
+  // Collect all markers from cache
+  for (mark_cache_const_iterator_t it = mark_cache.begin();
+       it != mark_cache.end(); it++)
+    marks.insert(it->first);
+
+  if (sess.verbose > 2)
+    clog << "suggesting from " << marks.size()
+         << " kernel marks" << endl;
+
+  if (marks.empty())
+    return "";
+
+  return levenshtein_suggest(mark, marks, 5); // print top 5 marks only
+}
+
 void
 mark_builder::build(systemtap_session & sess,
 		    probe * base,
@@ -599,9 +624,9 @@ mark_builder::build(systemtap_session & sess,
 		    literal_map_t const & parameters,
 		    vector<derived_probe *> & finished_results)
 {
-  string mark_str_val;
+  interned_string mark_str_val;
   bool has_mark_str = get_param (parameters, TOK_MARK, mark_str_val);
-  string mark_format_val;
+  interned_string mark_format_val;
   bool has_mark_format = get_param (parameters, TOK_FORMAT, mark_format_val);
   assert (has_mark_str);
   (void) has_mark_str;
@@ -671,18 +696,22 @@ mark_builder::build(systemtap_session & sess,
       module_markers.close();
     }
 
+  unsigned results_pre = finished_results.size();
+
   // Search marker list for matching markers
+  const string& str_val = mark_str_val;
+  const string& format_val = mark_format_val;
   for (mark_cache_const_iterator_t it = mark_cache.begin();
        it != mark_cache.end(); it++)
     {
       // Below, "rc" has negative polarity: zero iff matching.
-      int rc = fnmatch(mark_str_val.c_str(), it->first.c_str(), 0);
+      int rc = fnmatch(str_val.c_str(), it->first.c_str(), 0);
       if (! rc)
         {
 	  bool add_result = true;
 
 	  // Match format strings (if the user specified one)
-	  if (has_mark_format && fnmatch(mark_format_val.c_str(),
+	  if (has_mark_format && fnmatch(format_val.c_str(),
 					 it->second.c_str(), 0))
 	    add_result = false;
 
@@ -695,6 +724,17 @@ mark_builder::build(systemtap_session & sess,
 	      finished_results.push_back (dp);
 	    }
 	}
+    }
+
+  if (results_pre == finished_results.size()
+      && !loc->from_globby_comp(TOK_MARK))
+    {
+      string sugs = suggest_marks(sess, mark_str_val);
+      if (!sugs.empty())
+        throw SEMANTIC_ERROR (_NF("no match (similar mark: %s)",
+                                  "no match (similar marks: %s)",
+                                  sugs.find(',') == string::npos,
+                                  sugs.c_str()));
     }
 }
 

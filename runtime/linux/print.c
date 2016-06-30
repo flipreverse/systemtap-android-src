@@ -74,45 +74,12 @@ static void _stp_print_cleanup (void)
 		_stp_free_percpu(Stp_lbuf);
 }
 
-#define __DEF_EXPORT_FN(fn, postfix) fn ## _ ## postfix
-#define DEF_EXPORT_FN(fn, postfix) __DEF_EXPORT_FN(fn, postfix)
-
-#if defined(RELAY_GUEST)
-#if defined(RELAY_HOST)
-        #error "Cannot specify both RELAY_HOST and RELAY_GUEST"
-#endif
-#define EXPORT_FN(fn) DEF_EXPORT_FN(fn, RELAY_GUEST)
-#elif defined(RELAY_HOST)
-#define EXPORT_FN(fn) DEF_EXPORT_FN(fn, RELAY_HOST)
-#else /* defined(RELAY_GUEST) || defined(RELAY_HOST) */
-#define EXPORT_FN(fn) fn
-#endif
-
-#if !defined(RELAY_GUEST)
-
 #include "print_flush.c"
-#if defined(RELAY_HOST)
-EXPORT_SYMBOL_GPL(EXPORT_FN(stp_print_flush));
-#endif
 
-#endif /*!RELAY_GUEST*/
-
-#if defined(RELAY_GUEST) || defined(RELAY_HOST)
-/* Prohibit irqs to avoid racing on a relayfs */
-extern void EXPORT_FN(stp_print_flush) (_stp_pbuf *);
 static inline void _stp_print_flush(void)
 {
-	unsigned long flags;
-	local_irq_save(flags);
-	EXPORT_FN(stp_print_flush) (per_cpu_ptr(Stp_pbuf, smp_processor_id()));
-	local_irq_restore(flags);
+	stp_print_flush(per_cpu_ptr(Stp_pbuf, smp_processor_id()));
 }
-#else
-static inline void _stp_print_flush(void)
-{
-	EXPORT_FN(stp_print_flush)(per_cpu_ptr(Stp_pbuf, smp_processor_id()));
-}
-#endif
 #ifndef STP_MAXBINARYARGS
 #define STP_MAXBINARYARGS 127
 #endif
@@ -238,6 +205,11 @@ static void _stp_print_kernel_info(char *vstr, int ctx, int num_probes)
                "\n",
 	       THIS_MODULE->name,
 	       vstr, 
+#ifdef STAPCONF_MODULE_LAYOUT
+	       THIS_MODULE->core_layout.base,
+	       (unsigned long) (THIS_MODULE->core_layout.size - THIS_MODULE->core_layout.text_size)/1024,
+	       (unsigned long) (THIS_MODULE->core_layout.text_size)/1024,
+#else
 #ifndef STAPCONF_GRSECURITY
 	       THIS_MODULE->module_core,
 	       (unsigned long) (THIS_MODULE->core_size - THIS_MODULE->core_text_size)/1024,
@@ -246,6 +218,7 @@ static void _stp_print_kernel_info(char *vstr, int ctx, int num_probes)
                THIS_MODULE->module_core_rx,
 	       (unsigned long) (THIS_MODULE->core_size_rw - THIS_MODULE->core_size_rx)/1024,
                (unsigned long) (THIS_MODULE->core_size_rx)/1024,
+#endif
 #endif
 	       ctx/1024,
 	       _stp_allocated_net_memory/1024,

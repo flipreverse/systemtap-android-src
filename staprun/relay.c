@@ -7,15 +7,20 @@
  * Public License (GPL); either version 2, or (at your option) any
  * later version.
  *
- * Copyright (C) 2007-2012 Red Hat Inc.
+ * Copyright (C) 2007-2013 Red Hat Inc.
  */
 
 #include "staprun.h"
 
 int out_fd[NR_CPUS];
+int monitor_pfd[2];
+int monitor_set = 0;
+int monitor_end = 0;
 static pthread_t reader[NR_CPUS];
 static int relay_fd[NR_CPUS];
+static int avail_cpus[NR_CPUS];
 static int switch_file[NR_CPUS];
+static pthread_mutex_t mutex[NR_CPUS];
 static int bulkmode = 0;
 static volatile int stop_threads = 0;
 static time_t *time_backlog[NR_CPUS];
@@ -91,13 +96,11 @@ static int open_outfile(int fnum, int cpu, int remove_file)
 
 	if (make_outfile_name(buf, PATH_MAX, fnum, cpu, t, bulkmode) < 0)
 		return -1;
-	out_fd[cpu] = open (buf, O_CREAT|O_TRUNC|O_WRONLY, 0666);
+	out_fd[cpu] = open_cloexec (buf, O_CREAT|O_TRUNC|O_WRONLY, 0666);
 	if (out_fd[cpu] < 0) {
 		perr("Couldn't open output file %s", buf);
 		return -1;
 	}
-	if (set_clexec(out_fd[cpu]) < 0)
-		return -1;
 	return 0;
 }
 
@@ -170,12 +173,18 @@ static void *reader_thread(void *data)
 			if (errno == EINTR) {
 				if (stop_threads)
 					break;
+
+				pthread_mutex_lock(&mutex[cpu]);
 				if (switch_file[cpu]) {
-					if (switch_outfile(cpu, &fnum) < 0)
+					if (switch_outfile(cpu, &fnum) < 0) {
+						switch_file[cpu] = 0;
+						pthread_mutex_unlock(&mutex[cpu]);
 						goto error_out;
+					}
 					switch_file[cpu] = 0;
 					wsize = 0;
 				}
+				pthread_mutex_unlock(&mutex[cpu]);
 			} else {
 				_perr("poll error");
 				goto error_out;
@@ -183,20 +192,36 @@ static void *reader_thread(void *data)
                 }
 
 		while ((rc = read(relay_fd[cpu], buf, sizeof(buf))) > 0) {
+                        int wbytes = rc;
+                        char *wbuf = buf;
+                        
 			/* Switching file */
-			if ((fsize_max && wsize + rc > fsize_max) ||
+			pthread_mutex_lock(&mutex[cpu]);
+			if ((fsize_max && ((wsize + rc) > fsize_max)) ||
 			    switch_file[cpu]) {
-				if (switch_outfile(cpu, &fnum) < 0)
+				if (switch_outfile(cpu, &fnum) < 0) {
+					switch_file[cpu] = 0;
+					pthread_mutex_unlock(&mutex[cpu]);
 					goto error_out;
+				}
 				switch_file[cpu] = 0;
 				wsize = 0;
 			}
-			if (write(out_fd[cpu], buf, rc) != rc) {
-				if (errno != EPIPE)
-					perr("Couldn't write to output %d for cpu %d, exiting.", out_fd[cpu], cpu);
-				goto error_out;
-			}
-			wsize += rc;
+			pthread_mutex_unlock(&mutex[cpu]);
+
+                        /* Copy loop.  Must repeat write(2) in case of a pipe overflow
+                           or other transient fullness. */
+                        while (wbytes > 0) {
+                                rc = write(out_fd[cpu], wbuf, wbytes);
+                                if (rc <= 0) {
+					perr("Couldn't write to output %d for cpu %d, exiting.",
+                                             out_fd[cpu], cpu);
+                                        goto error_out;
+                                }
+                                wbytes -= rc;
+                                wbuf += rc;
+                        }
+			wsize += wbytes;
 		}
         } while (!stop_threads);
 	dbug(3, "exiting thread for cpu %d\n", cpu);
@@ -212,19 +237,35 @@ error_out:
 static void switchfile_handler(int sig)
 {
 	int i;
-	if (stop_threads)
+	if (stop_threads || !outfile_name)
 		return;
-	for (i = 0; i < ncpus; i++)
-		if (reader[i] && switch_file[i]) {
+
+	for (i = 0; i < ncpus; i++) {
+		pthread_mutex_lock(&mutex[avail_cpus[i]]);
+		if (reader[avail_cpus[i]] && switch_file[avail_cpus[i]]) {
+			pthread_mutex_unlock(&mutex[avail_cpus[i]]);
 			dbug(2, "file switching is progressing, signal ignored.\n", sig);
 			return;
 		}
+		pthread_mutex_unlock(&mutex[avail_cpus[i]]);
+	}
 	for (i = 0; i < ncpus; i++) {
-		if (reader[i]) {
-			switch_file[i] = 1;
-			pthread_kill(reader[i], SIGUSR2);
-		} else
+		pthread_mutex_lock(&mutex[avail_cpus[i]]);
+		if (reader[avail_cpus[i]]) {
+			switch_file[avail_cpus[i]] = 1;
+			pthread_mutex_unlock(&mutex[avail_cpus[i]]);
+
+			// Make sure we don't send the USR2 signal to
+			// ourselves.
+			if (pthread_equal(pthread_self(),
+					  reader[avail_cpus[i]]))
+				break;
+			pthread_kill(reader[avail_cpus[i]], SIGUSR2);
+		}
+		else {
+			pthread_mutex_unlock(&mutex[avail_cpus[i]]);
 			break;
+		}
 	}
 }
 
@@ -236,9 +277,9 @@ static void switchfile_handler(int sig)
 int init_relayfs(void)
 {
 	int i, len;
-	struct statfs st;
+	int cpui = 0;
 	char rqbuf[128];
-	char buf[PATH_MAX], relay_filebase[PATH_MAX];
+        char buf[PATH_MAX];
         struct sigaction sa;
         
 	dbug(2, "initializing relayfs\n");
@@ -247,38 +288,41 @@ int init_relayfs(void)
 	relay_fd[0] = 0;
 	out_fd[0] = 0;
 
-        if (relay_basedir_fd >= 0)
-                strcpy(relay_filebase, "\0");
- 	else if (statfs("/sys/kernel/debug", &st) == 0
-	    && (int) st.f_type == (int) DEBUGFS_MAGIC) {
-		if (sprintf_chk(relay_filebase,
-				"/sys/kernel/debug/systemtap/%s/",
-				modname))
-			return -1;
-	} else {
-		err("Cannot find relayfs or debugfs mount point.\n");
-		return -1;
-	}
-
+        /* Find out whether probe module was compiled with STP_BULKMODE. */
 	if (send_request(STP_BULK, rqbuf, sizeof(rqbuf)) == 0)
 		bulkmode = 1;
 
+	/* Try to open a slew of per-cpu trace%d files.  Per PR19241, we
+	   need to go through all potentially present CPUs up to NR_CPUS, that
+	   we hope is a reasonable limit.  For !bulknode, "trace0" will be
+	   typically used. */
+
 	for (i = 0; i < NR_CPUS; i++) {
-		if (sprintf_chk(buf, "%strace%d", relay_filebase, i))
-			return -1;
-		dbug(2, "attempting to open %s\n", buf);
                 relay_fd[i] = -1;
+
 #ifdef HAVE_OPENAT
-                if (relay_basedir_fd >= 0)
-                        relay_fd[i] = openat(relay_basedir_fd, buf, O_RDONLY | O_NONBLOCK);
+                if (relay_basedir_fd >= 0) {
+                        if (sprintf_chk(buf, "trace%d", i))
+                                return -1;
+                        dbug(2, "attempting to openat %s\n", buf);
+                        relay_fd[i] = openat_cloexec(relay_basedir_fd, buf, O_RDONLY | O_NONBLOCK, 0);
+                }
 #endif
-                if (relay_fd[i] < 0)
-                        relay_fd[i] = open(buf, O_RDONLY | O_NONBLOCK);
-		if (relay_fd[i] < 0 || set_clexec(relay_fd[i]) < 0)
-			break;
+                if (relay_fd[i] < 0) {
+                        if (sprintf_chk(buf, "/sys/kernel/debug/systemtap/%s/trace%d",
+                                        modname, i))
+                                return -1;
+                        dbug(2, "attempting to open %s\n", buf);
+                        relay_fd[i] = open_cloexec(buf, O_RDONLY | O_NONBLOCK, 0);
+                }
+		if (relay_fd[i] >= 0) {
+			avail_cpus[cpui++] = i;
+		}
 	}
-	ncpus = i;
+	ncpus = cpui;
 	dbug(2, "ncpus=%d, bulkmode = %d\n", ncpus, bulkmode);
+	for (i = 0; i < ncpus; i++)
+		dbug(2, "cpui=%d, relayfd=%d\n", i, avail_cpus[i]);
 
 	if (ncpus == 0) {
 		_err("couldn't open %s.\n", buf);
@@ -297,9 +341,9 @@ int init_relayfs(void)
 	if (fsize_max) {
 		/* switch file mode */
 		for (i = 0; i < ncpus; i++) {
-			if (init_backlog(i) < 0)
+			if (init_backlog(avail_cpus[i]) < 0)
 				return -1;
-  			if (open_outfile(0, i, 0) < 0)
+			if (open_outfile(0, avail_cpus[i], 0) < 0)
   				return -1;
 		}
 	} else if (bulkmode) {
@@ -319,21 +363,19 @@ int init_relayfs(void)
 						return -1;
 					}
 					if (snprintf_chk(&buf[len],
-						PATH_MAX - len, "_%d", i))
+						PATH_MAX - len, "_%d", avail_cpus[i]))
 						return -1;
 				}
 			} else {
-				if (sprintf_chk(buf, "stpd_cpu%d", i))
+				if (sprintf_chk(buf, "stpd_cpu%d", avail_cpus[i]))
 					return -1;
 			}
 			
-			out_fd[i] = open (buf, O_CREAT|O_TRUNC|O_WRONLY, 0666);
-			if (out_fd[i] < 0) {
+			out_fd[avail_cpus[i]] = open_cloexec (buf, O_CREAT|O_TRUNC|O_WRONLY, 0666);
+			if (out_fd[avail_cpus[i]] < 0) {
 				perr("Couldn't open output file %s", buf);
 				return -1;
 			}
-			if (set_clexec(out_fd[i]) < 0)
-				return -1;
 		}
 	} else {
 		/* stream mode */
@@ -344,16 +386,30 @@ int init_relayfs(void)
 				err("Invalid FILE name format\n");
 				return -1;
 			}
-			out_fd[0] = open (buf, O_CREAT|O_TRUNC|O_WRONLY, 0666);
-			if (out_fd[0] < 0) {
+			out_fd[avail_cpus[0]] = open_cloexec (buf, O_CREAT|O_TRUNC|O_WRONLY, 0666);
+			if (out_fd[avail_cpus[0]] < 0) {
 				perr("Couldn't open output file %s", buf);
 				return -1;
 			}
-			if (set_clexec(out_fd[i]) < 0)
-				return -1;
 		} else
-			out_fd[0] = STDOUT_FILENO;
-		
+			if (monitor) {
+				if (pipe_cloexec(monitor_pfd)) {
+					perr("Couldn't create pipe");
+					return -1;
+				}
+				fcntl(monitor_pfd[0], F_SETFL, O_NONBLOCK); /* read end */
+                                /* NB: leave write end of pipe normal blocking mode, since
+                                   that's the same mode as for STDOUT_FILENO. */
+				/* fcntl(monitor_pfd[1], F_SETFL, O_NONBLOCK); */ 
+#ifdef HAVE_F_SETPIPE_SZ
+                                /* Make it less likely for the pipe to be full. */
+				/* fcntl(monitor_pfd[1], F_SETPIPE_SZ, 8*65536); */
+#endif
+				monitor_set = 1;
+				out_fd[avail_cpus[0]] = monitor_pfd[1];
+			} else {
+				out_fd[avail_cpus[0]] = STDOUT_FILENO;
+			}
 	}
 
         memset(&sa, 0, sizeof(sa));
@@ -361,10 +417,17 @@ int init_relayfs(void)
         sa.sa_flags = 0;
         sigemptyset(&sa.sa_mask);
         sigaction(SIGUSR2, &sa, NULL);
+
         dbug(2, "starting threads\n");
+	for (i = 0; i < ncpus; i++) {
+		if (pthread_mutex_init(&mutex[avail_cpus[i]], NULL) < 0) {
+                        _perr("failed to create mutex");
+                        return -1;
+		}
+	}
         for (i = 0; i < ncpus; i++) {
-                if (pthread_create(&reader[i], NULL, reader_thread,
-                                   (void *)(long)i) < 0) {
+                if (pthread_create(&reader[avail_cpus[i]], NULL, reader_thread,
+                                   (void *)(long)avail_cpus[i]) < 0) {
                         _perr("failed to create thread");
                         return -1;
                 }
@@ -379,22 +442,25 @@ void close_relayfs(void)
 	stop_threads = 1;
 	dbug(2, "closing\n");
 	for (i = 0; i < ncpus; i++) {
-		if (reader[i])
-			pthread_kill(reader[i], SIGUSR2);
+		if (reader[avail_cpus[i]])
+			pthread_kill(reader[avail_cpus[i]], SIGUSR2);
 		else
 			break;
 	}
 	for (i = 0; i < ncpus; i++) {
-		if (reader[i])
-			pthread_join(reader[i], NULL);
+		if (reader[avail_cpus[i]])
+			pthread_join(reader[avail_cpus[i]], NULL);
 		else
 			break;
 	}
 	for (i = 0; i < ncpus; i++) {
-		if (relay_fd[i] >= 0)
-			close(relay_fd[i]);
+		if (relay_fd[avail_cpus[i]] >= 0)
+			close(relay_fd[avail_cpus[i]]);
 		else
 			break;
+	}
+	for (i = 0; i < ncpus; i++) {
+		pthread_mutex_destroy(&mutex[avail_cpus[i]]);
 	}
 	dbug(2, "done\n");
 }

@@ -1,5 +1,7 @@
 # Makefile.am --- automake input file for systemtap per-method probing
 
+AUTOMAKE_OPTIONS = subdir-objects
+
 JAVA_ARCH:=$(target_cpu)
 # XXX: the following arch names are based generally off the rpmspec
 # for java-1.7.0-openjdk, there might be omissions in some weird cases
@@ -8,6 +10,8 @@ override JAVA_ARCH:=$(JAVA_ARCH:i%86=i386)
 override JAVA_ARCH:=$(JAVA_ARCH:sparcv9=sparc)
 override JAVA_ARCH:=$(JAVA_ARCH:sparc64=sparcv9)
 override JAVA_ARCH:=$(JAVA_ARCH:arm%=arm)
+override JAVA_ARCH:=$(JAVA_ARCH:powerpc64le%=ppc64le)
+override JAVA_ARCH:=$(JAVA_ARCH:powerpc64%=ppc64)
 
 # XXX: perhaps autoconfigure the following?
 JAVAC = javac
@@ -16,7 +20,7 @@ JAR = jar
 BUILT_SOURCES = 
 CLEANFILES =
 
-#AM_CFLAGS = -Wall -Werror -W -Wformat=2 -Wno-format-nonliteral -g 
+#AM_CFLAGS = -Wall -Werror -W -Wformat=2 -g
 AM_CFLAGS = -g
 AM_CFLAGS += -I$(builddir)/../includes/sys
 AM_CFLAGS += -I$(srcdir)/../includes

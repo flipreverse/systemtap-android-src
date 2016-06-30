@@ -1,5 +1,5 @@
 // session functions
-// Copyright (C) 2010-2013 Red Hat Inc.
+// Copyright (C) 2010-2015 Red Hat Inc.
 //
 // This file is part of systemtap, and is free software.  You can
 // redistribute it and/or modify it under the terms of the GNU General
@@ -22,6 +22,8 @@
 #include "cmdline.h"
 #include "git_version.h"
 #include "version.h"
+#include "stringtable.h"
+#include "tapsets.h"
 
 #include <cerrno>
 #include <cstdlib>
@@ -34,8 +36,10 @@ extern "C" {
 #include <sys/utsname.h>
 #include <sys/resource.h>
 #include <elfutils/libdwfl.h>
+#include <elfutils/version.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <wordexp.h>
 }
 
 #if HAVE_NSS
@@ -63,14 +67,12 @@ systemtap_session::systemtap_session ():
   runtime_mode(kernel_runtime),
   base_hash(0),
   pattern_root(new match_node),
-  user_file (0),
   dfa_counter (0),
   dfa_maxstate (0),
   dfa_maxtag (0),
   need_tagged_dfa (false),
   be_derived_probes(0),
-  dwarf_derived_probes(0),
-  kprobe_derived_probes(0),
+  generic_kprobe_derived_probes(0),
   hwbkpt_derived_probes(0),
   perf_derived_probes(0),
   uprobe_derived_probes(0),
@@ -85,7 +87,6 @@ systemtap_session::systemtap_session ():
   hrtimer_derived_probes(0),
   procfs_derived_probes(0),
   dynprobe_derived_probes(0),
-  java_derived_probes(0),
   op (0), up (0),
   sym_kprobes_text_start (0),
   sym_kprobes_text_end (0),
@@ -96,6 +97,7 @@ systemtap_session::systemtap_session ():
   suppressed_warnings(0),
   suppressed_errors(0),
   warningerr_count(0),
+  target_namespaces_pid(0),
   last_token (0)
 {
   struct utsname buf;
@@ -117,14 +119,13 @@ systemtap_session::systemtap_session ():
   unoptimized = false;
   suppress_warnings = false;
   panic_warnings = false;
-  listing_mode = false;
-  listing_mode_vars = false;
-  dump_probe_types = false;
+  dump_mode = systemtap_session::dump_none;
+  dump_matched_pattern = "";
 
 #ifdef ENABLE_PROLOGUES
-  prologue_searching = true;
+  prologue_searching_mode = prologue_searching_always;
 #else
-  prologue_searching = false;
+  prologue_searching_mode = prologue_searching_auto;
 #endif
 
   buffer_size = 0;
@@ -134,7 +135,10 @@ systemtap_session::systemtap_session ():
   pid_file = "";
   output_file = ""; // -o FILE
   tmpdir_opt_set = false;
+  monitor = false;
+  monitor_interval = 1;
   save_module = false;
+  save_uprobes = false;
   modname_given = false;
   keep_tmpdir = false;
   cmd = "";
@@ -146,18 +150,18 @@ systemtap_session::systemtap_session ():
   need_uprobes = false;
   need_unwind = false;
   need_symbols = false;
+  need_lines = false;
   uprobes_path = "";
-  consult_symtab = false;
   load_only = false;
   skip_badvars = false;
   privilege = pr_stapdev;
   privilege_set = false;
-  omit_werror = false;
   compatible = VERSION; // XXX: perhaps also process GIT_SHAID if available?
   unwindsym_ldd = false;
   client_options = false;
   server_cache = NULL;
-  automatic_server_mode = false;
+  auto_privilege_level_msg = "";
+  auto_server_msgs.clear ();
   use_server_on_error = false;
   try_server_status = try_server_unset;
   use_remote_prefix = false;
@@ -169,9 +173,12 @@ systemtap_session::systemtap_session ():
   sysroot = "";
   update_release_sysroot = false;
   suppress_time_limits = false;
+  target_namespaces_pid = 0;
   color_mode = color_auto;
   color_errors = isatty(STDERR_FILENO) // conditions for coloring when
     && strcmp(getenv("TERM") ?: "notdumb", "dumb"); // on auto
+  interactive_mode = false;
+  pass_1a_complete = false;
 
   // PR12443: put compiled-in / -I paths in front, to be preferred during 
   // tapset duplicate-file elimination
@@ -239,7 +246,6 @@ systemtap_session::systemtap_session ():
   if (s_kr != NULL) {
     setup_kernel_release(s_kr);
   }
-  create_tmp_dir();
 }
 
 systemtap_session::systemtap_session (const systemtap_session& other,
@@ -251,12 +257,13 @@ systemtap_session::systemtap_session (const systemtap_session& other,
   runtime_mode(other.runtime_mode),
   base_hash(0),
   pattern_root(new match_node),
-  user_file (other.user_file),
+  user_files (other.user_files),
   dfa_counter(0),
+  dfa_maxstate (0),
+  dfa_maxtag (0),
   need_tagged_dfa(other.need_tagged_dfa),
   be_derived_probes(0),
-  dwarf_derived_probes(0),
-  kprobe_derived_probes(0),
+  generic_kprobe_derived_probes(0),
   hwbkpt_derived_probes(0),
   perf_derived_probes(0),
   uprobe_derived_probes(0),
@@ -271,7 +278,6 @@ systemtap_session::systemtap_session (const systemtap_session& other,
   hrtimer_derived_probes(0),
   procfs_derived_probes(0),
   dynprobe_derived_probes(0),
-  java_derived_probes(0),
   op (0), up (0),
   sym_kprobes_text_start (0),
   sym_kprobes_text_end (0),
@@ -282,10 +288,12 @@ systemtap_session::systemtap_session (const systemtap_session& other,
   suppressed_warnings(0),
   suppressed_errors(0),
   warningerr_count(0),
+  target_namespaces_pid(0),
   last_token (0)
 {
   release = kernel_release = kern;
   kernel_build_tree = "/lib/modules/" + kernel_release + "/build";
+  kernel_extra_cflags = other.kernel_extra_cflags;
   architecture = machine = normalize_machine(arch);
   setup_kernel_release(kern.c_str());
   native_build = false; // assumed; XXX: could be computed as in check_options()
@@ -304,11 +312,10 @@ systemtap_session::systemtap_session (const systemtap_session& other,
   unoptimized = other.unoptimized;
   suppress_warnings = other.suppress_warnings;
   panic_warnings = other.panic_warnings;
-  listing_mode = other.listing_mode;
-  listing_mode_vars = other.listing_mode_vars;
-  dump_probe_types = other.dump_probe_types;
+  dump_mode = other.dump_mode;
+  dump_matched_pattern = other.dump_matched_pattern;
 
-  prologue_searching = other.prologue_searching;
+  prologue_searching_mode = other.prologue_searching_mode;
 
   buffer_size = other.buffer_size;
   last_pass = other.last_pass;
@@ -317,7 +324,10 @@ systemtap_session::systemtap_session (const systemtap_session& other,
   pid_file = other.pid_file;
   output_file = other.output_file; // XXX how should multiple remotes work?
   tmpdir_opt_set = false;
+  monitor = other.monitor;
+  monitor_interval = other.monitor_interval;
   save_module = other.save_module;
+  save_uprobes = other.save_uprobes;
   modname_given = other.modname_given;
   keep_tmpdir = other.keep_tmpdir;
   cmd = other.cmd;
@@ -329,13 +339,12 @@ systemtap_session::systemtap_session (const systemtap_session& other,
   need_uprobes = false;
   need_unwind = false;
   need_symbols = false;
+  need_lines = false;
   uprobes_path = "";
-  consult_symtab = other.consult_symtab;
   load_only = other.load_only;
   skip_badvars = other.skip_badvars;
   privilege = other.privilege;
   privilege_set = other.privilege_set;
-  omit_werror = other.omit_werror;
   compatible = other.compatible;
   unwindsym_ldd = other.unwindsym_ldd;
   client_options = other.client_options;
@@ -352,6 +361,8 @@ systemtap_session::systemtap_session (const systemtap_session& other,
   suppress_time_limits = other.suppress_time_limits;
   color_errors = other.color_errors;
   color_mode = other.color_mode;
+  interactive_mode = other.interactive_mode;
+  pass_1a_complete = other.pass_1a_complete;
 
   include_path = other.include_path;
   runtime_path = other.runtime_path;
@@ -367,6 +378,7 @@ systemtap_session::systemtap_session (const systemtap_session& other,
   // copy them from "other".  In the same order as declared...
   script_file = other.script_file;
   cmdline_script = other.cmdline_script;
+  additional_scripts = other.additional_scripts;
   c_macros = other.c_macros;
   args = other.args;
   kbuildflags = other.kbuildflags;
@@ -379,9 +391,11 @@ systemtap_session::systemtap_session (const systemtap_session& other,
   specified_servers = other.specified_servers;
   server_trust_spec = other.server_trust_spec;
   server_args = other.server_args;
+  mok_fingerprints = other.mok_fingerprints;
 
   unwindsym_modules = other.unwindsym_modules;
-  automatic_server_mode = other.automatic_server_mode;
+  auto_privilege_level_msg = other.auto_privilege_level_msg;
+  auto_server_msgs = other.auto_server_msgs;
 
   create_tmp_dir();
 }
@@ -426,37 +440,39 @@ systemtap_session::clone(const string& arch, const string& release)
   return s;
 }
 
+
+string
+systemtap_session::version_string ()
+{
+  string elfutils_version1;
+#ifdef _ELFUTILS_VERSION
+  elfutils_version1 = "0." + lex_cast(_ELFUTILS_VERSION);
+#endif
+  string elfutils_version2 = dwfl_version(NULL);
+
+  if (elfutils_version1 != elfutils_version2)
+    elfutils_version2 += string("/") + elfutils_version1;
+
+  return string (VERSION) + "/" + elfutils_version2 + ", " + STAP_EXTENDED_VERSION;
+}
+
 void
 systemtap_session::version ()
 {
-  clog << _F("Systemtap translator/driver (version %s/%s, %s)\n"
-             "Copyright (C) 2005-2013 Red Hat, Inc. and others\n"
-             "This is free software; see the source for copying conditions.",
-             VERSION, dwfl_version(NULL), STAP_EXTENDED_VERSION) << endl;
-  clog << _("enabled features:")
+  cout << _F("Systemtap translator/driver (version %s)\n"
+             "Copyright (C) 2005-2015 Red Hat, Inc. and others\n"
+             "This is free software; see the source for copying conditions.\n",
+             version_string().c_str());
+
+  cout << _("enabled features:")
 #ifdef HAVE_AVAHI
        << " AVAHI"
-#endif
-#ifdef HAVE_LIBRPM
-       << " LIBRPM"
-#endif
-#ifdef HAVE_LIBSQLITE3
-       << " LIBSQLITE3"
-#endif
-#ifdef HAVE_NSS
-       << " NSS"
 #endif
 #ifdef HAVE_BOOST_SHARED_PTR_HPP
        << " BOOST_SHARED_PTR"
 #endif
-#ifdef HAVE_TR1_UNORDERED_MAP
-       << " TR1_UNORDERED_MAP"
-#endif
-#ifdef ENABLE_PROLOGUES
-       << " PROLOGUES"
-#endif
-#ifdef ENABLE_NLS
-       << " NLS"
+#ifdef HAVE_BOOST_UTILITY_STRING_REF_HPP
+       << " BOOST_STRING_REF"
 #endif
 #ifdef HAVE_DYNINST
        << " DYNINST"
@@ -464,11 +480,32 @@ systemtap_session::version ()
 #ifdef HAVE_JAVA
        << " JAVA"
 #endif
+#ifdef HAVE_LIBRPM
+       << " LIBRPM"
+#endif
+#ifdef HAVE_LIBSQLITE3
+       << " LIBSQLITE3"
+#endif
 #ifdef HAVE_LIBVIRT
        << " LIBVIRT"
 #endif
 #ifdef HAVE_LIBXML2
        << " LIBXML2"
+#endif
+#ifdef ENABLE_NLS
+       << " NLS"
+#endif
+#ifdef HAVE_NSS
+       << " NSS"
+#endif
+#ifdef ENABLE_PROLOGUES
+       << " PROLOGUES"
+#endif
+#ifdef HAVE_TR1_UNORDERED_MAP
+       << " TR1_UNORDERED_MAP"
+#endif
+#ifdef HAVE_LIBREADLINE
+       << " READLINE"
 #endif
        << endl;
 }
@@ -485,13 +522,17 @@ systemtap_session::usage (int exitcode)
     }
 
   version ();
-  clog
+  cout
     << endl
-    << _F("Usage: stap [options] FILE         Run script in file.\n"
-     "   or: stap [options] -            Run script on stdin.\n"
-     "   or: stap [options] -e SCRIPT    Run given script.\n"
-     "   or: stap [options] -l PROBE     List matching probes.\n"
-     "   or: stap [options] -L PROBE     List matching probes and local variables.\n\n"
+    << _F(
+     "Usage: stap [options] FILE                    Run script in file.\n"
+     "   or: stap [options] -                       Run script on stdin.\n"
+     "   or: stap [options] -e SCRIPT               Run given script.\n"
+     "   or: stap [options] -l PROBE                List matching probes.\n"
+     "   or: stap [options] -L PROBE                List matching probes and local variables.\n"
+     "   or: stap [options] --dump-probe-types      List available probe types.\n"
+     "   or: stap [options] --dump-probe-aliases    List available probe aliases.\n"
+     "   or: stap [options] --dump-functions        List available functions.\n\n"
      "Options (in %s/rc and on command line):\n"
      "   --         end of translator options, script options follow\n"
      "   -h --help  show help\n"
@@ -501,37 +542,37 @@ systemtap_session::usage (int exitcode)
      "   -v         add verbosity to all passes\n"
      "   --vp {N}+  add per-pass verbosity [", data_path.c_str(), last_pass);
   for (unsigned i=0; i<5; i++)
-    clog << (perpass_verbose[i] <= 9 ? perpass_verbose[i] : 9);
-  clog 
+    cout << (perpass_verbose[i] <= 9 ? perpass_verbose[i] : 9);
+  cout 
     << "]" << endl;
-    clog << _F("   -k         keep temporary directory\n"
+    cout << _F("   -k         keep temporary directory\n"
      "   -u         unoptimized translation %s\n"
      "   -w         suppress warnings %s\n"
      "   -W         turn warnings into errors %s\n"
      "   -g         guru mode %s\n"
      "   -P         prologue-searching for function probes %s\n"
      "   -b         bulk (percpu file) mode %s\n"
+#ifdef HAVE_LIBREADLINE
+     "   -i         interactive mode %s\n"
+#endif
      "   -s NUM     buffer size in megabytes, instead of %d\n"
      "   -I DIR     look in DIR for additional .stp script files", (unoptimized ? _(" [set]") : ""),
          (suppress_warnings ? _(" [set]") : ""), (panic_warnings ? _(" [set]") : ""),
-         (guru_mode ? _(" [set]") : ""), (prologue_searching ? _(" [set]") : ""),
-         (bulk_mode ? _(" [set]") : ""), buffer_size);
+         (guru_mode ? _(" [set]") : ""), (prologue_searching_mode == prologue_searching_always ? _(" [set]") : ""),
+         (bulk_mode ? _(" [set]") : ""),
+#ifdef HAVE_LIBREADLINE
+         (interactive_mode ? _(" [set]") : ""),
+#endif
+	 buffer_size);
   if (include_path.size() == 0)
-    clog << endl;
-  else{
-	if (!excl_include_path) {
-	  clog << ", in addition to" << endl;
-	  for (unsigned i=0; i<include_path.size(); i++)
-		clog << "              " << include_path[i] << endl;
-	}
-	else {
-		clog << endl;
-	}
-  }
-  clog
-	<< "   -j DIR     look *only* in DIR for .stp script files - the default directories or any other one given by -I are ignored" << (excl_include_path ? " [set]" : "") << endl;    
-  clog
-    << _F("   -D NM=VAL  emit macro definition into generated C code\n"
+    cout << endl;
+  else
+    cout << _(", in addition to") << endl;
+  for (unsigned i=0; i<include_path.size(); i++)
+    cout << "              " << include_path[i].c_str() << endl;
+  cout
+	<< "   -K DIR     look *only* in DIR for .stp script files - the default directories or any other ones given by -I are ignored" << (excl_include_path ? " [set]" : "") << endl;    
+  cout << _F("   -D NM=VAL  emit macro definition into generated C code\n"
     "   -B NM=VAL  pass option to kbuild make\n"
     "   --modinfo NM=VAL\n"
     "              include a MODULE_INFO(NM,VAL) in the generated C code\n"
@@ -545,9 +586,11 @@ systemtap_session::usage (int exitcode)
     "   -a ARCH    cross-compile to given architecture, instead of %s\n"
     "   -m MODULE  set probe module name, instead of \n"
     "              %s\n"
-    "   -M PIDFILE Create a pid file while running\n"
+    "   -U PIDFILE Create a pid file while running\n"
     "   -o FILE    send script output to file, instead of stdout. This supports\n" 
     "              strftime(3) formats for FILE\n"
+    "   -E SCRIPT  run the SCRIPT in addition to the main script specified\n"
+    "              through -e or a script file\n"
     "   -c CMD     start the probes, run CMD, and exit when it finishes\n"
     "   -x PID     sets target() to PID\n"
     "   -F         run as on-file flight recorder with -o.\n"
@@ -555,16 +598,16 @@ systemtap_session::usage (int exitcode)
     "   -S size[,n] set maximum of the size and the number of files.\n"
     "   -d OBJECT  add unwind/symbol data for OBJECT file", runtime_path.c_str(), kernel_build_tree.c_str(), architecture.c_str(), module_name.c_str());
   if (unwindsym_modules.size() == 0)
-    clog << endl;
+    cout << endl;
   else
-    clog << _(", in addition to") << endl;
+    cout << _(", in addition to") << endl;
   {
     vector<string> syms (unwindsym_modules.begin(), unwindsym_modules.end());
     for (unsigned i=0; i<syms.size(); i++)
-      clog << "              " << syms[i].c_str() << endl;
+      cout << "              " << syms[i].c_str() << endl;
   }
-  clog
-    << _F("   --ldd      add unwind/symbol data for all referenced object files.\n"
+  cout
+    << _F("   --ldd      add unwind/symbol data for referenced user-space objects.\n"
     "   --all-modules\n"
     "              add unwind/symbol data for all loaded kernel objects.\n"
     "   -t         collect probe timing information\n"
@@ -577,6 +620,8 @@ systemtap_session::usage (int exitcode)
     "   --dyninst\n"
     "              shorthand for --runtime=dyninst\n"
 #endif /* HAVE_DYNINST */
+    "   --prologue-searching[=WHEN]\n"
+    "              prologue-searching for function probes\n"
     "   --privilege=PRIVILEGE_LEVEL\n"
     "              check the script for constructs not allowed at the given privilege level\n"
     "   --unprivileged\n"
@@ -623,7 +668,15 @@ systemtap_session::usage (int exitcode)
     "              variables (e.g. PATH, LD_LIBRARY_PATH) are assumed to be\n"
     "              relative to the sysroot.\n"
     "   --suppress-time-limits\n"
-    "              disable -DSTP_NO_OVERLOAD -DMAXACTION and -DMAXTRYACTION limits\n"
+    "              disable -DSTP_OVERLOAD, -DMAXACTION, and -DMAXTRYACTION limits\n"
+    "   --save-uprobes\n"
+    "              save uprobes.ko to current directory if it is built from source\n"
+    "   --target-namesapce=PID\n"
+    "              sets the target namespaces pid to PID\n"
+#if HAVE_MONITOR_LIBS
+    "   --monitor=INTERVAL\n"
+    "              enables monitor interfaces\n"
+#endif
     , compatible.c_str()) << endl
   ;
 
@@ -631,7 +684,7 @@ systemtap_session::usage (int exitcode)
   time (& now);
   struct tm* t = localtime (& now);
   if (t && t->tm_mon*3 + t->tm_mday*173 == 0xb6)
-    clog << morehelp << endl;
+    cout << morehelp << endl;
 
   throw exit_exception (exitcode);
 }
@@ -667,8 +720,9 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
 
         case 'G':
           // Make sure the global option is only composed of the
-          // following chars: [_=a-zA-Z0-9]
-          assert_regexp_match("-G parameter", optarg, "^[a-z_][a-z0-9_]*=[a-z0-9_-]+$");
+          // following chars: [_=a-zA-Z0-9.-]
+          assert(optarg);
+          assert_regexp_match("-G parameter", optarg, "^[a-z_][a-z0-9_]*=[a-z0-9_.-]+$");
           globalopts.push_back (string(optarg));
           break;
 
@@ -688,27 +742,24 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
 	  break;
 
         case 'p':
+          assert(optarg);
           last_pass = (int)strtoul(optarg, &num_endptr, 10);
           if (*num_endptr != '\0' || last_pass < 1 || last_pass > 5)
             {
               cerr << _("Invalid pass number (should be 1-5).") << endl;
               return 1;
             }
-          if (listing_mode && last_pass != 2)
-            {
-              cerr << _("Listing (-l) mode implies pass 2.") << endl;
-              return 1;
-            }
 	  server_args.push_back (string ("-") + (char)grc + optarg);
           break;
 
-		case 'j':
+	 case 'K':
 	  if (excl_executed)
 	    break;
 	  include_path.clear();
 	  excl_include_path = true;
 
         case 'I':
+          assert(optarg);
 	  if (client_options)
 	    client_options_disallowed_for_unprivileged += client_options_disallowed_for_unprivileged.empty () ? "-I" : ", -I";
 	  if (include_arg_start == -1)
@@ -719,6 +770,7 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
           break;
 
         case 'd':
+          assert(optarg);
 	  server_args.push_back (string ("-") + (char)grc + optarg);
           {
             // Make sure an empty data object wasn't specified (-d "")
@@ -736,12 +788,13 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
           }
 
         case 'e':
+          assert(optarg);
 	  if (have_script)
-	    {
-	      cerr << _("Only one script can be given on the command line.")
-		   << endl;
+           {
+             cerr << _("Only one script can be given on the command line.")
+                  << endl;
               return 1;
-	    }
+           }
 	  server_args.push_back (string ("-") + (char)grc + optarg);
           cmdline_script = string (optarg);
           have_script = true;
@@ -752,19 +805,30 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
 	  pid_file = string (optarg);
 	  break;
 
+        case 'E':
+          assert(optarg);
+          server_args.push_back (string("-") + (char)grc + optarg);
+          additional_scripts.push_back(string (optarg));
+          // don't set have_script to true, since this script is meant to be
+          // given in addition to a script/script_file.
+          break;
+
         case 'o':
+          assert(optarg);
           // NB: client_options not a problem, since pass 1-4 does not use output_file.
 	  server_args.push_back (string ("-") + (char)grc + optarg);
           output_file = string (optarg);
           break;
 
         case 'R':
+          assert(optarg);
           if (client_options) { cerr << _F("ERROR: %s invalid with %s", "-R", "--client-options") << endl; return 1; }
 	  runtime_specified = true;
           runtime_path = string (optarg);
           break;
 
         case 'm':
+          assert(optarg);
 	  if (client_options)
 	    client_options_disallowed_for_unprivileged += client_options_disallowed_for_unprivileged.empty () ? "-m" : ", -m";
           module_name = string (optarg);
@@ -803,6 +867,7 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
           break;
 
         case 'r':
+          assert(optarg);
           if (client_options) // NB: no paths!
             assert_regexp_match("-r parameter from client", optarg, "^[a-z0-9_.-]+$");
 	  server_args.push_back (string ("-") + (char)grc + optarg);
@@ -810,6 +875,7 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
           break;
 
         case 'a':
+          assert(optarg);
           assert_regexp_match("-a parameter", optarg, "^[a-z0-9_-]+$");
 	  server_args.push_back (string ("-") + (char)grc + optarg);
           architecture = string(optarg);
@@ -826,9 +892,16 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
           guru_mode = true;
           break;
 
+	case 'i':
+#ifdef HAVE_LIBREADLINE
+          if (client_options) { cerr << _F("ERROR: %s invalid with %s", "-i", "--client-options") << endl; return 1; } 
+	  interactive_mode = true;
+#endif
+	  break;
+
         case 'P':
 	  server_args.push_back (string ("-") + (char)grc);
-          prologue_searching = true;
+          prologue_searching_mode = prologue_searching_always;
           break;
 
         case 'b':
@@ -842,6 +915,7 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
 	  break;
 
         case 's':
+          assert(optarg);
           buffer_size = (int) strtoul (optarg, &num_endptr, 10);
           if (*num_endptr != '\0' || buffer_size < 1 || buffer_size > 4095)
             {
@@ -852,6 +926,7 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
           break;
 
 	case 'c':
+          assert(optarg);
 	  cmd = string (optarg);
           if (cmd == "")
             {
@@ -864,6 +939,7 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
 	  break;
 
 	case 'x':
+          assert(optarg);
 	  target_pid = (int) strtoul(optarg, &num_endptr, 10);
 	  if (*num_endptr != '\0')
 	    {
@@ -874,6 +950,7 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
 	  break;
 
 	case 'D':
+          assert(optarg);
           assert_regexp_match ("-D parameter", optarg, "^[a-z_][a-z_0-9]*(=-?[a-z_0-9]+)?$");
 	  if (client_options)
 	    client_options_disallowed_for_unprivileged += client_options_disallowed_for_unprivileged.empty () ? "-D" : ", -D";
@@ -883,6 +960,7 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
 
 	case 'S':
           assert_regexp_match ("-S parameter", optarg, "^[0-9]+(,[0-9]+)?$");
+          assert(optarg);
 	  server_args.push_back (string ("-") + (char)grc + optarg);
 	  size_option = string (optarg);
 	  break;
@@ -898,22 +976,32 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
           break;
 
         case 'L':
-          listing_mode_vars = true;
-          unoptimized = true; // This causes retention of variables for listing_mode
-          // fallthrough
-        case 'l':
-	  suppress_warnings = true;
-          listing_mode = true;
-          last_pass = 2;
-          if (have_script)
+          if (dump_mode)
             {
-	      cerr << _("Only one script can be given on the command line.")
-		   << endl;
-	      return 1;
+              cerr << _("ERROR: only one of the -l/-L/--dump-* "
+                        "switches may be specified") << endl;
+              return 1;
             }
-	  server_args.push_back (string ("-") + (char)grc + optarg);
-          cmdline_script = string("probe ") + string(optarg) + " {}";
-          have_script = true;
+          assert(optarg);
+          server_args.push_back (string ("-") + (char)grc + optarg);
+          dump_mode = systemtap_session::dump_matched_probes_vars;
+          dump_matched_pattern = optarg;
+          unoptimized = true; // This causes retention of vars for listing
+          suppress_warnings = true;
+          break;
+
+        case 'l':
+          if (dump_mode)
+            {
+              cerr << _("ERROR: only one of the -l/-L/--dump-* "
+                        "switches may be specified") << endl;
+              return 1;
+            }
+          assert(optarg);
+          server_args.push_back (string ("-") + (char)grc + optarg);
+          dump_mode = systemtap_session::dump_matched_probes;
+          dump_matched_pattern = optarg;
+          suppress_warnings = true;
           break;
 
         case 'F':
@@ -923,6 +1011,7 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
 
 	case 'B':
           if (client_options) { cerr << _F("ERROR: %s invalid with %s", "-B", "--client-options") << endl; return 1; } 
+          assert(optarg);
 	  server_args.push_back (string ("-") + (char)grc + optarg);
           kbuildflags.push_back (string (optarg));
 	  break;
@@ -933,6 +1022,7 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
 
 	case LONG_OPT_VERBOSE_PASS:
 	  {
+            assert(optarg);
 	    bool ok = true;
 	    if (strlen(optarg) < 1 || strlen(optarg) > 5)
 	      ok = false;
@@ -1003,11 +1093,6 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
 	  server_args.push_back ("--unprivileged");
 	  /* NB: for server security, it is essential that once this flag is
 	     set, no future flag be able to unset it. */
-	  break;
-
-	case LONG_OPT_OMIT_WERROR:
-	  server_args.push_back (OMIT_WERROR_NAME);
-	  omit_werror = true;
 	  break;
 
 	case LONG_OPT_CLIENT_OPTIONS:
@@ -1178,10 +1263,41 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
 	  systemtap_v_check = true;
 	  break;
 
-	case LONG_OPT_DUMP_PROBE_TYPES:
-	  server_args.push_back ("--dump-probe-types");
-	  dump_probe_types = true;
-	  break;
+        case LONG_OPT_DUMP_PROBE_TYPES:
+          if (dump_mode)
+            {
+              cerr << _("ERROR: only one of the -l/-L/--dump-* "
+                        "switches may be specified") << endl;
+              return 1;
+            }
+          server_args.push_back ("--dump-probe-types");
+          dump_mode = systemtap_session::dump_probe_types;
+          break;
+
+        case LONG_OPT_DUMP_PROBE_ALIASES:
+          if (dump_mode)
+            {
+              cerr << _("ERROR: only one of the -l/-L/--dump-* "
+                        "switches may be specified") << endl;
+              return 1;
+            }
+          server_args.push_back ("--dump-probe-aliases");
+          suppress_warnings = true;
+          dump_mode = systemtap_session::dump_probe_aliases;
+          break;
+
+        case LONG_OPT_DUMP_FUNCTIONS:
+          if (dump_mode)
+            {
+              cerr << _("ERROR: only one of the -l/-L/--dump-* "
+                        "switches may be specified") << endl;
+              return 1;
+            }
+          server_args.push_back ("--dump-functions");
+          suppress_warnings = true;
+          dump_mode = systemtap_session::dump_functions;
+          unoptimized = true; // Keep unused functions (which is all of them)
+          break;
 
 	case LONG_OPT_SUPPRESS_HANDLER_ERRORS:
 	  suppress_handler_errors = true;
@@ -1350,6 +1466,47 @@ systemtap_session::parse_cmdline (int argc, char * const argv [])
                     strcmp(getenv("TERM") ?: "notdumb", "dumb"));
           break;
 
+        case LONG_OPT_PROLOGUE_SEARCHING:
+          // --prologue-searching without arg is equivalent to always
+          if (!optarg || !strcmp(optarg, "always"))
+            prologue_searching_mode = prologue_searching_always;
+          else if (!strcmp(optarg, "auto"))
+            prologue_searching_mode = prologue_searching_auto;
+          else if (!strcmp(optarg, "never"))
+            prologue_searching_mode = prologue_searching_never;
+          else {
+            cerr << _F("Invalid argument '%s' for --prologue-searching.", optarg) << endl;
+            return 1;
+          }
+          break;
+
+        case LONG_OPT_SAVE_UPROBES:
+          save_uprobes = true;
+          break;
+
+        case LONG_OPT_TARGET_NAMESPACES:
+          assert(optarg);
+          target_namespaces_pid = (int) strtoul(optarg, &num_endptr, 10);
+          if (*num_endptr != '\0' || target_namespaces_pid < 1)
+            {
+              cerr << _("Invalid process ID number for target namespaces.") << endl;
+              return 1;
+            }
+          break;
+
+        case LONG_OPT_MONITOR:
+          monitor = true;
+          if (optarg)
+            {
+              monitor_interval = (int) strtoul(optarg, &num_endptr, 10);
+              if (*num_endptr != '\0' || monitor_interval < 1)
+                {
+                  cerr << _("Invalid monitor interval.") << endl;
+                  return 1;
+                }
+            }
+          break;
+
 	case '?':
 	  // Invalid/unrecognized option given or argument required, but
 	  // not given. In both cases getopt_long() will have printed the
@@ -1383,7 +1540,7 @@ systemtap_session::parse_cmdline_runtime (const string& opt_runtime)
       cerr << _("ERROR: --runtime=dyninst unavailable; this build lacks DYNINST feature") << endl;
       version();
       return false;
-#endif
+#else
       if (privilege_set && pr_unprivileged != privilege)
         {
           cerr << _("ERROR: --runtime=dyninst implies unprivileged mode only") << endl;
@@ -1392,6 +1549,7 @@ systemtap_session::parse_cmdline_runtime (const string& opt_runtime)
       privilege = pr_unprivileged;
       privilege_set = true;
       runtime_mode = dyninst_runtime;
+#endif
     }
   else
     {
@@ -1407,7 +1565,7 @@ systemtap_session::check_options (int argc, char * const argv [])
 {
   for (int i = optind; i < argc; i++)
     {
-      if (! have_script)
+      if (! have_script && ! dump_mode)
         {
           script_file = string (argv[i]);
           have_script = true;
@@ -1416,8 +1574,10 @@ systemtap_session::check_options (int argc, char * const argv [])
         args.push_back (string (argv[i]));
     }
 
-  // We don't need a script with --list-servers, --trust-servers, or --dump-probe-types.
-  bool need_script = server_status_strings.empty () && server_trust_spec.empty () && ! dump_probe_types;
+  // We don't need a script with --list-servers, --trust-servers, or any dump mode
+  bool need_script = server_status_strings.empty () &&
+                     server_trust_spec.empty () &&
+                     !dump_mode && !interactive_mode;
 
   if (benchmark_sdt_loops > 0 || benchmark_sdt_threads > 0)
     {
@@ -1444,6 +1604,33 @@ systemtap_session::check_options (int argc, char * const argv [])
       cerr << _("A script must be specified.") << endl;
       usage(1);
     }
+  if (dump_mode && have_script)
+    {
+      cerr << _("Cannot specify a script with -l/-L/--dump-* switches.") << endl;
+      usage(1);
+    }
+  if (dump_mode && last_pass != 5)
+    {
+      cerr << _("Cannot specify -p with -l/-L/--dump-* switches.") << endl;
+      usage(1);
+    }
+  if (dump_mode && interactive_mode)
+    {
+      cerr << _("Cannot specify -i with -l/-L/--dump-* switches.") << endl;
+      usage(1);
+    }
+  if (dump_mode && monitor)
+    {
+      cerr << _("Cannot specify --monitor with -l/-L/--dump-* switches.") << endl;
+      usage(1);
+    }
+  // FIXME: we need to think through other options that shouldn't be
+  // used with '-i'.
+  if (interactive_mode && have_script)
+    {
+      cerr << _("Cannot specify a script with -i") << endl;
+      usage(1);
+    }
 
 #if ! HAVE_NSS
   if (client_options)
@@ -1459,6 +1646,14 @@ systemtap_session::check_options (int argc, char * const argv [])
     {
       print_warning("--trust-servers is not supported by this version of systemtap");
       server_trust_spec.clear ();
+    }
+#endif
+
+#if ! HAVE_MONITOR_LIBS
+  if (monitor)
+    {
+      print_warning("Monitor mode is not supported by this version of systemtap");
+      exit(1);
     }
 #endif
 
@@ -1490,24 +1685,27 @@ systemtap_session::check_options (int argc, char * const argv [])
 	  // the privilege level to match our credentials.
 	  if (pr_contains (credentials, pr_stapsys))
 	    {
-	      if (perpass_verbose[0] > 1)
-		cerr << _("Using --privilege=stapsys for member of the group stapsys") << endl;
 	      privilege = pr_stapsys;
 	      server_args.push_back ("--privilege=stapsys");
+	      auto_privilege_level_msg =
+		_("--privilege=stapsys was automatically selected because you are a member "
+		  "of the groups stapusr and stapsys.  [man stap]");
 	    }
 	  else if (pr_contains (credentials, pr_stapusr))
 	    {
-	      if (perpass_verbose[0] > 1)
-		cerr << _("Using --privilege=stapusr for member of the group stapusr") << endl;
 	      privilege = pr_stapusr;
 	      server_args.push_back ("--privilege=stapusr");
+	      auto_privilege_level_msg =
+		_("--privilege=stapusr was automatically selected because you are a member "
+		  "of the group stapusr.  [man stap]");
 	    }
 	  else
 	    {
 	      // Completely unprivileged user.
 	      cerr << _("You are trying to run systemtap as a normal user.\n"
 			"You should either be root, or be part of "
-			"the group \"stapusr\" and possibly one of the groups \"stapsys\" or \"stapdev\".\n");
+			"the group \"stapusr\" and possibly one of the groups "
+			"\"stapsys\" or \"stapdev\".  [man stap]\n");
 #if HAVE_DYNINST
 	      cerr << _("Alternatively, you may specify --runtime=dyninst for userspace probing.\n");
 #endif
@@ -1518,14 +1716,10 @@ systemtap_session::check_options (int argc, char * const argv [])
       // it for pass 5.
       if (! pr_contains (credentials, pr_stapdev))
 	{
-	  if (specified_servers.empty ())
-	    {
-	      if (perpass_verbose[0] > 1)
-		cerr << _F("Using --use-server for user with privilege level %s",
-			   pr_name (privilege))
-		     << endl;
-	      specified_servers.push_back ("");
-	    }
+	  enable_auto_server (
+            _F("For users with the privilege level %s, the module created by compiling your "
+	       "script must be signed by a trusted systemtap compile-server.  [man stap-server]",
+	       pr_name (credentials)));
 	}
     }
 
@@ -1591,8 +1785,22 @@ systemtap_session::check_options (int argc, char * const argv [])
   const char *tmpdir = getenv("TMPDIR");
   if (tmpdir != NULL)
     assert_regexp_match("TMPDIR", tmpdir, "^[-/._0-9a-z]+$");
-}
 
+  // If the kernel is using signed modules, we need to enforce server
+  // use.
+  if (!client_options && modules_must_be_signed())
+    {
+      // Force server use to be on, if not on already.
+      enable_auto_server (
+	_("The kernel on your system requires modules to be signed for loading.\n"
+	  "The module created by compiling your script must be signed by a systemtap "
+	  "compile-server.  [man stap-server]"));
+
+      // Cache the current system's machine owner key (MOK)
+      // information, to pass over to the server.
+      get_mok_info();
+    }
+}
 
 int
 systemtap_session::parse_kernel_config ()
@@ -1661,10 +1869,10 @@ systemtap_session::parse_kernel_exports ()
         kernel_exports.insert (tokens[1]);
     }
   if (verbose > 2)
-    clog << _NF("Parsed kernel %s, which contained one vmlinux export",
-                        "Parsed kernel %s, which contained %zu vmlinux exports",
-                         kernel_exports.size(), kernel_exports_file.c_str(),
-                         kernel_exports.size()) << endl;
+    clog << _NF("Parsed kernel \"%s\", containing one vmlinux export",
+                "Parsed kernel \"%s\", containing %zu vmlinux exports",
+                kernel_exports.size(), kernel_exports_file.c_str(),
+                kernel_exports.size()) << endl;
 
   kef.close();
   return 0;
@@ -1684,20 +1892,22 @@ systemtap_session::parse_kernel_functions ()
 	clog << _F("Kernel symbol table %s unavailable, (%s)",
 		   system_map_path.c_str(), strerror(errno)) << endl;
 
-      string system_map_path2 = "/boot/System.map-" + kernel_release;
+      system_map_path = "/boot/System.map-" + kernel_release;
       system_map.clear();
-      system_map.open(system_map_path2.c_str(), ifstream::in);
+      system_map.open(system_map_path.c_str(), ifstream::in);
       if (! system_map.is_open())
         {
 	  if (verbose > 1)
 	    clog << _F("Kernel symbol table %s unavailable, (%s)",
-		       system_map_path2.c_str(), strerror(errno)) << endl;
+		       system_map_path.c_str(), strerror(errno)) << endl;
         }
     }
 
-  string address, type, name;
   while (system_map.good())
     {
+      assert_no_interrupts();
+
+      string address, type, name;
       system_map >> address >> type >> name;
 
       if (verbose > 3)
@@ -1721,7 +1931,63 @@ systemtap_session::parse_kernel_functions ()
       kernel_functions.insert(name);
     }
   system_map.close();
+
+  if (kernel_functions.size() == 0)
+    print_warning ("Kernel function symbol table missing [man warning::symbols]", 0);
+
+  if (verbose > 2)
+    clog << _F("Parsed kernel \"%s\", ", system_map_path.c_str())
+         << _NF("containing %zu symbol", "containing %zu symbols",
+                kernel_functions.size(), kernel_functions.size()) << endl;
+
   return 0;
+}
+
+
+string
+systemtap_session::cmd_file ()
+{
+  wordexp_t words;
+  string file;
+  
+  if (target_pid && cmd == "")
+    {
+      // check that the target_pid corresponds to a running process
+      string err_msg;
+      if(!is_valid_pid (target_pid, err_msg))
+        throw SEMANTIC_ERROR(err_msg);
+
+      file = string("/proc/") + lex_cast(target_pid) + "/exe";
+    }
+  else // default is to assume -c flag was given
+    {  
+      int rc = wordexp (cmd.c_str (), &words, WRDE_NOCMD|WRDE_UNDEF);
+      if(rc == 0)
+        {
+          if (words.we_wordc > 0)
+            file = words.we_wordv[0];
+          wordfree (& words);
+        }
+      else
+        {
+          switch (rc)
+            {
+              case WRDE_BADCHAR:
+                throw SEMANTIC_ERROR(_("command contains illegal characters"));
+              case WRDE_BADVAL:
+                throw SEMANTIC_ERROR(_("command contains undefined shell variables"));
+              case WRDE_CMDSUB:
+                throw SEMANTIC_ERROR(_("command contains command substitutions"));
+              case WRDE_NOSPACE:
+                throw SEMANTIC_ERROR(_("out of memory"));
+              case WRDE_SYNTAX:
+                throw SEMANTIC_ERROR(_("command contains shell syntax errors"));
+              default:
+                throw SEMANTIC_ERROR(_("unspecified wordexp failure"));
+           }  
+        }
+    }
+  return file;
 }
 
 
@@ -1814,7 +2080,7 @@ void
 systemtap_session::register_library_aliases()
 {
   vector<stapfile*> files(library_files);
-  files.push_back(user_file);
+  files.insert(files.end(), user_files.begin(), user_files.end());
 
   for (unsigned f = 0; f < files.size(); ++f)
     {
@@ -1834,7 +2100,7 @@ systemtap_session::register_library_aliases()
                       // XXX: alias parameters
                       if (comp->arg)
                         throw SEMANTIC_ERROR(_F("alias component %s contains illegal parameter",
-                                                comp->functor.c_str()));
+                                                comp->functor.to_string().c_str()));
                       mn = mn->bind(comp->functor);
                     }
 		  // PR 12916: All probe aliases are OK for all users. The actual
@@ -1845,11 +2111,9 @@ systemtap_session::register_library_aliases()
             }
           catch (const semantic_error& e)
             {
-              semantic_error* er = new SEMANTIC_ERROR (_("while registering probe alias"),
-                                                       alias->tok);
-              er->chain = & e;
-              print_error (* er);
-              delete er;
+              semantic_error er(ERR_SRC, _("while registering probe alias"),
+                                alias->tok, NULL, &e);
+              print_error (er);
             }
 	}
     }
@@ -1892,7 +2156,7 @@ void
 systemtap_session::print_error (const semantic_error& se)
 {
   // skip error message printing for listing mode with low verbosity
-  if (this->listing_mode && this->verbose <= 1)
+  if (this->dump_mode && this->verbose <= 1)
     {
       seen_errors[se.errsrc_chain()]++; // increment num_errors()
       return;
@@ -1902,7 +2166,7 @@ systemtap_session::print_error (const semantic_error& se)
   if (verbose > 0 || seen_errors[se.errsrc_chain()] < 1)
     {
       seen_errors[se.errsrc_chain()]++;
-      for (const semantic_error *e = &se; e != NULL; e = e->chain)
+      for (const semantic_error *e = &se; e != NULL; e = e->get_chain())
         cerr << build_error_msg(*e);
     }
   else suppressed_errors++;
@@ -1917,10 +2181,21 @@ systemtap_session::build_error_msg (const semantic_error& e)
   message << colorize(_("semantic error:"), "error") << ' ' << e.what ();
   if (e.tok1 || e.tok2)
     message << ": ";
+  else
+    {
+      print_error_details (message, align_semantic_error, e);
+      message << endl;
+      if (verbose > 1) // no tokens to print, so print any errsrc right there
+	message << _("   thrown from: ") << e.errsrc;
+    }
+
   if (e.tok1)
     {
       print_token (message, e.tok1);
+      print_error_details (message, align_semantic_error, e);
       message << endl;
+      if (verbose > 1)
+        message << _("   thrown from: ") << e.errsrc << endl;
       print_error_source (message, align_semantic_error, e.tok1);
     }
   if (e.tok2)
@@ -1946,7 +2221,7 @@ systemtap_session::print_error_source (std::ostream& message,
 
   unsigned line = tok->location.line;
   unsigned col = tok->location.column;
-  const string &file_contents = tok->location.file->file_contents;
+  interned_string file_contents = tok->location.file->file_contents;
 
   size_t start_pos = 0, end_pos = 0;
   //Navigate to the appropriate line
@@ -1958,19 +2233,30 @@ systemtap_session::print_error_source (std::ostream& message,
     }
   //TRANSLATORS: Here we are printing the source string of the error
   message << align << _("source: ");
-  string srcline = file_contents.substr(start_pos, end_pos-start_pos-1);
-  if (color_errors &&
-      // Only colorize tokens whose content is known to match the source
-      // content.  e.g. tok_string doesn't qualify because of the double-quotes.
-      // tok_embedded lacks the %{ %}. tok_junk is just junky.
-      (tok->type == tok_number ||
-       tok->type == tok_identifier || 
-       tok->type == tok_operator)) {
-    // Split into before token, token, and after token
-    string tok_content = tok->content;
-    message << srcline.substr(0, col-1);
-    message << colorize(tok_content, "token");
-    message << srcline.substr(col+tok_content.size()-1) << endl;
+  interned_string srcline = file_contents.substr(start_pos, end_pos-start_pos-1);
+  if (color_errors) {
+      // before token:
+      message << srcline.substr(0, col-1);
+      // token:
+      // after token:
+      // ... hold it - the token might have been synthetic,
+      // or expanded from a $@ command line argument, or ...
+      // so tok->content may have nothing in common with the
+      // contents of srcline at the same point.
+      interned_string srcline_rest = srcline.substr(col-1);
+      interned_string srcline_tokenish = srcline_rest.substr(0, tok->content.size());
+      if (srcline_tokenish == tok->content) { // oh good
+        message << colorize(tok->content, "token");
+        message << srcline_rest.substr(tok->content.size());
+        message << endl;
+      }
+      else { // oh bad
+        message << " ... ";
+        col += 5; // line up with the caret
+        message << colorize(tok->content, "token");
+        message << " ... " << srcline_rest;
+        message << endl;
+      }
   } else
     message << srcline << endl;
   message << align << "        ";
@@ -1983,12 +2269,33 @@ systemtap_session::print_error_source (std::ostream& message,
 	message << ' ';
     }
   message << colorize("^", "caret") << endl;
+
+  // print chained macro invocations and synthesized code
+  if (tok->chain)
+    {
+      if (tok->location.file->synthetic)
+	message << _("\tin synthesized code from: ");
+      else
+	message << _("\tin expansion of macro: ");
+      message << colorize(tok->chain) << endl;
+      print_error_source (message, align, tok->chain);
+    }
+}
+
+void
+systemtap_session::print_error_details (std::ostream& message,
+					std::string& align,
+					const semantic_error& e)
+{
+  for (size_t i = 0; i < e.details.size(); ++i)
+    message << endl << align << e.details[i];
 }
 
 void
 systemtap_session::print_warning (const string& message_str, const token* tok)
 {
-  if (suppress_warnings)
+  // Only output in dump mode if -vv is supplied:
+  if (suppress_warnings && (!dump_mode || verbose <= 1))
     return; // NB: don't count towards suppressed_warnings count
 
   // Duplicate elimination
@@ -2039,10 +2346,11 @@ systemtap_session::build_error_msg (const parse_error& pe,
 
   // print either pe.what() or a deferred error from the lexer
   bool found_junk = false;
-  if (tok && tok->type == tok_junk && tok->msg != "")
+  if (tok && tok->type == tok_junk && tok->junk_type != tok_junk_unknown)
     {
       found_junk = true;
-      message << colorize(_("parse error:"), "error") << ' ' << tok->msg << endl;
+      message << colorize(_("parse error:"), "error") << ' '
+              << tok->junk_message(*this) << endl;
     }
   else
     {
@@ -2055,25 +2363,18 @@ systemtap_session::build_error_msg (const parse_error& pe,
 
   if (pe.tok || found_junk)
     {
-      message << _("\tat: ") << colorize(tok) << endl;
+      message << align_parse_error << _("    at: ") << colorize(tok) << endl;
       print_error_source (message, align_parse_error, tok);
     }
   else if (tok) // "expected" type error
     {
-      message << _("\tsaw: ") << colorize(tok) << endl;
+      message << align_parse_error << _("   saw: ") << colorize(tok) << endl;
       print_error_source (message, align_parse_error, tok);
     }
   else
     {
-      message << _("\tsaw: ") << input_name << " EOF" << endl;
+      message << align_parse_error << _("   saw: ") << input_name << " EOF" << endl;
     }
-
-  // print chained macro invocations
-  while (tok && tok->chain) {
-    tok = tok->chain;
-    message << _("\tin expansion of macro: ") << colorize(tok) << endl;
-    print_error_source (message, align_parse_error, tok);
-  }
   message << endl;
 
   return message.str();
@@ -2098,6 +2399,9 @@ void
 systemtap_session::create_tmp_dir()
 {
   if (!tmpdir.empty())
+    return;
+
+  if (tmpdir_opt_set)
     return;
 
   // Create the temp directory
@@ -2153,11 +2457,12 @@ systemtap_session::reset_tmp_dir()
   create_tmp_dir();
 }
 
-translator_output* systemtap_session::op_create_auxiliary()
+translator_output* systemtap_session::op_create_auxiliary(bool trailer_p)
 {
   static int counter = 0;
   string tmpname = this->tmpdir + "/" + this->module_name + "_aux_" + lex_cast(counter++) + ".c";
   translator_output* n = new translator_output (tmpname);
+  n->trailer_p = trailer_p;
   auxiliary_outputs.push_back (n);
   return n;
 }
@@ -2225,8 +2530,10 @@ systemtap_session::parse_stap_color(const std::string& type)
   int done = 0;
 
   key = getenv("SYSTEMTAP_COLORS");
-  if (key == NULL || *key == '\0')
+  if (key == NULL)
     key = "error=01;31:warning=00;33:source=00;34:caret=01:token=01";
+  else if (*key == '\0')
+    return ""; // disable colors if set but empty
 
   while (!done) {
     if (!(col = strchr(key, ':'))) {
@@ -2246,6 +2553,161 @@ systemtap_session::parse_stap_color(const std::string& type)
 
   // Could not find the key
   return "";
+}
+
+/*
+ * Returns true if this system requires modules to have signatures
+ * (typically on a secure boot system), false otherwise.
+ *
+ * This routine parses /sys/module/module/parameters/sig_enforce to
+ * figure out if signatures are enforced on modules. Note that if the
+ * file doesn't exist, we don't really care and return false.
+ *
+ * On certain kernels (RHEL7), we also have to check
+ * /sys/kernel/security/securelevel.
+ */
+bool
+systemtap_session::modules_must_be_signed()
+{
+  ifstream statm("/sys/module/module/parameters/sig_enforce");
+  ifstream securelevel("/sys/kernel/security/securelevel");
+  char status = 'N';
+
+  statm >> status;
+  if (status == 'Y')
+    return true;
+
+  securelevel >> status;
+  if (status == '1')
+    return true;
+  return false;
+}
+
+/*
+ * Get information on the list of enrolled machine owner keys (MOKs) on
+ * this system.
+ */ 
+void
+systemtap_session::get_mok_info()
+{
+  vector<string> cmd;
+  int rc;
+  stringstream out;
+
+  // FIXME: In theory, we should be able to read /sys files and use
+  // some of the guts of read_cert_info_from_file() to get the
+  // fingerprints. This would rid us of our mokutil
+  // dependency. However, we'd need to copy/duplicate efilib.c from
+  // mokutil source to be able to decipher the efi data.
+
+  cmd.push_back("mokutil");
+  cmd.push_back("--list-enrolled");
+  rc = stap_system_read(verbose, cmd, out);
+  if (rc != 0)
+    // If we're here, we know the client requires module signing, but
+    // we can't get the list of MOKs. Quit.
+    throw runtime_error(_F("failed to get list of machine owner keys (MOK) fingerprints: rc %d", rc));
+
+  string line, fingerprint;
+  while (! out.eof())
+    {
+      vector<string> matches;
+
+      // Get a line of the output, then try to find the fingerprint in
+      // the line.
+      getline(out, line);
+      if (! regexp_match(line, "^SHA1 Fingerprint: ([0-9a-f:]+)$", matches))
+        {
+	  // matches[0] is the entire line, matches[1] is the first
+	  // submatch, in this case the actual fingerprint
+	  if (verbose > 2)
+	    clog << "MOK fingerprint found: " << matches[1] << endl;
+	  if (! matches[1].empty())
+	    mok_fingerprints.push_back(matches[1]);
+	}
+    }
+}
+
+void
+systemtap_session::enable_auto_server (const string &message)
+{
+  // There may be more than one reason to enable auto server mode, so we may be called
+  // more than once. Accumulate the messages.
+  auto_server_msgs.push_back (message);
+
+#if HAVE_NSS
+  // Enable auto server mode, if not enabled already.
+  if (specified_servers.empty())
+    specified_servers.push_back ("");
+#else
+  // Compilation using a server is not supported. exit() after
+  // the first explanation.
+  explain_auto_options ();
+  clog << _("Unable to request compilation by a compile-server\n."
+	    "Without NSS, --use-server is not supported by this version systemtap.") << endl;
+  exit(1);
+#endif
+}
+
+void
+systemtap_session::explain_auto_options()
+{
+  // Was there an automatic privilege setting?
+  if (! auto_privilege_level_msg.empty())
+    clog << auto_privilege_level_msg << endl;
+
+  // Was a server was automatically requested? Handle this one after other auto_settings
+  // which may result in an auto_server setting.
+  if (! auto_server_msgs.empty())
+    {
+      for (vector<string>::iterator i = auto_server_msgs.begin(); i != auto_server_msgs.end(); ++i)
+	{
+	  clog << *i << endl;
+	  clog << _("--use-server was automatically selected in order to request compilation by "
+		    "a compile-server.") << endl;
+	}
+    }
+}
+
+bool
+systemtap_session::is_user_file (const string &name)
+{
+  // base the check on the name of the user_file
+  for (vector<stapfile*>::iterator it = user_files.begin(); it != user_files.end(); it++)
+    if (name == (*it)->name)
+      return true;
+  return false; // no match
+}
+
+bool
+systemtap_session::is_primary_probe (derived_probe *dp)
+{
+  // We check if this probe is from the primary user file by going back to its
+  // original probe and checking if that probe was found in the primary user
+  // file.
+
+  if (user_files.empty())
+    return false;
+
+  vector<probe*> chain;
+  dp->collect_derivation_chain (chain);
+  const source_loc& origin = chain.back()->tok->location;
+  return origin.file == user_files[0];
+}
+
+void
+systemtap_session::clear_script_data()
+{
+  delete pattern_root;
+  pattern_root = new match_node;
+
+  // We need to be sure to reset all our error counts, so that an
+  // error on one script won't be counted against the next script.
+  seen_warnings.clear();
+  suppressed_warnings = 0;
+  seen_errors.clear();
+  suppressed_errors = 0;
+  warningerr_count = 0;
 }
 
 // --------------------------------------------------------------------------

@@ -1,12 +1,14 @@
 #ifndef TASK_FINDER_VMA_C
 #define TASK_FINDER_VMA_C
 
+#include <linux/file.h>
 #include <linux/list.h>
 #include <linux/jhash.h>
-#include <linux/spinlock.h>
 
 #include <linux/fs.h>
 #include <linux/dcache.h>
+
+#include "stp_helper_lock.h"
 
 // __stp_tf_vma_lock protects the hash table.
 // Documentation/spinlocks.txt suggest we can be a bit more clever
@@ -15,7 +17,7 @@
 // contents in interrupt context (which should only ever call 
 // stap_find_vma_map_info for getting stored vma info). So we might
 // want to look into that if this seems a bottleneck.
-static DEFINE_RWLOCK(__stp_tf_vma_lock);
+static STP_DEFINE_RWLOCK(__stp_tf_vma_lock);
 
 #define __STP_TF_HASH_BITS 4
 #define __STP_TF_TABLE_SIZE (1 << __STP_TF_HASH_BITS)
@@ -180,17 +182,17 @@ stap_add_vma_map_info(struct task_struct *tsk,
 	// Take a write lock, since we are most likely going to write
 	// after reading. But reserve a new entry first outside the lock.
 	new_entry = __stp_tf_vma_new_entry();
-	write_lock_irqsave(&__stp_tf_vma_lock, flags);
+	stp_write_lock_irqsave(&__stp_tf_vma_lock, flags);
 	entry = __stp_tf_get_vma_map_entry_internal(tsk, vm_start);
 	if (entry != NULL) {
-		write_unlock_irqrestore(&__stp_tf_vma_lock, flags);
+		stp_write_unlock_irqrestore(&__stp_tf_vma_lock, flags);
 		if (new_entry)
 			__stp_tf_vma_release_entry(new_entry);
 		return -EBUSY;	/* Already there */
 	}
 
 	if (!new_entry) {
-		write_unlock_irqrestore(&__stp_tf_vma_lock, flags);
+		stp_write_unlock_irqrestore(&__stp_tf_vma_lock, flags);
 		return -ENOMEM;
 	}
 
@@ -213,7 +215,7 @@ stap_add_vma_map_info(struct task_struct *tsk,
 
 	head = &__stp_tf_vma_map[__stp_tf_vma_map_hash(tsk)];
 	hlist_add_head(&entry->hlist, head);
-	write_unlock_irqrestore(&__stp_tf_vma_lock, flags);
+	stp_write_unlock_irqrestore(&__stp_tf_vma_lock, flags);
 	return 0;
 }
 
@@ -234,13 +236,13 @@ stap_extend_vma_map_info(struct task_struct *tsk,
 
 	// Take a write lock, since we are most likely going to write
 	// to the entry after reading, if its vm_end matches our vm_start.
-	write_lock_irqsave(&__stp_tf_vma_lock, flags);
+	stp_write_lock_irqsave(&__stp_tf_vma_lock, flags);
 	entry = __stp_tf_get_vma_map_entry_end_internal(tsk, vm_start);
 	if (entry != NULL) {
 		entry->vm_end = vm_end;
 		res = 0;
 	}
-	write_unlock_irqrestore(&__stp_tf_vma_lock, flags);
+	stp_write_unlock_irqrestore(&__stp_tf_vma_lock, flags);
 	return res;
 }
 
@@ -258,14 +260,14 @@ stap_remove_vma_map_info(struct task_struct *tsk, unsigned long vm_start)
 	// Take a write lock since we are most likely going to delete
 	// after reading.
 	unsigned long flags;
-	write_lock_irqsave(&__stp_tf_vma_lock, flags);
+	stp_write_lock_irqsave(&__stp_tf_vma_lock, flags);
 	entry = __stp_tf_get_vma_map_entry_internal(tsk, vm_start);
 	if (entry != NULL) {
 		hlist_del(&entry->hlist);
 		__stp_tf_vma_release_entry(entry);
                 rc = 0;
 	}
-	write_unlock_irqrestore(&__stp_tf_vma_lock, flags);
+	stp_write_unlock_irqrestore(&__stp_tf_vma_lock, flags);
 	return rc;
 }
 
@@ -288,7 +290,7 @@ stap_find_vma_map_info(struct task_struct *tsk, unsigned long addr,
 	if (__stp_tf_vma_map == NULL)
 		return rc;
 
-	read_lock_irqsave(&__stp_tf_vma_lock, flags);
+	stp_read_lock_irqsave(&__stp_tf_vma_lock, flags);
 	head = &__stp_tf_vma_map[__stp_tf_vma_map_hash(tsk)];
 	stap_hlist_for_each_entry(entry, node, head, hlist) {
 		if (tsk->pid == entry->pid
@@ -309,7 +311,7 @@ stap_find_vma_map_info(struct task_struct *tsk, unsigned long addr,
 			*user = found_entry->user;
 		rc = 0;
 	}
-	read_unlock_irqrestore(&__stp_tf_vma_lock, flags);
+	stp_read_unlock_irqrestore(&__stp_tf_vma_lock, flags);
 	return rc;
 }
 
@@ -332,7 +334,7 @@ stap_find_vma_map_info_user(struct task_struct *tsk, void *user,
 	if (__stp_tf_vma_map == NULL)
 		return rc;
 
-	read_lock_irqsave(&__stp_tf_vma_lock, flags);
+	stp_read_lock_irqsave(&__stp_tf_vma_lock, flags);
 	head = &__stp_tf_vma_map[__stp_tf_vma_map_hash(tsk)];
 	stap_hlist_for_each_entry(entry, node, head, hlist) {
 		if (tsk->pid == entry->pid
@@ -350,7 +352,7 @@ stap_find_vma_map_info_user(struct task_struct *tsk, void *user,
 			*path = found_entry->path;
 		rc = 0;
 	}
-	read_unlock_irqrestore(&__stp_tf_vma_lock, flags);
+	stp_read_unlock_irqrestore(&__stp_tf_vma_lock, flags);
 	return rc;
 }
 
@@ -363,7 +365,7 @@ stap_drop_vma_maps(struct task_struct *tsk)
 	struct __stp_tf_vma_entry *entry;
 
 	unsigned long flags;
-	write_lock_irqsave(&__stp_tf_vma_lock, flags);
+	stp_write_lock_irqsave(&__stp_tf_vma_lock, flags);
 	head = &__stp_tf_vma_map[__stp_tf_vma_map_hash(tsk)];
         stap_hlist_for_each_entry_safe(entry, node, n, head, hlist) {
             if (tsk->pid == entry->pid) {
@@ -371,25 +373,69 @@ stap_drop_vma_maps(struct task_struct *tsk)
 		    __stp_tf_vma_release_entry(entry);
             }
         }
-	write_unlock_irqrestore(&__stp_tf_vma_lock, flags);
+	stp_write_unlock_irqrestore(&__stp_tf_vma_lock, flags);
 	return 0;
 }
 
-/* Find the main executable for this mm.
- * NB: mmap_sem should be held already. */
+/*
+ * stap_find_exe_file - acquire a reference to the mm's executable file
+ *
+ * Returns NULL if mm has no associated executable file.  User must
+ * release file via fput().
+ */
 static struct file*
 stap_find_exe_file(struct mm_struct* mm)
 {
-	/* VM_EXECUTABLE was killed in kernel commit e9714acf, but in kernels
-	 * that new we can just use mm->exe_file anyway.  (PR14712)  */
-#ifdef VM_EXECUTABLE
-	struct vm_area_struct *vma;
-	for (vma = mm->mmap; vma; vma = vma->vm_next)
-		if ((vma->vm_flags & VM_EXECUTABLE) && vma->vm_file)
-			return vma->vm_file;
-	return NULL;
+	// The following kernel commit changed the way the exported
+	// get_mm_exe_file() works. This commit first appears in the
+	// 4.1 kernel:
+	//
+	// commit 90f31d0ea88880f780574f3d0bb1a227c4c66ca3
+	// Author: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+	// Date:   Thu Apr 16 12:47:56 2015 -0700
+	// 
+	//     mm: rcu-protected get_mm_exe_file()
+	//     
+	//     This patch removes mm->mmap_sem from mm->exe_file read side.
+	//     Also it kills dup_mm_exe_file() and moves exe_file
+	//     duplication into dup_mmap() where both mmap_sems are
+	//     locked.
+	//
+	// So, for kernels >= 4.1, we'll use get_mm_exe_file(). For
+	// kernels < 4.1 but with get_mm_exe_file() exported, we'll
+	// still use our own code. The original get_mm_exe_file() can
+	// sleep (since it calls down_read()), so we'll have to roll
+	// our own.
+#if defined(STAPCONF_DPATH_PATH) && (LINUX_VERSION_CODE >= KERNEL_VERSION(4,1,0))
+	return get_mm_exe_file(mm);
 #else
-	return mm->exe_file;
+	struct file *exe_file = NULL;
+
+	// The down_read() function can sleep, so we'll call
+	// down_read_trylock() instead, which can fail.  If it
+	// fails, we'll just pretend this task didn't have a
+	// exe file.
+	if (mm && down_read_trylock(&mm->mmap_sem)) {
+
+		// VM_EXECUTABLE was killed in kernel commit e9714acf,
+		// but in kernels that new we can just use
+		// mm->exe_file anyway. (PR14712)
+#ifdef VM_EXECUTABLE
+		struct vm_area_struct *vma;
+		for (vma = mm->mmap; vma; vma = vma->vm_next) {
+			if ((vma->vm_flags & VM_EXECUTABLE) && vma->vm_file) {
+				exe_file = vma->vm_file;
+				break;
+			}
+		}
+#else
+		exe_file = mm->exe_file;
+#endif
+		if (exe_file)
+			get_file(exe_file);
+		up_read(&mm->mmap_sem);
+	}
+	return exe_file;
 #endif
 }
 

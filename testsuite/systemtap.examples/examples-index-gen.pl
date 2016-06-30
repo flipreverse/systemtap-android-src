@@ -1,6 +1,6 @@
 #! /usr/bin/perl
 # Generates index files from examples .meta file info.
-# Copyright (C) 2008-2011 Red Hat Inc.
+# Copyright (C) 2008-2015 Red Hat Inc.
 #
 # This file is part of systemtap, and is free software.  You can
 # redistribute it and/or modify it under the terms of the GNU General
@@ -24,6 +24,13 @@ if ($#ARGV >= 0) {
     $inputdir = ".";
 }
 $inputdir = abs_path($inputdir);
+
+# get current stap version
+open(PIPE, " $inputdir/../../configure -V |") or die ("can't find stap version");
+my $version_line = <PIPE>;
+$version_line =~ /systemtap configure (.*)/ or die ("can't parse configure -V");
+my $version = "For systemtap version ${1}.";
+close(PIPE);
 
 my $outputdir;
 if ($#ARGV >= 1) {
@@ -60,8 +67,10 @@ sub add_meta_txt(*;$) {
 
     $Text::Wrap::separator = " \\\n";
     my $usage = wrap('', '  ', $scripts{$meta}{test_installcheck});
-    print $file "\n  # $usage\n";
-    $Text::Wrap::separator = "\n";
+    if ($usage =~ /[a-z]/) {
+        print $file "\n  # $usage\n";
+    }
+     $Text::Wrap::separator = "\n";
 
     print $file "\n\n";
 }
@@ -86,14 +95,21 @@ sub add_meta_html(*;$) {
     }
     print $file "<br>\n";
 
-    print $file "<p>".encode_entities($scripts{$meta}{description});
+    print $file "<p>".encode_entities($scripts{$meta}{description})."</p>";
 
-    $Text::Wrap::separator = " \\\n";
-    my $usage = wrap('', '', $scripts{$meta}{test_installcheck});
-    $Text::Wrap::separator = "\n";
-    my $usage = encode_entities($usage);
-
-    print $file "<p><font size=\"-2\"><pre># $usage</pre></font>";
+    my $txt = $name;
+    $txt =~ s/.stp$/.txt/;
+    if (-e $txt) { # prefer .txt file link
+        print $file "<p><i><a href=\"$txt\">sample usage in $txt</i></font>";
+    } else {
+        $Text::Wrap::separator = " \\\n";
+        my $usage = wrap('', '', $scripts{$meta}{test_installcheck});
+        $Text::Wrap::separator = "\n";
+        if ($usage =~ /[a-z]/) {
+            $usage = encode_entities($usage);
+            print $file "<p><font size=\"-2\"><pre># $usage</pre></font>";
+        }
+    }
 
     print $file "</p>\n";
 }
@@ -118,13 +134,30 @@ open (FULLINDEX, ">$fullindex")
     || die "couldn't open $fullindex: $!";
 print "Creating $fullindex...\n";
 print FULLINDEX $HEADER;
-
+print FULLINDEX "\n$version\n\n";
+    
 my $fullhtml = "$outputdir/index.html";
 open (FULLHTML, ">$fullhtml")
     || die "couldn't open $fullhtml: $!";
 print "Creating $fullhtml...\n";
 print FULLHTML $HTMLHEADER;
-print FULLHTML "<h2>All Examples</h2>\n";
+print FULLHTML "<p><em>$version</em></p>";
+
+print FULLHTML "<h2>Best Examples</h2>\n";
+print FULLHTML "<ul>\n"; 
+foreach $meta (sort keys %scripts) {
+    my $isbest = 0;
+    foreach $keyword (split(/ /, $scripts{$meta}{keywords})) {
+	if ($keyword eq "_best") { $isbest = 1; }
+    }
+    if ($isbest) {
+        print FULLHTML "<li><a href=\"#".$scripts{$meta}{name}."\">";
+        print FULLHTML $scripts{$meta}{name}." - ".$scripts{$meta}{title};
+        print FULLHTML "</a></li>\n";
+    }
+}
+print FULLHTML "</ul>\n\n";
+print FULLHTML "<h2>All " . scalar (keys %scripts) . " Examples</h2>\n";
 print FULLHTML "<ul>\n";
 
 foreach $meta (sort keys %scripts) {
@@ -160,19 +193,23 @@ open (KEYINDEX, ">$keyindex")
     || die "couldn't open $keyindex: $!";
 print "Creating $keyindex...\n";
 print KEYINDEX $KEYHEADER;
+print KEYINDEX "\n$version\n\n";
 
 my $keyhtml = "$outputdir/keyword-index.html";
 open (KEYHTML, ">$keyhtml")
     || die "couldn't open $keyhtml: $!";
 print "Creating $keyhtml...\n";
 print KEYHTML $HTMLHEADER;
+print KEYHTML "<p><em>$version</em></p>";
+
 print KEYHTML "<h2>Examples by Keyword</h2>\n";
 
 # On top link list
 print KEYHTML "<p><tt>";
 foreach $keyword (sort keys %keywords) {
     print KEYHTML '<a href="#' . (uc $keyword) . '">'
-		  . (uc $keyword) . "</a> ";
+		  . (uc $keyword)
+                  . "(". (scalar keys @{$keywords{$keyword}}). ")</a> ";
 }
 print KEYHTML "</tt></p>\n";
 

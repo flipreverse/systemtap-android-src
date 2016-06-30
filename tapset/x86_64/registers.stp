@@ -5,9 +5,9 @@
 #endif
 %}
 
-global _reg_offsets, _r32_offsets, _stp_regs_registered
+@__private30 global _reg_offsets[34], _r32_offsets[10]
 
-function _stp_register_regs() {
+probe init {
 	/* Same order as pt_regs */
 	_reg_offsets["r15"] = 0
 	_reg_offsets["r14"] = 8
@@ -41,8 +41,6 @@ function _stp_register_regs() {
 	_r32_offsets["orig_eax"] = 120
 	_r32_offsets["eip"] = 128
 	_r32_offsets["esp"] = 152
-
-	_stp_regs_registered = 1
 }
 
 function _stp_get_register_by_offset:long (offset:long) %{ /* pure */
@@ -73,19 +71,11 @@ function _stp_sign_extend32:long (value:long) %{ /* pure */
 
 function _stp_register:long (name:string, sign_extend:long) {
 	reg32 = 0
-	if (!registers_valid()) {
-		error("cannot access CPU registers in this context")
-		return 0
-	}
-	if (!_stp_regs_registered)
-		_stp_register_regs()
+  assert(registers_valid(), "cannot access CPU registers in this context")
 	offset = _reg_offsets[name]
 	if (offset == 0 && !(name in _reg_offsets)) {
 		offset = _r32_offsets[name]
-		if (offset == 0 && !(name in _r32_offsets)) {
-			error("Unknown register: " . name)
-			return 0
-		}
+    assert(offset != 0 || (name in _r32_offsets), "Unknown register: " . name)
 		reg32 = 1
 	}
 	value =  _stp_get_register_by_offset(offset)
@@ -116,8 +106,16 @@ function u_register:long (name:string) {
  * If truncate=1, mask off the top 32 bits.
  * If sign_extend=1 and (truncate=1 or the probepoint we've hit is in a
  * 32-bit app), sign-extend the 32-bit value.
+ * If force64=1, return a 64-bit value even if we're in a 32-bit app.
  */
-function _stp_arg:long (argnum:long, sign_extend:long, truncate:long) %{ /* pure */
+function _stp_arg:long (argnum:long, sign_extend:long, truncate:long)
+{
+	return _stp_arg2(argnum, sign_extend, truncate, 0)
+}
+function _stp_arg2:long (argnum:long, sign_extend:long, truncate:long,
+			 force64:long)
+%{ /* pure */
+
 	long val;
 	struct pt_regs *regs;
 	int result, n, nr_regargs;
@@ -142,7 +140,7 @@ function _stp_arg:long (argnum:long, sign_extend:long, truncate:long) %{ /* pure
 			nr_regargs = 6;
 	} else
 		nr_regargs = (CONTEXT->regparm & _STP_REGPARM_MASK);
-	if (CONTEXT->user_mode_p && _stp_is_compat_task()) {
+	if (!STAP_ARG_force64 && CONTEXT->user_mode_p && _stp_is_compat_task()) {
 		argsz = sizeof(int);
 		result = _stp_get_arg32_by_number(n, nr_regargs, regs, &val);
 	} else
@@ -171,7 +169,8 @@ function _stp_arg:long (argnum:long, sign_extend:long, truncate:long) %{ /* pure
 	default:
 		goto bad_argnum;
 	}
-	if (STAP_ARG_truncate || argsz == sizeof(int)) {
+	if ((STAP_ARG_truncate || _stp_is_compat_task())
+	    && !STAP_ARG_force64) {
 		if (STAP_ARG_sign_extend)
 			STAP_RETVALUE = (int64_t) __stp_sign_extend32(val);
 		else
@@ -196,35 +195,44 @@ deref_fault: /* branched to from kread() */
 	}
 %}
 
-function probing_32bit_app() %{ /* pure */
+function probing_32bit_app:long() %{ /* pure */
 	STAP_RETVALUE = (CONTEXT->user_mode_p && _stp_is_compat_task());
 %}
 
+function arch_bytes:long() %{ /* pure */
+  STAP_RETVALUE = sizeof(long);
+%}
+
+function uarch_bytes:long() {
+  assert(user_mode(), "requires user mode")
+  return probing_32bit_app() ? 4 : 8
+}
+
 /* Return the value of function arg #argnum (1=first arg) as a signed int. */
 function int_arg:long (argnum:long) {
-	return _stp_arg(argnum, 1, 1)
+	return _stp_arg2(argnum, 1, 1, 0)
 }
 
 /* Return the value of function arg #argnum (1=first arg) as an unsigned int. */
 function uint_arg:long (argnum:long) {
-	return _stp_arg(argnum, 0, 1)
+	return _stp_arg2(argnum, 0, 1, 0)
 }
 
 function long_arg:long (argnum:long) {
-	return _stp_arg(argnum, 1, 0)
+	return _stp_arg2(argnum, 1, 0, 0)
 }
 
 function ulong_arg:long (argnum:long) {
-	return _stp_arg(argnum, 0, 0)
+	return _stp_arg2(argnum, 0, 0, 0)
 }
 
 function longlong_arg:long (argnum:long) {
 	if (probing_32bit_app()) {
-		lowbits = _stp_arg(argnum, 0, 1)
-		highbits = _stp_arg(argnum+1, 0, 1)
+		lowbits = _stp_arg2(argnum, 0, 1, 0)
+		highbits = _stp_arg2(argnum+1, 0, 1, 0)
 		return ((highbits << 32) | lowbits)
 	} else
-		return _stp_arg(argnum, 0, 0)
+		return _stp_arg2(argnum, 0, 0, 1)
 }
 
 function ulonglong_arg:long (argnum:long) {
@@ -232,7 +240,7 @@ function ulonglong_arg:long (argnum:long) {
 }
 
 function pointer_arg:long (argnum:long) {
-	return _stp_arg(argnum, 0, 0)
+	return _stp_arg2(argnum, 0, 0, 0)
 }
 
 function s32_arg:long (argnum:long) {

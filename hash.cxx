@@ -1,5 +1,5 @@
 // Copyright (C) Andrew Tridgell 2002 (original file)
-// Copyright (C) 2006-2011 Red Hat Inc. (systemtap changes)
+// Copyright (C) 2006-2014 Red Hat Inc. (systemtap changes)
 //
 // This program is free software; you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -139,6 +139,9 @@ get_base_hash (systemtap_session& s)
   s.base_hash = new stap_hash();
   stap_hash& h = *s.base_hash;
 
+  // Hash systemtap version
+  h.add("Systemtap version: ", s.version_string());
+
   // Hash kernel release and arch.
   h.add("Kernel Release: ", s.kernel_release);
   h.add_path("Kernel Build Tree ", s.kernel_build_tree);
@@ -221,14 +224,13 @@ find_script_hash (systemtap_session& s, const string& script)
   // Hash user-specified arguments (that change the generated module).
   h.add("Bulk Mode (-b): ", s.bulk_mode);
   h.add("Timing (-t): ", s.timing);
-  h.add("Prologue Searching (-P): ", s.prologue_searching);
   h.add("Skip Badvars (--skip-badvars): ", s.skip_badvars);
   h.add("Privilege (--privilege): ", s.privilege);
   h.add("Compatible (--compatible): ", s.compatible);
-  h.add("Omit Werror (undocumented): ", s.omit_werror);
-  h.add("Prologue Searching (-P): ", s.prologue_searching);
   h.add("Error suppression (--suppress-handler-errors): ", s.suppress_handler_errors);
   h.add("Suppress Time Limits (--suppress-time-limits): ", s.suppress_time_limits);
+  h.add("Prologue Searching (--prologue-searching[=WHEN]): ", int(s.prologue_searching_mode));
+
   for (unsigned i = 0; i < s.c_macros.size(); i++)
     h.add("Macros: ", s.c_macros[i]);
 

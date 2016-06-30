@@ -1,5 +1,5 @@
 // utrace tapset
-// Copyright (C) 2005-2013 Red Hat Inc.
+// Copyright (C) 2005-2014 Red Hat Inc.
 // Copyright (C) 2005-2007 Intel Corporation.
 //
 // This file is part of systemtap, and is free software.  You can
@@ -51,15 +51,15 @@ enum utrace_derived_probe_flags {
 struct utrace_derived_probe: public derived_probe
 {
   bool has_path;
-  string path;
+  interned_string path;
   bool has_library;
-  string library;
+  interned_string library;
   int64_t pid;
   enum utrace_derived_probe_flags flags;
   bool target_symbol_seen;
 
   utrace_derived_probe (systemtap_session &s, probe* p, probe_point* l,
-			bool hp, string &pn, int64_t pd,
+			bool hp, interned_string pn, int64_t pd,
 			enum utrace_derived_probe_flags f);
   void join_group (systemtap_session& s);
 
@@ -105,14 +105,12 @@ public:
 struct utrace_var_expanding_visitor: public var_expanding_visitor
 {
   utrace_var_expanding_visitor(systemtap_session& s, probe_point* l,
-			       const string& pn,
                                enum utrace_derived_probe_flags f):
-    sess (s), base_loc (l), probe_name (pn), flags (f),
+    sess (s), base_loc (l), flags (f),
     target_symbol_seen (false), add_block(NULL), add_probe(NULL) {}
 
   systemtap_session& sess;
   probe_point* base_loc;
-  string probe_name;
   enum utrace_derived_probe_flags flags;
   bool target_symbol_seen;
   block *add_block;
@@ -129,16 +127,17 @@ struct utrace_var_expanding_visitor: public var_expanding_visitor
 
 utrace_derived_probe::utrace_derived_probe (systemtap_session &s,
                                             probe* p, probe_point* l,
-					    bool hp, string &pn, int64_t pd,
+					    bool hp, interned_string pn, int64_t pd,
 					    enum utrace_derived_probe_flags f):
   derived_probe (p, l, true /* .components soon rewritten */ ),
   has_path(hp), path(pn), has_library(false), pid(pd), flags(f),
   target_symbol_seen(false)
 {
-  check_process_probe_kernel_support(s);
+  if (!s.runtime_usermode_p())
+    check_process_probe_kernel_support(s);
 
   // Expand local variables in the probe body
-  utrace_var_expanding_visitor v (s, l, name, flags);
+  utrace_var_expanding_visitor v (s, l, flags);
   v.replace (this->body);
   target_symbol_seen = v.target_symbol_seen;
 
@@ -208,6 +207,7 @@ utrace_derived_probe::join_group (systemtap_session& s)
       s.utrace_derived_probes = new utrace_derived_probe_group ();
     }
   s.utrace_derived_probes->enroll (this);
+  this->group = s.utrace_derived_probes;
 
   if (s.runtime_usermode_p())
     enable_dynprobes(s);
@@ -296,7 +296,7 @@ utrace_var_expanding_visitor::visit_target_symbol_cached (target_symbol* e)
       // calls at a time. The array will look like this:
       //
       //   _utrace_tvar_{name}_{num}
-      string aname = (string("_utrace_tvar_")
+      string aname = (string("__global_utrace_tvar_")
 		      + e->sym_name()
 		      + "_" + lex_cast(tick++));
       vardecl* vd = new vardecl;
@@ -486,9 +486,7 @@ utrace_var_expanding_visitor::visit_target_symbol_arg (target_symbol* e)
   if (e->name == "$$parms")
     {
       // copy from tracepoint
-      token* pf_tok = new token(*e->tok);
-      pf_tok->content = "sprintf";
-      print_format* pf = print_format::create(pf_tok);
+      print_format* pf = print_format::create(e->tok, "sprintf");
 
       target_symbol_seen = true;
 
@@ -506,7 +504,7 @@ utrace_var_expanding_visitor::visit_target_symbol_arg (target_symbol* e)
 	  functioncall* n = new functioncall; //same as the following
 	  n->tok = e->tok;
 	  n->function = "_utrace_syscall_arg";
-	  n->referent = 0;
+	  n->referents.clear();
 	  literal_number *num = new literal_number(i);
 	  num->tok = e->tok;
 	  n->args.push_back(num);
@@ -519,7 +517,7 @@ utrace_var_expanding_visitor::visit_target_symbol_arg (target_symbol* e)
      }
    else // $argN
      {
-        string argnum_s = e->name.substr(4,e->name.length()-4);
+        string argnum_s = (string)e->name.substr(4,e->name.length()-4);
         int argnum = 0;
         try
           {
@@ -548,7 +546,7 @@ utrace_var_expanding_visitor::visit_target_symbol_arg (target_symbol* e)
         functioncall* n = new functioncall;
         n->tok = e->tok;
         n->function = "_utrace_syscall_arg";
-        n->referent = 0; // NB: must not resolve yet, to ensure inclusion in session
+        n->referents.clear(); // NB: must not resolve yet, to ensure inclusion in session
 
         literal_number *num = new literal_number(argnum - 1);
         num->tok = e->tok;
@@ -561,7 +559,7 @@ utrace_var_expanding_visitor::visit_target_symbol_arg (target_symbol* e)
 void
 utrace_var_expanding_visitor::visit_target_symbol_context (target_symbol* e)
 {
-  const string& sname = e->name;
+  string sname = e->name;
 
   e->assert_no_components("utrace");
 
@@ -609,7 +607,7 @@ utrace_var_expanding_visitor::visit_target_symbol_context (target_symbol* e)
   functioncall* n = new functioncall;
   n->tok = e->tok;
   n->function = fname;
-  n->referent = 0; // NB: must not resolve yet, to ensure inclusion in session
+  n->referents.clear(); // NB: must not resolve yet, to ensure inclusion in session
 
   provide (n);
 }
@@ -656,7 +654,7 @@ struct utrace_builder: public derived_probe_builder
 		     literal_map_t const & parameters,
 		     vector<derived_probe *> & finished_results)
   {
-    string path, path_tgt;
+    interned_string path, path_tgt;
     int64_t pid;
 
     bool has_path = get_param (parameters, TOK_PROCESS, path);
@@ -685,6 +683,14 @@ struct utrace_builder: public derived_probe_builder
     else if (has_null_param (parameters, TOK_END))
       flags = UDPF_END;
 
+    // Check that if a pid was given, then it corresponds to a running process.
+    if (has_pid || sess.target_pid)
+      {
+	string pid_err_msg;
+	if (!is_valid_pid(has_pid ? pid : sess.target_pid, pid_err_msg))
+	  throw SEMANTIC_ERROR(pid_err_msg);
+      }
+
     // If we didn't get a path or pid, this means to probe everything.
     // Convert this to a pid-based probe.
     if (! has_path && ! has_pid)
@@ -699,15 +705,6 @@ struct utrace_builder: public derived_probe_builder
         path = find_executable (path, sess.sysroot, sess.sysenv);
         sess.unwindsym_modules.insert (path);
         path_tgt = path_remove_sysroot(sess, path);
-      }
-    else if (has_pid)
-      {
-	// We can't probe 'init' (pid 1).  XXX: where does this limitation come from?
-	if (pid < 2)
-	  throw SEMANTIC_ERROR (_("process pid must be greater than 1"),
-				location->components.front()->tok);
-
-        // XXX: could we use /proc/$pid/exe in unwindsym_modules and elsewhere?
       }
 
     finished_results.push_back(new utrace_derived_probe(sess, base, location,
@@ -866,7 +863,7 @@ utrace_derived_probe_group::emit_module_linux_decls (systemtap_session& s)
 
       // call probe function
       s.op->newline() << "(*p->probe->ph) (c);";
-      common_probe_entryfn_epilogue (s, true);
+      common_probe_entryfn_epilogue (s, true, otf_safe_context(s));
 
       s.op->newline() << "return;";
       s.op->newline(-1) << "}";
@@ -895,7 +892,7 @@ utrace_derived_probe_group::emit_module_linux_decls (systemtap_session& s)
 
       // call probe function
       s.op->newline() << "(*p->probe->ph) (c);";
-      common_probe_entryfn_epilogue (s, true);
+      common_probe_entryfn_epilogue (s, true, otf_safe_context(s));
 
       s.op->newline() << "if ((atomic_read (session_state()) != STAP_SESSION_STARTING) && (atomic_read (session_state()) != STAP_SESSION_RUNNING)) {";
       s.op->indent(1);
@@ -1183,7 +1180,7 @@ utrace_derived_probe_group::emit_module_dyninst_decls (systemtap_session& s)
   // XXX: the way that dyninst rewrites stuff is probably going to be
   // ...  very confusing to our backtracer (at least if we stay in process)
   s.op->newline() << "(*sup->probe->ph) (c);";
-  common_probe_entryfn_epilogue (s, true);
+  common_probe_entryfn_epilogue (s, true, otf_safe_context(s));
   s.op->newline() << "return 0;";
   s.op->newline(-1) << "}";
   s.op->assert_0_indent();

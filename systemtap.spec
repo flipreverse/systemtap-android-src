@@ -1,7 +1,9 @@
 %{!?with_sqlite: %global with_sqlite 1}
 %{!?with_docs: %global with_docs 1}
+%{!?with_htmldocs: %global with_htmldocs 0}
+%{!?with_monitor: %global with_monitor 1}
 # crash is not available
-%ifarch ppc ppc64 %{sparc} aarch64
+%ifarch ppc ppc64 %{sparc} aarch64 ppc64le
 %{!?with_crash: %global with_crash 0}
 %else
 %{!?with_crash: %global with_crash 1}
@@ -11,27 +13,30 @@
 %{!?elfutils_version: %global elfutils_version 0.142}
 %{!?pie_supported: %global pie_supported 1}
 %{!?with_boost: %global with_boost 0}
-%ifarch ppc ppc64 %{sparc} aarch64
-%{!?with_publican: %global with_publican 0}
-%else
-%{!?with_publican: %global with_publican 1}
-%endif
-%if 0%{?rhel}
-%{!?publican_brand: %global publican_brand RedHat}
-%else
-%{!?publican_brand: %global publican_brand fedora}
-%endif
-%ifnarch s390 s390x %{arm} aarch64
+%ifarch %{ix86} x86_64 ppc ppc64
 %{!?with_dyninst: %global with_dyninst 0%{?fedora} >= 18 || 0%{?rhel} >= 7}
 %else
 %{!?with_dyninst: %global with_dyninst 0}
 %endif
 %{!?with_systemd: %global with_systemd 0%{?fedora} >= 19 || 0%{?rhel} >= 7}
-%{!?with_emacsvim: %global with_emacsvim 1}
-%{!?with_java: %global with_java 1}
-# don't want to build runtime-virthost for f18 or RHEL5/6
+%{!?with_emacsvim: %global with_emacsvim 0%{?fedora} >= 19 || 0%{?rhel} >= 7}
+%{!?with_java: %global with_java 0%{?fedora} >= 19 || 0%{?rhel} >= 7}
 %{!?with_virthost: %global with_virthost 0%{?fedora} >= 19 || 0%{?rhel} >= 7}
 %{!?with_virtguest: %global with_virtguest 1}
+%{!?with_dracut: %global with_dracut 0%{?fedora} >= 19 || 0%{?rhel} >= 7}
+%ifarch x86_64
+%{!?with_mokutil: %global with_mokutil 0%{?fedora} >= 18 || 0%{?rhel} >= 7}
+%{!?with_openssl: %global with_openssl 0%{?fedora} >= 18 || 0%{?rhel} >= 7}
+%else
+%{!?with_mokutil: %global with_mokutil 0}
+%{!?with_openssl: %global with_openssl 0}
+%endif
+%{!?with_pyparsing: %global with_pyparsing 0%{?fedora} >= 18 || 0%{?rhel} >= 7}
+%{!?with_python3: %global with_python3 0%{?fedora} >= 23}
+
+%ifarch ppc64le aarch64
+%global with_virthost 0
+%endif
 
 %if 0%{?fedora} >= 18 || 0%{?rhel} >= 6
    %define initdir %{_initddir}
@@ -40,15 +45,21 @@
 %endif
 
 %if %{with_virtguest}
-   %if 0%{?fedora} >= 18 || 0%{?rhel} >= 6
-      %define udevrulesdir /lib/udev/rules.d
+   %if 0%{?fedora} >= 18 || 0%{?rhel} >= 7
+      %define udevrulesdir /usr/lib/udev/rules.d
    %else
-      %define udevrulesdir /etc/udev/rules.d
+      %if 0%{?rhel} >= 6
+         %define udevrulesdir /lib/udev/rules.d
+      %else # RHEL5
+         %define udevrulesdir /etc/udev/rules.d
+      %endif
    %endif
 %endif
 
+%define dracutstap %{_prefix}/lib/dracut/modules.d/99stap
+
 Name: systemtap
-Version: 2.5
+Version: 3.0
 Release: 1%{?dist}
 # for version, see also configure.ac
 
@@ -60,7 +71,7 @@ Release: 1%{?dist}
 # systemtap-devel        /usr/bin/stap, runtime, tapset, req:kernel-devel
 # systemtap-runtime      /usr/bin/staprun, /usr/bin/stapsh, /usr/bin/stapdyn
 # systemtap-client       /usr/bin/stap, samples, docs, tapset(bonus), req:-runtime
-# systemtap-initscript   /etc/init.d/systemtap, req:systemtap
+# systemtap-initscript   /etc/init.d/systemtap, dracut module, req:systemtap
 # systemtap-sdt-devel    /usr/include/sys/sdt.h /usr/bin/dtrace
 # systemtap-testsuite    /usr/share/systemtap/testsuite*, req:systemtap, req:sdt-devel
 # systemtap-runtime-java libHelperSDT.so, HelperSDT.jar, stapbm, req:-runtime
@@ -96,6 +107,9 @@ BuildRequires: libselinux-devel
 %if %{with_sqlite}
 BuildRequires: sqlite-devel
 %endif
+%if %{with_monitor}
+BuildRequires: json-c-devel ncurses-devel
+%endif
 # Needed for libstd++ < 4.0, without <tr1/memory>
 %if %{with_boost}
 BuildRequires: boost-devel
@@ -115,21 +129,18 @@ BuildRequires: m4
 BuildRequires: elfutils-devel >= %{elfutils_version}
 %endif
 %if %{with_docs}
-BuildRequires: /usr/bin/latex /usr/bin/dvips /usr/bin/ps2pdf latex2html
+BuildRequires: /usr/bin/latex /usr/bin/dvips /usr/bin/ps2pdf
 %if 0%{?fedora} >= 18 || 0%{?rhel} >= 7
-BuildRequires: tex(fullpage.sty) tex(fancybox.sty) tex(bchr7t.tfm)
+BuildRequires: tex(fullpage.sty) tex(fancybox.sty) tex(bchr7t.tfm) tex(graphicx.sty)
 %endif
+# For the html.sty mentioned in the .tex files, even though latex2html is
+# not run during the build, only during manual scripts/update-docs runs:
+BuildRequires: latex2html
+%if %{with_htmldocs}
 # On F10, xmlto's pdf support was broken off into a sub-package,
 # called 'xmlto-tex'.  To avoid a specific F10 BuildReq, we'll do a
 # file-based buildreq on '/usr/share/xmlto/format/fo/pdf'.
 BuildRequires: xmlto /usr/share/xmlto/format/fo/pdf
-%if %{with_publican}
-BuildRequires: publican
-BuildRequires: /usr/share/publican/Common_Content/%{publican_brand}/defaults.cfg
-
-# A workaround for BZ920216 which requires an X server to build docs
-# with publican.
-BuildRequires: /usr/bin/xvfb-run
 %endif
 %endif
 %if %{with_emacsvim}
@@ -141,6 +152,10 @@ BuildRequires: jpackage-utils java-devel
 %if %{with_virthost}
 BuildRequires: libvirt-devel >= 1.0.2
 BuildRequires: libxml2-devel
+%endif
+BuildRequires: readline-devel
+%if 0%{?rhel} <= 5
+BuildRequires: ncurses-devel
 %endif
 
 # Install requirements
@@ -172,6 +187,9 @@ Requires(preun): chkconfig
 Requires(preun): initscripts
 Requires(postun): initscripts
 BuildRequires: nss-devel avahi-devel
+%if %{with_openssl}
+Requires: openssl
+%endif
 
 %description server
 This is the remote script compilation server component of systemtap.
@@ -184,7 +202,6 @@ Summary: Programmable system-wide instrumentation system - development headers, 
 Group: Development/System
 License: GPLv2+
 URL: http://sourceware.org/systemtap/
-Requires: kernel >= 2.6.9-11
 # Alternate kernel packages kernel-PAE-devel et al. have a virtual
 # provide for kernel-devel, so this requirement does the right thing,
 # at least past RHEL4.
@@ -206,7 +223,6 @@ Summary: Programmable system-wide instrumentation system - runtime
 Group: Development/System
 License: GPLv2+
 URL: http://sourceware.org/systemtap/
-Requires: kernel >= 2.6.9-11
 Requires(pre): shadow-utils
 
 %description runtime
@@ -224,6 +240,9 @@ Requires: zip unzip
 Requires: systemtap-runtime = %{version}-%{release}
 Requires: coreutils grep sed unzip zip
 Requires: openssh-clients
+%if %{with_mokutil}
+Requires: mokutil
+%endif
 
 %description client
 This package contains/requires the components needed to develop
@@ -245,7 +264,9 @@ Requires(preun): initscripts
 Requires(postun): initscripts
 
 %description initscript
-Sysvinit scripts to launch selected systemtap scripts at system startup.
+This package includes a SysVinit script to launch selected systemtap
+scripts at system startup, along with a dracut module for early
+boot-time probing if supported.
 
 
 %package sdt-devel
@@ -253,6 +274,13 @@ Summary: Static probe support tools
 Group: Development/System
 License: GPLv2+ and Public Domain
 URL: http://sourceware.org/systemtap/
+%if %{with_pyparsing}
+%if %{with_python3}
+Requires: python3-pyparsing
+%else
+Requires: pyparsing
+%endif
+%endif
 
 %description sdt-devel
 This package includes the <sys/sdt.h> header file used for static
@@ -277,8 +305,12 @@ Requires: strace
 # that provides nc has changed over time (from 'nc' to
 # 'nmap-ncat'). So, we'll do a file-based require.
 Requires: /usr/bin/nc
-%ifnarch ia64
+%ifnarch ia64 ppc64le aarch64
+%if 0%{?fedora} >= 21 || 0%{?rhel} >= 8
+# no prelink
+%else
 Requires: prelink
+%endif
 %endif
 # testsuite/systemtap.server/client.exp needs avahi
 Requires: avahi
@@ -294,6 +326,13 @@ Requires: /usr/lib/libc.so
 # ... and /usr/lib/libgcc_s.so.*
 # ... and /usr/lib/libstdc++.so.*
 %endif
+%if 0%{?fedora} >= 18
+Requires: stress
+%endif
+# The following "meta" files for the systemtap examples run "perf":
+#   testsuite/systemtap.examples/hw_watch_addr.meta
+#   testsuite/systemtap.examples/memory/hw_watch_sym.meta
+Requires: perf
 
 %description testsuite
 This package includes the dejagnu-based systemtap stress self-testing
@@ -309,6 +348,7 @@ License: GPLv2+
 URL: http://sourceware.org/systemtap/
 Requires: systemtap-runtime = %{version}-%{release}
 Requires: byteman > 2.0
+Requires: net-tools
 
 %description runtime-java
 This package includes support files needed to run systemtap scripts
@@ -414,7 +454,11 @@ cd ..
 %endif
 
 %if %{with_docs}
-%global docs_config --enable-docs
+%if %{with_htmldocs}
+%global docs_config --enable-docs --enable-htmldocs
+%else
+%global docs_config --enable-docs --disable-htmldocs
+%endif
 %else
 %global docs_config --disable-docs
 %endif
@@ -426,11 +470,6 @@ cd ..
 %global pie_config --disable-pie
 %endif
 
-%if %{with_publican}
-%global publican_config --enable-publican --with-publican-brand=%{publican_brand}
-%else
-%global publican_config --disable-publican
-%endif
 
 %if %{with_java}
 %global java_config --with-java=%{_jvmdir}/java
@@ -438,7 +477,27 @@ cd ..
 %global java_config --without-java
 %endif
 
-%configure %{?elfutils_config} %{dyninst_config} %{sqlite_config} %{crash_config} %{docs_config} %{pie_config} %{publican_config} %{rpm_config} %{java_config} --disable-silent-rules --with-extra-version="rpm %{version}-%{release}"
+%if %{with_virthost}
+%global virt_config --enable-virt
+%else
+%global virt_config --disable-virt
+%endif
+
+%if %{with_dracut}
+%global dracut_config --with-dracutstap=%{dracutstap}
+%else
+%global dracut_config %{nil}
+%endif
+
+%if %{with_python3}
+%global python3_config --with-python3
+%else
+%global python3_config --without-python3
+%endif
+# We don't ship compileworthy python code, just oddball samples
+%global py_auto_byte_compile 0
+
+%configure %{?elfutils_config} %{dyninst_config} %{sqlite_config} %{crash_config} %{docs_config} %{pie_config} %{rpm_config} %{java_config} %{virt_config} %{dracut_config} %{python3_config} --disable-silent-rules --with-extra-version="rpm %{version}-%{release}"
 make %{?_smp_mflags}
 
 %if %{with_emacsvim}
@@ -449,6 +508,11 @@ make %{?_smp_mflags}
 rm -rf ${RPM_BUILD_ROOT}
 make DESTDIR=$RPM_BUILD_ROOT install
 %find_lang %{name}
+for dir in $(ls -1d $RPM_BUILD_ROOT%{_mandir}/{??,??_??}) ; do
+    dir=$(echo $dir | sed -e "s|^$RPM_BUILD_ROOT||")
+    lang=$(basename $dir)
+    echo "%%lang($lang) $dir/man*/*" >> %{name}.lang
+done
 
 # We want the examples in the special doc dir, not the build install dir.
 # We build it in place and then move it away so it doesn't get installed
@@ -456,8 +520,8 @@ make DESTDIR=$RPM_BUILD_ROOT install
 # %doc directive.
 mv $RPM_BUILD_ROOT%{_datadir}/doc/systemtap/examples examples
 
-# Fix paths in the example & testsuite scripts
-find examples testsuite -type f -name '*.stp' -print0 | xargs -0 sed -i -r -e '1s@^#!.+stap@#!%{_bindir}/stap@'
+# Fix paths in the example scripts.
+find examples -type f -name '*.stp' -print0 | xargs -0 sed -i -r -e '1s@^#!.+stap@#!%{_bindir}/stap@'
 
 # To make rpmlint happy, remove any .gitignore files in the testsuite.
 find testsuite -type f -name '.gitignore' -print0 | xargs -0 rm -f
@@ -481,8 +545,8 @@ cp -rp testsuite $RPM_BUILD_ROOT%{_datadir}/systemtap
 # %doc directive.
 mkdir docs.installed
 mv $RPM_BUILD_ROOT%{_datadir}/doc/systemtap/*.pdf docs.installed/
+%if %{with_htmldocs}
 mv $RPM_BUILD_ROOT%{_datadir}/doc/systemtap/tapsets docs.installed/
-%if %{with_publican}
 mv $RPM_BUILD_ROOT%{_datadir}/doc/systemtap/SystemTap_Beginners_Guide docs.installed/
 %endif
 %endif
@@ -545,6 +609,13 @@ done
    %endif
 %endif
 
+%if %{with_dracut}
+   mkdir -p $RPM_BUILD_ROOT%{dracutstap}
+   install -p -m 755 initscript/99stap/module-setup.sh $RPM_BUILD_ROOT%{dracutstap}
+   install -p -m 755 initscript/99stap/start-staprun.sh $RPM_BUILD_ROOT%{dracutstap}
+   touch $RPM_BUILD_ROOT%{dracutstap}/params.conf
+%endif
+
 %clean
 rm -rf ${RPM_BUILD_ROOT}
 
@@ -574,7 +645,11 @@ test -e ~stap-server && chmod 750 ~stap-server
 if [ ! -f ~stap-server/.systemtap/rc ]; then
   mkdir -p ~stap-server/.systemtap
   chown stap-server:stap-server ~stap-server/.systemtap
-  echo "--rlimit-as=614400000 --rlimit-cpu=60 --rlimit-nproc=20 --rlimit-stack=1024000 --rlimit-fsize=51200000" > ~stap-server/.systemtap/rc
+  # PR16276: guess at a reasonable number for a default --rlimit-nproc
+  numcpu=`/usr/bin/getconf _NPROCESSORS_ONLN`
+  if [ -z "$numcpu" -o "$numcpu" -lt 1 ]; then numcpu=1; fi
+  nproc=`expr $numcpu \* 30`
+  echo "--rlimit-as=614400000 --rlimit-cpu=60 --rlimit-nproc=$nproc --rlimit-stack=1024000 --rlimit-fsize=51200000" > ~stap-server/.systemtap/rc
   chown stap-server:stap-server ~stap-server/.systemtap/rc
 fi
 
@@ -588,10 +663,11 @@ test -e %{_localstatedir}/log/stap-server/log || {
 if test ! -e ~stap-server/.systemtap/ssl/server/stap.cert; then
    runuser -s /bin/sh - stap-server -c %{_libexecdir}/systemtap/stap-gen-cert >/dev/null
 fi
-# Activate the service
+# Prepare the service
 %if %{with_systemd}
-     /bin/systemctl enable stap-server.service >/dev/null 2>&1 || :
-     /bin/systemd-tmpfiles --create >/dev/null 2>&1 || :
+     # Note, Fedora policy doesn't allow network services enabled by default
+     # /bin/systemctl enable stap-server.service >/dev/null 2>&1 || :
+     /bin/systemd-tmpfiles --create %{_tmpfilesdir}/stap-server.conf >/dev/null 2>&1 || :
 %else
     /sbin/chkconfig --add stap-server
 %endif
@@ -615,7 +691,7 @@ if [ $1 = 0 ] ; then
        /bin/systemctl stop stap-server.service >/dev/null 2>&1 || :
     %else
         /sbin/service stap-server stop >/dev/null 2>&1
-    	/sbin/chkconfig --del stap-server
+        /sbin/chkconfig --del stap-server
     %endif
 fi
 exit 0
@@ -625,7 +701,7 @@ exit 0
 # If so, restart the service if it's running
 if [ "$1" -ge "1" ] ; then
     %if %{with_systemd}
-    	/bin/systemctl restart stap-server.service >/dev/null 2>&1 || :
+        /bin/systemctl condrestart stap-server.service >/dev/null 2>&1 || :
     %else
         /sbin/service stap-server condrestart >/dev/null 2>&1 || :
     %endif
@@ -634,8 +710,7 @@ exit 0
 
 %post initscript
 %if %{with_systemd}
-    /bin/systemctl enable stap-server.service >/dev/null 2>&1 || :
-     /bin/systemd-tmpfiles --create >/dev/null 2>&1 || :
+    /bin/systemctl enable systemtap.service >/dev/null 2>&1 || :
 %else
     /sbin/chkconfig --add systemtap
 %endif
@@ -646,11 +721,11 @@ exit 0
 # just removing the old package on upgrade.
 if [ $1 = 0 ] ; then
     %if %{with_systemd}
-    	/bin/systemctl --no-reload disable stap-server.service >/dev/null 2>&1 || :
-	/bin/systemctl stop stap-server.service >/dev/null 2>&1 || :
+        /bin/systemctl --no-reload disable systemtap.service >/dev/null 2>&1 || :
+        /bin/systemctl stop systemtap.service >/dev/null 2>&1 || :
     %else
         /sbin/service systemtap stop >/dev/null 2>&1
-    	/sbin/chkconfig --del systemtap
+        /sbin/chkconfig --del systemtap
     %endif
 fi
 exit 0
@@ -660,7 +735,7 @@ exit 0
 # If so, restart the service if it's running
 if [ "$1" -ge "1" ] ; then
     %if %{with_systemd}
-        /bin/systemctl restart stap-server.service >/dev/null 2>&1 || :
+        /bin/systemctl condrestart systemtap.service >/dev/null 2>&1 || :
     %else
         /sbin/service systemtap condrestart >/dev/null 2>&1 || :
     %endif
@@ -729,31 +804,25 @@ exit 0
 
 %if %{with_java}
 
-%triggerin runtime-java -- java-1.7.0-openjdk, java-1.6.0-openjdk
+%triggerin runtime-java -- java-1.8.0-openjdk, java-1.7.0-openjdk, java-1.6.0-openjdk
 for f in %{_libexecdir}/systemtap/libHelperSDT_*.so; do
-    %ifarch %{ix86} ppc64
-        %ifarch ppc64
-            arch=ppc64
-	%else
-	    arch=i386
-	%endif
+    %ifarch %{ix86}
+	arch=i386
     %else
         arch=`basename $f | cut -f2 -d_ | cut -f1 -d.`
     %endif
     for archdir in %{_jvmdir}/*openjdk*/jre/lib/${arch}; do
-        ln -sf %{_libexecdir}/systemtap/libHelperSDT_${arch}.so ${archdir}/libHelperSDT_${arch}.so
-        ln -sf %{_libexecdir}/systemtap/HelperSDT.jar ${archdir}/../ext/HelperSDT.jar
+	 if [ -d ${archdir} ]; then
+            ln -sf %{_libexecdir}/systemtap/libHelperSDT_${arch}.so ${archdir}/libHelperSDT_${arch}.so
+            ln -sf %{_libexecdir}/systemtap/HelperSDT.jar ${archdir}/../ext/HelperSDT.jar
+	 fi
     done
 done
 
-%triggerun runtime-java -- java-1.7.0-openjdk, java-1.6.0-openjdk
+%triggerun runtime-java -- java-1.8.0-openjdk, java-1.7.0-openjdk, java-1.6.0-openjdk
 for f in %{_libexecdir}/systemtap/libHelperSDT_*.so; do
-    %ifarch %{ix86} ppc64
-        %ifarch ppc64
-            arch=ppc64
-	%else
-	    arch=i386
-	%endif
+    %ifarch %{ix86}
+	arch=i386
     %else
         arch=`basename $f | cut -f2 -d_ | cut -f1 -d.`
     %endif
@@ -763,21 +832,19 @@ for f in %{_libexecdir}/systemtap/libHelperSDT_*.so; do
     done
 done
 
-%triggerpostun runtime-java -- java-1.7.0-openjdk, java-1.6.0-openjdk
+%triggerpostun runtime-java -- java-1.8.0-openjdk, java-1.7.0-openjdk, java-1.6.0-openjdk
 # Restore links for any JDKs remaining after a package removal:
 for f in %{_libexecdir}/systemtap/libHelperSDT_*.so; do
-    %ifarch %{ix86} ppc64
-        %ifarch ppc64
-            arch=ppc64
-	%else
-	    arch=i386
-	%endif
+    %ifarch %{ix86}
+	arch=i386
     %else
         arch=`basename $f | cut -f2 -d_ | cut -f1 -d.`
     %endif
     for archdir in %{_jvmdir}/*openjdk*/jre/lib/${arch}; do
-        ln -sf %{_libexecdir}/systemtap/libHelperSDT_${arch}.so ${archdir}/libHelperSDT_${arch}.so
-        ln -sf %{_libexecdir}/systemtap/HelperSDT.jar ${archdir}/../ext/HelperSDT.jar
+	 if [ -d ${archdir} ]; then
+            ln -sf %{_libexecdir}/systemtap/libHelperSDT_${arch}.so ${archdir}/libHelperSDT_${arch}.so
+            ln -sf %{_libexecdir}/systemtap/HelperSDT.jar ${archdir}/../ext/HelperSDT.jar
+	 fi
     done
 done
 
@@ -820,8 +887,9 @@ done
 %dir %attr(0755,stap-server,stap-server) %{_localstatedir}/log/stap-server
 %ghost %config(noreplace) %attr(0644,stap-server,stap-server) %{_localstatedir}/log/stap-server/log
 %ghost %attr(0755,stap-server,stap-server) %{_localstatedir}/run/stap-server
-%doc initscript/README.stap-server
-%doc README README.unprivileged AUTHORS NEWS COPYING
+%doc README README.unprivileged AUTHORS NEWS 
+%{!?_licensedir:%global license %%doc}
+%license COPYING
 
 
 %files devel -f systemtap.lang
@@ -837,7 +905,9 @@ done
 %{_mandir}/man7/error*
 %{_mandir}/man7/stappaths.7*
 %{_mandir}/man7/warning*
-%doc README README.unprivileged AUTHORS NEWS COPYING
+%doc README README.unprivileged AUTHORS NEWS 
+%{!?_licensedir:%global license %%doc}
+%license COPYING
 %if %{with_java}
 %dir %{_libexecdir}/systemtap
 %{_libexecdir}/systemtap/libHelperSDT_*.so
@@ -878,16 +948,20 @@ done
 %if %{with_dyninst}
 %{_mandir}/man8/stapdyn.8*
 %endif
-%doc README README.security AUTHORS NEWS COPYING
+%doc README README.security AUTHORS NEWS 
+%{!?_licensedir:%global license %%doc}
+%license COPYING
 
 
 %files client -f systemtap.lang
 %defattr(-,root,root)
-%doc README README.unprivileged AUTHORS NEWS COPYING examples
+%doc README README.unprivileged AUTHORS NEWS examples
+%{!?_licensedir:%global license %%doc}
+%license COPYING
 %if %{with_docs}
 %doc docs.installed/*.pdf
+%if %{with_htmldocs}
 %doc docs.installed/tapsets/*.html
-%if %{with_publican}
 %doc docs.installed/SystemTap_Beginners_Guide
 %endif
 %endif
@@ -898,6 +972,7 @@ done
 %{_mandir}/man1/stap-prep.1*
 %{_mandir}/man1/stap-merge.1*
 %{_mandir}/man1/stap-report.1*
+%{_mandir}/man1/stapref.1*
 %{_mandir}/man3/*
 %{_mandir}/man7/error*
 %{_mandir}/man7/stappaths.7*
@@ -916,7 +991,11 @@ done
 %config(noreplace) %{_sysconfdir}/systemtap/config
 %dir %{_localstatedir}/cache/systemtap
 %ghost %{_localstatedir}/run/systemtap
-%doc initscript/README.systemtap
+%{_mandir}/man8/systemtap.8*
+%if %{with_dracut}
+   %dir %{dracutstap}
+   %{dracutstap}/*
+%endif
 
 
 %files sdt-devel
@@ -925,7 +1004,9 @@ done
 %{_includedir}/sys/sdt.h
 %{_includedir}/sys/sdt-config.h
 %{_mandir}/man1/dtrace.1*
-%doc README AUTHORS NEWS COPYING
+%doc README AUTHORS NEWS 
+%{!?_licensedir:%global license %%doc}
+%license COPYING
 
 
 %files testsuite
@@ -970,6 +1051,30 @@ done
 #   http://sourceware.org/systemtap/wiki/SystemTapReleases
 
 %changelog
+* Thu Oct 08 2015 Frank Ch. Eigler <fche@redhat.com> - 2.9-1
+- Upstream release.
+
+* Wed Jun 17 2015 Abegail Jakop <ajakop@redhat.com> - 2.8-1
+- Upstream release.
+
+* Wed Feb 18 2015 Frank Ch. Eigler <fche@redhat.com> - 2.7-1
+- Upstream release.
+
+* Fri Sep 05 2014 Josh Stone <jistone@redhat.com> - 2.6-1
+- Upstream release.
+
+* Mon Jul 07 2014 Josh Stone <jistone@redhat.com>
+- Flip with_dyninst to an %ifarch whitelist.
+
+* Wed Apr 30 2014 Jonathan Lebon <jlebon@redhat.com> - 2.5-1
+- Upstream release.
+
+* Thu Feb 13 2014 Lukas Berk <lberk@redhat.com>
+- Add directory checks for runtime-java sym links
+
+* Mon Jan 06 2014 Jonathan Lebon <jlebon@redhat.com>
+- Added dracut module to initscript package
+
 * Wed Nov 06 2013 Frank Ch. Eigler <fche@redhat.com> - 2.4-1
 - Upstream release.
 

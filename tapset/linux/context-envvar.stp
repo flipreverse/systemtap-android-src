@@ -25,15 +25,15 @@ function env_var:string(name:string)
     return ""
 
   env_value = "";
-  mm = @cast(task_current(), "task_struct", "kernel<linux/sched.h>")->mm;
+  mm = task_current()->mm;
   if (mm)
     {
-      env_start = @cast(mm, "mm_struct", "kernel<linux/sched.h>")->env_start;
-      env_end = @cast(mm, "mm_struct", "kernel<linux/sched.h>")->env_end;
+      env_start = mm->env_start;
+      env_end = mm->env_end;
       if (env_start != 0 && env_end != 0)
         {
           len = env_end - env_start;
-          cur = user_string2(env_start, "");
+          cur = user_string(env_start, "");
           env_name = tokenize(cur, "=");
           while (env_name != name && len > 0)
             {
@@ -42,7 +42,7 @@ function env_var:string(name:string)
               len -= env_len + 1;
               if (len > 0)
                 {
-                  cur = user_string2(env_start, "");
+                  cur = user_string(env_start, "");
                   env_name = tokenize(cur, "=");
                 }
               else

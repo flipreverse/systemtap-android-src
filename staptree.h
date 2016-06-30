@@ -1,5 +1,5 @@
 // -*- C++ -*-
-// Copyright (C) 2005-2013 Red Hat Inc.
+// Copyright (C) 2005-2015 Red Hat Inc.
 // Copyright (C) 2006 Intel Corporation.
 //
 // This file is part of systemtap, and is free software.  You can
@@ -24,6 +24,18 @@ extern "C" {
 }
 
 #include "util.h"
+#include "stringtable.h"
+
+#if defined(HAVE_TR1_MEMORY)
+#include <tr1/memory>
+using std::tr1::shared_ptr;
+#elif defined(HAVE_BOOST_SHARED_PTR_HPP)
+#include <boost/shared_ptr.hpp>
+using boost::shared_ptr;
+#else
+#error "No shared_ptr implementation found; get boost or modern g++"
+#endif
+
 
 struct token; // parse.h
 struct systemtap_session; // session.h
@@ -32,22 +44,60 @@ struct semantic_error: public std::runtime_error
 {
   const token* tok1;
   const token* tok2;
-  const semantic_error *chain;
-  const std::string errsrc;
+  std::string errsrc;
 
-  ~semantic_error () throw () {}
+  // Extra details to explain the error or provide alternatives to the user.
+  // Each one printed after the main error message and tokens aligned on
+  // separate lines. Just push_back anything you want that better explains
+  // the error to the user (not meant for extra verbose developer messages).
+  std::vector<std::string> details;
+
+  ~semantic_error () throw ()
+    {
+      if (chain)
+        delete chain;
+    }
 
   semantic_error (const std::string& src, const std::string& msg, const token* t1=0):
-    runtime_error (msg), tok1 (t1), tok2 (0), chain (0), errsrc(src) {}
+    runtime_error (msg), tok1 (t1), tok2 (0), errsrc (src), chain (0) {}
 
   semantic_error (const std::string& src, const std::string& msg, const token* t1,
-                  const token* t2):
-    runtime_error (msg), tok1 (t1), tok2 (t2), chain (0), errsrc(src) {}
+                  const token* t2, const semantic_error* chn=0):
+      runtime_error (msg), tok1 (t1), tok2 (t2), errsrc (src), chain (0)
+    {
+      if (chn)
+        set_chain(*chn);
+    }
+
+  /* override copy-ctor to deep-copy chain */
+  semantic_error (const semantic_error& other):
+      runtime_error(other), tok1(other.tok1), tok2(other.tok2),
+      errsrc(other.errsrc), details(other.details), chain (0)
+    {
+      if (other.chain)
+        set_chain(*other.chain);
+    }
 
   std::string errsrc_chain(void) const
     {
       return errsrc + (chain ? "|" + chain->errsrc_chain() : "");
     }
+
+  semantic_error& set_chain(const semantic_error& new_chain)
+    {
+      if (chain)
+        delete chain;
+      chain = new semantic_error(new_chain);
+      return *this;
+    }
+
+  const semantic_error* get_chain(void) const
+    {
+      return chain;
+    }
+
+private:
+  const semantic_error* chain;
 };
 
 // ------------------------------------------------------------------------
@@ -66,6 +116,26 @@ enum exp_type
 
 std::ostream& operator << (std::ostream& o, const exp_type& e);
 
+struct functioncall;
+struct autocast_op;
+struct exp_type_details
+{
+  virtual ~exp_type_details () {};
+
+  // A process-wide unique identifier; probably a pointer.
+  virtual uintptr_t id () const = 0;
+  bool operator==(const exp_type_details& other) const
+    { return id () == other.id (); }
+  bool operator!=(const exp_type_details& other) const
+    { return !(*this == other); }
+
+  // Expand this autocast_op into a function call
+  virtual bool expandable() const = 0;
+  virtual functioncall *expand(autocast_op* e, bool lvalue) = 0;
+};
+typedef shared_ptr<exp_type_details> exp_type_ptr;
+
+
 struct token;
 struct visitor;
 struct update_visitor;
@@ -75,14 +145,17 @@ struct visitable
   virtual ~visitable ();
 };
 
+struct symbol;
 struct expression : public visitable
 {
   exp_type type;
+  exp_type_ptr type_details;
   const token* tok;
   expression ();
   virtual ~expression ();
   virtual void print (std::ostream& o) const = 0;
   virtual void visit (visitor* u) = 0;
+  virtual bool is_symbol(symbol *& sym_out);
 };
 
 std::ostream& operator << (std::ostream& o, const expression& k);
@@ -95,8 +168,8 @@ struct literal: public expression
 
 struct literal_string: public literal
 {
-  std::string value;
-  literal_string (const std::string& v);
+  interned_string value;
+  literal_string (interned_string v);
   void print (std::ostream& o) const;
   void visit (visitor* u);
 };
@@ -114,7 +187,7 @@ struct literal_number: public literal
 
 struct embedded_expr: public expression
 {
-  std::string code;
+  interned_string code;
   void print (std::ostream& o) const;
   void visit (visitor* u);
 };
@@ -123,7 +196,7 @@ struct embedded_expr: public expression
 struct binary_expression: public expression
 {
   expression* left;
-  std::string op;
+  interned_string op;
   expression* right;
   void print (std::ostream& o) const;
   void visit (visitor* u);
@@ -132,7 +205,7 @@ struct binary_expression: public expression
 
 struct unary_expression: public expression
 {
-  std::string op;
+  interned_string op;
   expression* operand;
   void print (std::ostream& o) const;
   void visit (visitor* u);
@@ -175,7 +248,7 @@ struct array_in: public expression
 struct regex_query: public expression
 {
   expression* left;
-  std::string op;
+  interned_string op;
   literal_string* right;
   void visit (visitor* u);
   void print (std::ostream& o) const;
@@ -208,7 +281,6 @@ struct assignment: public binary_expression
   void visit (visitor* u);
 };
 
-struct symbol;
 struct hist_op;
 struct indexable : public expression
 {
@@ -231,7 +303,7 @@ classify_indexable(indexable* ix,
 struct vardecl;
 struct symbol: public indexable
 {
-  std::string name;
+  interned_string name;
   vardecl *referent;
   symbol ();
   void print (std::ostream& o) const;
@@ -241,7 +313,7 @@ struct symbol: public indexable
 };
 
 
-struct target_symbol: public symbol
+struct target_symbol: public expression
 {
   enum component_type
     {
@@ -273,6 +345,7 @@ struct target_symbol: public symbol
       void print (std::ostream& o) const;
     };
 
+  interned_string name;
   bool addressof;
   std::vector<component> components;
   semantic_error* saved_conversion_error; // hand-made linked list
@@ -284,6 +357,8 @@ struct target_symbol: public symbol
   void visit_components (visitor* u);
   void visit_components (update_visitor* u);
   void assert_no_components(const std::string& tapset, bool pretty_ok=false);
+  size_t pretty_print_depth () const;
+  bool check_pretty_print (bool lvalue=false) const;
 };
 
 std::ostream& operator << (std::ostream& o, const target_symbol::component& c);
@@ -292,14 +367,23 @@ std::ostream& operator << (std::ostream& o, const target_symbol::component& c);
 struct cast_op: public target_symbol
 {
   expression *operand;
-  std::string type_name, module;
+  interned_string type_name, module;
+  void print (std::ostream& o) const;
+  void visit (visitor* u);
+};
+
+// An autocast is like an implicit @cast on any expression, like
+// (expr)->foo->var[baz], and the type is gleaned from the expr.
+struct autocast_op: public target_symbol
+{
+  expression *operand;
   void print (std::ostream& o) const;
   void visit (visitor* u);
 };
 
 struct atvar_op: public target_symbol
 {
-  std::string target_name, cu_name, module;
+  interned_string target_name, cu_name, module;
   virtual std::string sym_name ();
   void print (std::ostream& o) const;
   void visit (visitor* u);
@@ -307,7 +391,7 @@ struct atvar_op: public target_symbol
 
 struct defined_op: public expression
 {
-  target_symbol *operand;
+  expression *operand;
   void print (std::ostream& o) const;
   void visit (visitor* u);
 };
@@ -342,9 +426,9 @@ struct arrayindex: public expression
 struct functiondecl;
 struct functioncall: public expression
 {
-  std::string function;
+  interned_string function;
   std::vector<expression*> args;
-  functiondecl *referent;
+  std::vector<functiondecl*> referents;
   functioncall ();
   void print (std::ostream& o) const;
   void visit (visitor* u);
@@ -401,14 +485,14 @@ struct print_format: public expression
 
   struct format_component
   {
-    unsigned long flags;
     unsigned base;
     unsigned width;
     unsigned precision;
-    width_type widthtype;
-    precision_type prectype;
-    conversion_type type;
-    std::string literal_string;
+    unsigned flags : 8;
+    width_type widthtype : 8;
+    precision_type prectype : 8;
+    conversion_type type : 8;
+    interned_string literal_string;
     bool is_empty() const
     {
       return flags == 0
@@ -419,34 +503,39 @@ struct print_format: public expression
     }
     void clear()
     {
+      base = 0;
       flags = 0;
+      width = 0;
       widthtype = width_unspecified;
+      precision = 0;
       prectype = prec_unspecified;
       type = conv_unspecified;
       literal_string.clear();
     }
+    format_component() { clear(); }
     inline void set_flag(format_flag f) { flags |= f; }
     inline bool test_flag(format_flag f) const { return flags & f; }
   };
 
   std::string raw_components;
   std::vector<format_component> components;
-  format_component delimiter;
+  interned_string delimiter;
   std::vector<expression*> args;
   hist_op *hist;
 
   static std::string components_to_string(std::vector<format_component> const & components);
   static std::vector<format_component> string_to_components(std::string const & str);
-  static print_format* create(const token *t);
+  static print_format* create(const token *t, const char *n = NULL);
 
   void print (std::ostream& o) const;
   void visit (visitor* u);
 
 private:
-  print_format(bool stream, bool format, bool delim, bool newline, bool _char):
+  interned_string print_format_type;
+  print_format(bool stream, bool format, bool delim, bool newline, bool _char, interned_string type):
     print_to_stream(stream), print_with_format(format),
     print_with_delim(delim), print_with_newline(newline),
-    print_char(_char), hist(NULL)
+    print_char(_char), hist(NULL), print_format_type(type)
   {}
 };
 
@@ -494,8 +583,10 @@ struct symboldecl // unique object per (possibly implicit)
 {
   const token* tok;
   const token* systemtap_v_conditional; //checking systemtap compatibility
-  std::string name;
+  interned_string name; // mangled name
+  interned_string unmangled_name;
   exp_type type;
+  exp_type_ptr type_details;
   symboldecl ();
   virtual ~symboldecl ();
   virtual void print (std::ostream &o) const = 0;
@@ -520,6 +611,7 @@ struct vardecl: public symboldecl
   literal *init; // for global scalars only
   bool synthetic; // for probe locals only, don't init on entry
   bool wrap;
+  bool char_ptr_arg; // set in ::emit_common_header(), only used if a formal_arg
 };
 
 
@@ -536,10 +628,20 @@ struct functiondecl: public symboldecl
   statement* body;
   bool synthetic;
   bool mangle_oldstyle;
+  int64_t priority;
   functiondecl ();
   void print (std::ostream& o) const;
   void printsig (std::ostream& o) const;
+  void printsigtags (std::ostream& o, bool all_tags) const;
   void join (systemtap_session& s); // for synthetic functions only
+};
+
+struct function_priority_order
+{
+  bool operator() (const functiondecl* f1, const functiondecl* f2)
+  {
+    return f1->priority < f2->priority;
+  }
 };
 
 
@@ -561,7 +663,7 @@ std::ostream& operator << (std::ostream& o, const statement& k);
 
 struct embeddedcode: public statement
 {
-  std::string code;
+  interned_string code;
   void print (std::ostream& o) const;
   void visit (visitor* u);
 };
@@ -604,6 +706,7 @@ struct foreach_loop: public statement
 {
   // this part is a specialization of arrayindex
   std::vector<symbol*> indexes;
+  std::vector<expression*> array_slice; // optional array slice to iterate over
   indexable *base;
   int sort_direction; // -1: decreasing, 0: none, 1: increasing
   unsigned sort_column; // 0: value, 1..N: index
@@ -690,10 +793,11 @@ struct stapfile
   std::vector<functiondecl*> functions;
   std::vector<vardecl*> globals;
   std::vector<embeddedcode*> embeds;
-  std::string file_contents;
+  interned_string file_contents;
   bool privileged;
-  stapfile (): file_contents (""),
-    privileged (false) {}
+  bool synthetic; // via parse_synthetic_*
+  stapfile ():
+    privileged (false), synthetic (false) {}
   void print (std::ostream& o) const;
 };
 
@@ -702,21 +806,24 @@ struct probe_point
 {
   struct component // XXX: sort of a restricted functioncall
   {
-    std::string functor;
+    interned_string functor;
     literal* arg; // optional
+    bool from_glob;
     component ();
     const token* tok; // points to component's functor
-    component(std::string const & f, literal * a = NULL);
+    component(interned_string f, literal *a=NULL, bool from_glob=false);
   };
   std::vector<component*> components;
   bool optional;
   bool sufficient;
+  bool well_formed; // used in derived_probe::script_location()
   expression* condition;
   void print (std::ostream& o, bool print_extras=true) const;
   probe_point ();
   probe_point(const probe_point& pp);
   probe_point(std::vector<component*> const & comps);
   std::string str(bool print_extras=true) const;
+  bool from_globby_comp(const std::string& comp);
 };
 
 std::ostream& operator << (std::ostream& o, const probe_point& k);
@@ -724,6 +831,8 @@ std::ostream& operator << (std::ostream& o, const probe_point& k);
 
 struct probe
 {
+  static unsigned last_probeidx;
+
   std::vector<probe_point*> locations;
   statement* body;
   struct probe* base;
@@ -731,19 +840,24 @@ struct probe
   const token* systemtap_v_conditional; //checking systemtap compatibility
   std::vector<vardecl*> locals;
   std::vector<vardecl*> unused_locals;
-  static unsigned last_probeidx;
+  bool privileged;
+  unsigned id;
+
   probe ();
   probe (probe* p, probe_point *l);
   void print (std::ostream& o) const;
+  std::string name () const;
   virtual void printsig (std::ostream &o) const;
   virtual void collect_derivation_chain (std::vector<probe*> &probes_list) const;
   virtual void collect_derivation_pp_chain (std::vector<probe_point*> &) const;
   virtual const probe_alias *get_alias () const { return 0; }
   virtual probe_point *get_alias_loc () const { return 0; }
-  virtual probe* create_alias(probe_point* l, probe_point* a);
   virtual ~probe() {}
-  bool privileged;
-  std::string name;
+
+private:
+
+  probe (const probe&);
+  probe& operator = (const probe&);
 };
 
 struct probe_alias: public probe
@@ -802,10 +916,60 @@ struct visitor
   virtual void visit_stat_op (stat_op* e) = 0;
   virtual void visit_hist_op (hist_op* e) = 0;
   virtual void visit_cast_op (cast_op* e) = 0;
+  virtual void visit_autocast_op (autocast_op* e) = 0;
   virtual void visit_atvar_op (atvar_op* e) = 0;
   virtual void visit_defined_op (defined_op* e) = 0;
   virtual void visit_entry_op (entry_op* e) = 0;
   virtual void visit_perf_op (perf_op* e) = 0;
+};
+
+
+// A NOP visitor doesn't do anything.  It's a useful base class if you need to
+// take action only for specific types, without even traversing the rest.
+struct nop_visitor: public visitor
+{
+  virtual ~nop_visitor () {}
+  virtual void visit_block (block *) {};
+  virtual void visit_try_block (try_block *) {};
+  virtual void visit_embeddedcode (embeddedcode *) {};
+  virtual void visit_null_statement (null_statement *) {};
+  virtual void visit_expr_statement (expr_statement *) {};
+  virtual void visit_if_statement (if_statement*) {};
+  virtual void visit_for_loop (for_loop*) {};
+  virtual void visit_foreach_loop (foreach_loop*) {};
+  virtual void visit_return_statement (return_statement*) {};
+  virtual void visit_delete_statement (delete_statement*) {};
+  virtual void visit_next_statement (next_statement*) {};
+  virtual void visit_break_statement (break_statement*) {};
+  virtual void visit_continue_statement (continue_statement*) {};
+  virtual void visit_literal_string (literal_string*) {};
+  virtual void visit_literal_number (literal_number*) {};
+  virtual void visit_embedded_expr (embedded_expr*) {};
+  virtual void visit_binary_expression (binary_expression*) {};
+  virtual void visit_unary_expression (unary_expression*) {};
+  virtual void visit_pre_crement (pre_crement*) {};
+  virtual void visit_post_crement (post_crement*) {};
+  virtual void visit_logical_or_expr (logical_or_expr*) {};
+  virtual void visit_logical_and_expr (logical_and_expr*) {};
+  virtual void visit_array_in (array_in*) {};
+  virtual void visit_regex_query (regex_query*) {};
+  virtual void visit_comparison (comparison*) {};
+  virtual void visit_concatenation (concatenation*) {};
+  virtual void visit_ternary_expression (ternary_expression*) {};
+  virtual void visit_assignment (assignment*) {};
+  virtual void visit_symbol (symbol*) {};
+  virtual void visit_target_symbol (target_symbol*) {};
+  virtual void visit_arrayindex (arrayindex*) {};
+  virtual void visit_functioncall (functioncall*) {};
+  virtual void visit_print_format (print_format*) {};
+  virtual void visit_stat_op (stat_op*) {};
+  virtual void visit_hist_op (hist_op*) {};
+  virtual void visit_cast_op (cast_op*) {};
+  virtual void visit_autocast_op (autocast_op*) {};
+  virtual void visit_atvar_op (atvar_op*) {};
+  virtual void visit_defined_op (defined_op*) {};
+  virtual void visit_entry_op (entry_op*) {};
+  virtual void visit_perf_op (perf_op*) {};
 };
 
 
@@ -850,6 +1014,43 @@ struct traversing_visitor: public visitor
   void visit_stat_op (stat_op* e);
   void visit_hist_op (hist_op* e);
   void visit_cast_op (cast_op* e);
+  void visit_autocast_op (autocast_op* e);
+  void visit_atvar_op (atvar_op* e);
+  void visit_defined_op (defined_op* e);
+  void visit_entry_op (entry_op* e);
+  void visit_perf_op (perf_op* e);
+};
+
+
+// A visitor that calls a generic visit_expression on every expression.
+struct expression_visitor: public traversing_visitor
+{
+  virtual void visit_expression(expression *e) = 0;
+
+  void visit_literal_string (literal_string* e);
+  void visit_literal_number (literal_number* e);
+  void visit_embedded_expr (embedded_expr* e);
+  void visit_binary_expression (binary_expression* e);
+  void visit_unary_expression (unary_expression* e);
+  void visit_pre_crement (pre_crement* e);
+  void visit_post_crement (post_crement* e);
+  void visit_logical_or_expr (logical_or_expr* e);
+  void visit_logical_and_expr (logical_and_expr* e);
+  void visit_array_in (array_in* e);
+  void visit_regex_query (regex_query* e);
+  void visit_comparison (comparison* e);
+  void visit_concatenation (concatenation* e);
+  void visit_ternary_expression (ternary_expression* e);
+  void visit_assignment (assignment* e);
+  void visit_symbol (symbol* e);
+  void visit_target_symbol (target_symbol* e);
+  void visit_arrayindex (arrayindex* e);
+  void visit_functioncall (functioncall* e);
+  void visit_print_format (print_format* e);
+  void visit_stat_op (stat_op* e);
+  void visit_hist_op (hist_op* e);
+  void visit_cast_op (cast_op* e);
+  void visit_autocast_op (autocast_op* e);
   void visit_atvar_op (atvar_op* e);
   void visit_defined_op (defined_op* e);
   void visit_entry_op (entry_op* e);
@@ -861,10 +1062,13 @@ struct traversing_visitor: public visitor
 // It uses an internal set object to prevent infinite recursion.
 struct functioncall_traversing_visitor: public traversing_visitor
 {
-  std::set<functiondecl*> traversed;
+  std::set<functiondecl*> seen;
+  std::set<functiondecl*> nested;
   functiondecl* current_function;
   functioncall_traversing_visitor(): current_function(0) {}
   void visit_functioncall (functioncall* e);
+  void enter_functioncall (functioncall* e);
+  virtual void note_recursive_functioncall (functioncall* e);
 };
 
 
@@ -888,12 +1092,17 @@ struct varuse_collecting_visitor: public functioncall_traversing_visitor
     current_lvalue_read (false),
     current_lvalue(0),
     current_lrvalue(0) {}
+  void visit_if_statement (if_statement* s);
+  void visit_for_loop (for_loop* s);
   void visit_embeddedcode (embeddedcode *s);
   void visit_embedded_expr (embedded_expr *e);
   void visit_try_block (try_block *s);
+  void visit_functioncall (functioncall* e);
+  void visit_return_statement (return_statement *s);
   void visit_delete_statement (delete_statement *s);
   void visit_print_format (print_format *e);
   void visit_assignment (assignment *e);
+  void visit_ternary_expression (ternary_expression* e);
   void visit_arrayindex (arrayindex *e);
   void visit_target_symbol (target_symbol *e);
   void visit_symbol (symbol *e);
@@ -901,6 +1110,7 @@ struct varuse_collecting_visitor: public functioncall_traversing_visitor
   void visit_post_crement (post_crement *e);
   void visit_foreach_loop (foreach_loop *s);
   void visit_cast_op (cast_op* e);
+  void visit_autocast_op (autocast_op* e);
   void visit_atvar_op (atvar_op *e);
   void visit_defined_op (defined_op* e);
   void visit_entry_op (entry_op* e);
@@ -957,6 +1167,7 @@ struct throwing_visitor: public visitor
   void visit_stat_op (stat_op* e);
   void visit_hist_op (hist_op* e);
   void visit_cast_op (cast_op* e);
+  void visit_autocast_op (autocast_op* e);
   void visit_atvar_op (atvar_op* e);
   void visit_defined_op (defined_op* e);
   void visit_entry_op (entry_op* e);
@@ -1036,6 +1247,7 @@ struct update_visitor: public visitor
   virtual void visit_stat_op (stat_op* e);
   virtual void visit_hist_op (hist_op* e);
   virtual void visit_cast_op (cast_op* e);
+  virtual void visit_autocast_op (autocast_op* e);
   virtual void visit_atvar_op (atvar_op* e);
   virtual void visit_defined_op (defined_op* e);
   virtual void visit_entry_op (entry_op* e);
@@ -1095,10 +1307,22 @@ struct deep_copy_visitor: public update_visitor
   virtual void visit_stat_op (stat_op* e);
   virtual void visit_hist_op (hist_op* e);
   virtual void visit_cast_op (cast_op* e);
+  virtual void visit_autocast_op (autocast_op* e);
   virtual void visit_atvar_op (atvar_op* e);
   virtual void visit_defined_op (defined_op* e);
   virtual void visit_entry_op (entry_op* e);
   virtual void visit_perf_op (perf_op* e);
+};
+
+struct embedded_tags_visitor: public traversing_visitor
+{
+  std::set<std::string> available_tags;
+  std::set<std::string> tags; // set of the tags that appear in the code
+  embedded_tags_visitor(bool all_tags);
+  bool tagged_p (const std::string &tag);
+  void find_tags_in_code (const std::string& s);
+  void visit_embeddedcode (embeddedcode *s);
+  void visit_embedded_expr (embedded_expr *e);
 };
 
 #endif // STAPTREE_H

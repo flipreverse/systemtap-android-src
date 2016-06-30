@@ -1,6 +1,6 @@
 /* -*- linux-c -*- 
  * String Functions
- * Copyright (C) 2005, 2006, 2007, 2009 Red Hat Inc.
+ * Copyright (C) 2005, 2006, 2007, 2009, 2015 Red Hat Inc.
  *
  * This file is part of systemtap, and is free software.  You can
  * redistribute it and/or modify it under the terms of the GNU General
@@ -50,6 +50,90 @@ static int _stp_vscnprintf(char *buf, size_t size, const char *fmt, va_list args
 }
 
 
+/**
+ * Decode a UTF-8 sequence into its codepoint.
+ *
+ * @param buf The input buffer.
+ * @param size The size of the input buffer.
+ * @param user Flag to mark user memory, vs kernel.
+ * @param c_ret The return pointer for the codepoint.
+ *
+ * @return The number of bytes consumed,
+ * 	   or -EFAULT for unreadable memory address.
+ */
+static int _stp_decode_utf8(const char* buf, int size, int user, int* c_ret)
+{
+	int c;
+	char b = '\0';
+	int i, n;
+
+	if (size <= 0)
+		return -EFAULT;
+
+	if (_stp_read_address(b, buf, (user ? USER_DS : KERNEL_DS)))
+		return -EFAULT;
+	++buf;
+	--size;
+
+	if ((b & 0xE0) == 0xC0 && size >= 1) {
+		/* 110xxxxx 10xxxxxx */
+		/* Two-byte UTF-8, one more byte to read.  */
+		n = 2;
+		c = b & 0x1F;
+	} else if ((b & 0xF0) == 0xE0 && size >= 2) {
+		/* 1110xxxx 10xxxxxx 10xxxxxx */
+		/* Three-byte UTF-8, two more bytes to read.  */
+		n = 3;
+		c = b & 0xF;
+	} else if ((b & 0xF8) == 0xF0 && size >= 3) {
+		/* 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx */
+		/* Four-byte UTF-8, three more bytes to read.  */
+		n = 4;
+		c = b & 0x7;
+	} else {
+		/* Return everything else verbatim, whether it's ASCII, longer
+		 * UTF-8 (against RFC 3629), invalid UTF-8, or just not enough
+		 * bytes left in the input buffer.  */
+		goto verbatim;
+	}
+
+	/* Mix in the UTF-8 continuation bytes.  */
+	for (i = 1; i < n; ++i) {
+		char b2 = '\0';
+		if (_stp_read_address(b2, buf, (user ? USER_DS : KERNEL_DS)))
+			return -EFAULT;
+		++buf;
+		--size;
+
+		if ((b2 & 0xC0) != 0x80) /* Bad continuation.  */
+			goto verbatim;
+
+		c = (c << 6) | (b2 & 0x3F);
+	}
+
+
+	/* Reject UTF-16 surrogates.  */
+	if (0xD800 <= c && c <= 0xDFFF)
+		goto verbatim;
+
+	/* Reject values that exceed RFC 3629.  */
+	if (c > 0x10FFFF)
+		goto verbatim;
+
+	/* Reject values that were encoded longer than necessary, so we don't
+	 * hide that fact in our output.  (e.g. 0xC0 0x80 -> 0!)  */
+	if (c < 0x80 || (n == 3 && c < 0x800) || (n == 4 && c < 0x10000))
+		goto verbatim;
+
+	/* Successfully consumed the continuation bytes.  */
+	*c_ret = c;
+	return n;
+
+verbatim:
+	*c_ret = (unsigned char) b;
+	return 1;
+}
+
 /** Return a printable text string.
  *
  * Takes a string, and any ASCII characters that are not printable are
@@ -65,9 +149,11 @@ static int _stp_vscnprintf(char *buf, size_t size, const char *fmt, va_list args
  * in will have "..." after the second quote.
  * @param user Set this to indicate the input string pointer is a userspace pointer.
  */
-static int _stp_text_str(char *outstr, char *in, int inlen, int outlen, int quoted, int user)
+static int _stp_text_str(char *outstr, const char *in, int inlen, int outlen,
+			 int quoted, int user)
 {
-	char c = '\0', *out = outstr;
+	int c = 0;
+	char *out = outstr;
 
 	if (inlen <= 0 || inlen > MAXSTRINGLEN-1)
 		inlen = MAXSTRINGLEN-1;
@@ -78,17 +164,35 @@ static int _stp_text_str(char *outstr, char *in, int inlen, int outlen, int quot
 		*out++ = '"';
 	}
 
-	if (user) {
-		if (_stp_read_address(c, in, USER_DS))
-			goto bad;
-	} else
-		c = *in;
-
-	while (c && inlen > 0 && outlen > 0) {
+	while (inlen > 0) {
 		int num = 1;
-		if (isprint(c) && isascii(c)
-                    && c != '"' && c != '\\') /* quoteworthy characters */
-                  *out++ = c;
+
+		int n = _stp_decode_utf8(in, inlen, user, &c);
+		if (n <= 0)
+			goto bad;
+		if (c == 0 || outlen <= 0)
+			break;
+		in += n;
+		inlen -= n;
+
+		if (n > 1) {
+			/* UTF-8, print \uXXXX or \UXXXXXXXX */
+			int i;
+			num = (c <= 0xFFFF) ? 6 : 10;
+			if (outlen < num)
+				break;
+
+			*out++ = '\\';
+			*out++ = (c <= 0xFFFF) ? 'u' : 'U';
+			for (i = num - 3; i >= 0; --i) {
+				char nibble = (c >> (i * 4)) & 0xF;
+				*out++ = to_hex_digit(nibble);
+			}
+
+		}
+		else if (isascii(c) && isprint(c)
+				&& c != '"' && c != '\\') /* quoteworthy characters */
+			*out++ = c;
 		else {
 			switch (c) {
 			case '\a':
@@ -100,10 +204,10 @@ static int _stp_text_str(char *outstr, char *in, int inlen, int outlen, int quot
 			case '\v':
 			case '"':
 			case '\\':
-				num = 2;
+				num = 2; // "\c"
 				break;
 			default:
-				num = 4;
+				num = 4; // "\ooo"
 				break;
 			}
 			
@@ -147,13 +251,6 @@ static int _stp_text_str(char *outstr, char *in, int inlen, int outlen, int quot
 			}
 		}
 		outlen -= num;
-		inlen--;
-		in++;
-		if (user) {
-			if (_stp_read_address(c, in, USER_DS))
-				goto bad;
-		} else
-			c = *in;
 	}
 
 	if (quoted) {
@@ -189,11 +286,11 @@ static int _stp_convert_utf32(char* buf, int size, u32 c)
 	int i, n;
 
 	/* 0xxxxxxx */
-	if (c < 0x7F)
+	if (c <= 0x7F)
 		n = 1;
 
 	/* 110xxxxx 10xxxxxx */
-	else if (c < 0x7FF)
+	else if (c <= 0x7FF)
 		n = 2;
 
 	/* UTF-16 surrogates are not valid by themselves.
@@ -203,11 +300,11 @@ static int _stp_convert_utf32(char* buf, int size, u32 c)
 		return -EINVAL;
 
 	/* 1110xxxx 10xxxxxx 10xxxxxx */
-	else if (c < 0xFFFF)
+	else if (c <= 0xFFFF)
 		n = 3;
 
 	/* 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx */
-	else if (c < 0x10FFFF)
+	else if (c <= 0x10FFFF)
 		n = 4;
 
 	/* The original UTF-8 design could go up to 0x7FFFFFFF, but RFC 3629

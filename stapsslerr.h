@@ -319,5 +319,5 @@ NSSYERROR(SEC_ERROR_CRL_IMPORT_FAILED,"Error attempting to import a CRL.");
 #endif
 /* 3.14.1 and later */
 #if (NSS_VMAJOR > 3) || (NSS_VMAJOR == 3 && NSS_VMINOR > 14) || (NSS_VMAJOR == 3 && NSS_VMINOR == 14 && NSS_VPATCH >= 1)
-NSSYERROR(SEC_ERROR_LEGACY_DATABASE,"Expecting a 'sql:' database but found a 'dbm:' database.");
+NSSYERROR(SEC_ERROR_LEGACY_DATABASE,"Database has the wrong format.");
 #endif

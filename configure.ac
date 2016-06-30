@@ -1,7 +1,7 @@
 dnl configure.ac --- autoconf input file for systemtap
 dnl Process this file with autoconf to produce a configure script.
 
-AC_INIT([systemtap], 2.5, systemtap@sourceware.org, systemtap)
+AC_INIT([systemtap], 3.0, systemtap@sourceware.org, systemtap)
 dnl                  ^^^ see also NEWS, systemtap.spec, testsuite/configure.ac
 dnl                      doc/SystemTap_Beginners_Guide/en-US/Book_Info.xml
 
@@ -32,10 +32,14 @@ AC_PROG_MAKE_SET
 AC_SUBST(CFLAGS)
 AC_SUBST(CXXFLAGS)
 AC_SYS_LARGEFILE
-AM_GNU_GETTEXT(external)
-AM_GNU_GETTEXT_VERSION([0.18.2])
 AC_CHECK_FUNCS(ppoll)
 AC_CHECK_FUNCS(openat)
+AM_GNU_GETTEXT(external)
+AM_GNU_GETTEXT_VERSION([0.19.4])
+
+if test "x$GMSGFMT" = "x:"; then
+   AC_MSG_ERROR([missing gnu /usr/bin/msgfmt])
+fi
 
 dnl Handle the prologues option.
 dnl
@@ -196,13 +200,10 @@ AC_ARG_ENABLE([docs],
     [enable building documentation (default on if latex etc. found).]),
   [enable_docs=$enableval],
   [enable_docs="check"])
-AC_CHECK_PROG(have_xvfb, xvfb-run, yes, no)
-AM_CONDITIONAL([HAVE_XVFB], [test "$have_xvfb" == "yes"])
 AC_CHECK_PROG(have_latex, latex, yes, no)
 AC_CHECK_PROG(have_dvips, dvips, yes, no)
 AC_CHECK_PROG(have_ps2pdf, ps2pdf, yes, no)
-AC_CHECK_PROG(have_latex2html, latex2html, yes, no)
-if test "x${have_latex}${have_dvips}${have_ps2pdf}${have_latex2html}" != "xyesyesyesyes"; then
+if test "x${have_latex}${have_dvips}${have_ps2pdf}" != "xyesyesyes"; then
    if test "$enable_docs" == "yes"; then
       AC_MSG_ERROR([cannot find all tools for building documentation])
    fi
@@ -210,61 +211,28 @@ if test "x${have_latex}${have_dvips}${have_ps2pdf}${have_latex2html}" != "xyesye
     AC_MSG_WARN([will not build documentation, cannot find all tools])
   fi
 fi
-if test "x${have_latex}${have_dvips}${have_ps2pdf}${have_latex2html}" == "xyesyesyesyes" -a "$enable_docs" != "no"; then
+if test "x${have_latex}${have_dvips}${have_ps2pdf}" == "xyesyesyes" -a "$enable_docs" != "no"; then
    building_docs="yes"
 fi
 AM_CONDITIONAL([BUILD_DOCS], [test "$building_docs" == "yes"])
 
-dnl Handle the options to build the publican options
-building_publican="no"
-AC_ARG_ENABLE([publican],
-  AS_HELP_STRING([--enable-publican],
-    [enable building publican documentation guides (default on if publican found and other documentation built).]),
-  [enable_publican=$enableval],
-  [enable_publican="check"])
-if test "$building_docs" == "no" -a "$enable_publican" == "yes" ; then
-   AC_MSG_ERROR([must use --enable-docs with --enable-publican])
-fi
-AC_CHECK_PROG(have_publican, publican, yes, no)
-if test "$enable_publican" == "yes"; then
-   if test "x${have_publican}" != "xyes"; then
-      AC_MSG_ERROR([cannot find publican for building publican guides])
-   fi
-fi
-if test "x${have_publican}" == "xyes" -a "$enable_publican" != "no" -a "${building_docs}" == "yes"; then
-   building_publican="yes"
-fi
-AM_CONDITIONAL([BUILD_PUBLICAN], [test "$building_publican" == "yes"])
-publican_brand="common"
-AC_ARG_WITH([publican-brand],
-  AS_HELP_STRING([--with-publican-brand=BRAND],
-    [building publican documentation guides using given brand (defaults to "common").]),
-  [publican_brand=$withval],
-  [publican_brand="common"])
-PUBLICAN_BRAND=$publican_brand
-AC_SUBST(PUBLICAN_BRAND)
 
 dnl Handle the option to build the reference documentation
 building_refdocs="no"
 AC_ARG_ENABLE([refdocs],
   AS_HELP_STRING([--enable-refdocs],
-    [enable building reference documentation (default on if xmlto etc. found and other documentation built).]),
+    [enable building reference documentation (default on if other documentation built).]),
   [enable_refdocs=$enableval],
   [enable_refdocs="check"])
 if test "$building_docs" == "no" -a "$enable_refdocs" == "yes" ; then
    AC_MSG_ERROR([must use --enable-docs with --enable-refdocs])
 fi
-AC_CHECK_PROG(have_xmlto, xmlto, yes, no)
-if test "$enable_refdocs" == "yes"; then
-   if test "x${have_xmlto}" != "xyes"; then
-      AC_MSG_ERROR([cannot find xmlto for building reference documentation])
-   fi
-fi
-if test "x${have_xmlto}" == "xyes" -a "$enable_refdocs" != "no" -a "${building_docs}" == "yes"; then
+if test "$enable_refdocs" != "no" -a "${building_docs}" == "yes"; then
    building_refdocs="yes"
 fi
 AM_CONDITIONAL([BUILD_REFDOCS], [test "$building_refdocs" == "yes"])
 
+AC_CHECK_PROG(have_xmlto, xmlto, yes, no)
 AC_CHECK_PROG(have_fop, fop, yes, no)
 if test "x${have_fop}" == "xyes"; then
    # Due to rhbz505364 / 830266, we must actually test-run fop, not just
@@ -279,6 +247,20 @@ if test "x${have_fop}" == "xyes"; then
    rm -f dummy-tapsets.pdf
 fi
 AM_CONDITIONAL([HAVE_FOP], [test "$have_fop" == "yes"])
+AM_CONDITIONAL([HAVE_XMLTO], [test "$have_xmlto" == "yes"])
+
+dnl Handle the option to build the html documentation
+building_htmldocs="no"
+AC_ARG_ENABLE([htmldocs],
+  AS_HELP_STRING([--enable-htmldocs],
+    [enable building html documentation (default off).]),
+    [building_htmldocs=$enableval],
+    [building_htmldocs="no"])
+if test "$have_xmlto" == "no" -a "$building_htmldocs" == "yes"; then
+   AC_MSG_ERROR([xmlto required for building html documentation])
+fi
+
+AM_CONDITIONAL([BUILD_HTMLDOCS], [test "$building_htmldocs" == "yes"])
 
 dnl There is a strange bug in older versions of xmlto when generating pdf.
 dnl https://bugzilla.redhat.com/show_bug.cgi?id=526273
@@ -311,28 +293,6 @@ AC_MSG_CHECKING([for xmlto --stringparam support])
 fi
 AM_CONDITIONAL([XMLTO_STRINGPARAM], [test "$have_xmlto_stringparam" == "yes"])
 
-if test "x${building_refdocs}" == "xyes"; then
-AC_MSG_CHECKING([for xmlto pdf support])
-   # xmlto pdf may work *only* with --with-fop
-   # XXX: To an extent this test is redundant in that the --with-fop test
-   # already ran xmlto --with-fop pdf ....
-   if test "x$have_fop" == "xyes"; then
-      XMLTOPDF_FOP=--with-fop
-   else
-      XMLTOPDF_FOP=
-   fi
-   xmlto $XMLTOPDF_FOP pdf conftest.xml >& /dev/null
-   if test $? == 0; then
-      have_xmlto_pdf="yes"
-      AC_MSG_RESULT([yes])
-   else
-      AC_MSG_RESULT([no])
-      AC_MSG_WARN([Not building reference documentation in PDF format])
-   fi
-   rm -f conftest.pdf
-fi
-AM_CONDITIONAL([BUILD_PDFREFDOCS], [test "$have_xmlto_pdf" == "yes"])
-
 rm -f conftest.xml
 
 dnl See if we have the nss/nspr headers and libraries
@@ -348,6 +308,17 @@ AS_IF([test "x$with_nss" != "xno"], [
 ], [have_nss=no])
 
 AM_CONDITIONAL([HAVE_NSS], [test "${have_nss}" = "yes"])
+
+dnl Handle dracut directory configuration.  Note we hard-code /usr by default,
+dnl instead of $prefix, because dracut is a system service that doesn't listen
+dnl at relocatable directories.
+AC_ARG_WITH([dracutstap],
+  AS_HELP_STRING([--with-dracutstap=DIR],
+    [Install dracut module files in DIR]))
+AS_IF([test "x$with_dracutstap" != "x"],[dracutstap="$with_dracutstap"],
+            [dracutstap=/usr/lib/dracut/modules.d/99stap])
+AC_MSG_NOTICE([using dracut module directory $dracutstap])
+AC_SUBST(dracutstap)
 
 dnl Handle the option to build the compile server.
 AC_ARG_ENABLE([server],
@@ -408,7 +379,50 @@ if test "$with_rpm" != "no"; then
   fi
 fi
 
+dnl Look for readline.
+dnl
+dnl First save the orignal value of LIBS.
+LIBS_no_readline=$LIBS
 
+dnl Check how for readline presence and how to link with it. On some
+dnl systems you need to add a termcap compatible library.
+have_libreadline="no"
+AC_MSG_CHECKING([how to link readline libs])
+for libtermcap in "" tinfo ncursesw ncurses curses termcap; do
+  if test -z "$libtermcap"; then
+    READLINE_LIBS="-lreadline"
+  else
+    READLINE_LIBS="-lreadline -l$libtermcap"
+  fi
+  LIBS="$READLINE_LIBS $LIBS_no_readline"
+  AC_LINK_IFELSE(
+    [AC_LANG_CALL([],[readline])],
+    [have_libreadline="yes"])
+  if test "$have_libreadline" = "yes"; then
+    break
+  fi
+done
+if test "$have_libreadline" = "no"; then
+  AC_MSG_RESULT([none])
+  READLINE_LIBS=""
+else
+  AC_MSG_RESULT([$READLINE_LIBS])
+  AC_DEFINE(HAVE_LIBREADLINE, [1],
+	    [Define if you have the readline library (-lreadline).])
+fi
+AC_SUBST([READLINE_LIBS])
+AM_CONDITIONAL([HAVE_LIBREADLINE], [test "$have_libreadline" == "yes"])
+
+dnl End of readline checks: restore LIBS
+LIBS=$LIBS_no_readline
+
+dnl Allow user to choose python3 for /usr/bin/dtrace
+AC_ARG_WITH([python3],
+  AS_HELP_STRING([--with-python3],[prefer /usr/bin/python3]))
+AS_IF([test "x$with_python3" = "xyes"],
+      [AC_SUBST(python,[python3])],
+      [AC_SUBST(python,[python])])
+      
 dnl Handle elfutils.  If '--with-elfutils=DIR' wasn't specified, used
 dnl the system's elfutils.
 build_elfutils=no
@@ -484,6 +498,7 @@ AC_LANG_PUSH(C++)
 AC_CHECK_HEADERS([tr1/unordered_map])
 AC_CHECK_HEADERS([tr1/memory])
 AC_CHECK_HEADERS([boost/shared_ptr.hpp])
+AC_CHECK_HEADERS([boost/utility/string_ref.hpp])
 AC_LANG_POP(C++)
 
 
@@ -522,7 +537,14 @@ if test "$with_dyninst" != "no"; then
 fi
 AM_CONDITIONAL([HAVE_DYNINST], [test "${have_dyninst}" = "yes"])
 
+
 dnl Check for the libvirt and libxml2 devel packages
+
+AC_ARG_ENABLE([virt],
+  AS_HELP_STRING([--enable-virt],
+    [enable building of stapvirt support (default on if libvirt etc. found).]),
+  [enable_virt=$enableval],
+  [enable_virt="check"])
 
 dnl We require libvirt >= 1.0.2 because stapvirt relies on the
 dnl virDomainOpenChannel function, which was implemented in 1.0.2.
@@ -536,6 +558,25 @@ PKG_CHECK_MODULES([libxml2], [libxml-2.0], [
    AC_DEFINE([HAVE_LIBXML2],[1],[Define to 1 if libxml2 development libraries are installed])
    ], [have_libxml2=no])
 AM_CONDITIONAL([HAVE_LIBXML2], [test "${have_libxml2}" = "yes"])
+
+if test "$enable_virt" != "no"; then
+dnl See if we have enough libraries and tools to build the virt server
+  if test "x${have_libvirt}" != "xyes"; then
+    AC_MSG_WARN([will not build systemtap virt support, cannot find libvirt headers])
+  fi		       
+  if test "x${have_libxml2}" != "xyes"; then
+    AC_MSG_WARN([will not build systemtap virt support, cannot find xml2 headers])
+  fi		       
+fi
+AM_CONDITIONAL([BUILD_VIRT], [test "${have_libvirt}" == "yes" -a "${have_libxml2}" == "yes" -a "$enable_virt" != "no"])
+
+dnl Check for presence of json-c and ncurses for use in monitor mode
+PKG_CHECK_MODULES([jsonc], [json-c], [have_jsonc=yes], [have_jsonc=no])
+PKG_CHECK_MODULES([ncurses], [ncurses], [have_ncurses=yes], [have_ncurses=no])
+AM_CONDITIONAL([HAVE_MONITOR_LIBS], [test "${have_jsonc}" == "yes" -a "${have_ncurses}" == "yes"])
+if test "${have_jsonc}" == "yes" -a "${have_ncurses}" == yes; then
+  AC_DEFINE([HAVE_MONITOR_LIBS],[1],[Define to 1 if json-c and ncurses libraries are installed])
+fi
 
 AC_CACHE_CHECK([for assembler .section "?" flags support], stap_cv_sectionq, [
 old_CFLAGS="$CFLAGS"
@@ -559,10 +600,15 @@ fi
 AC_CONFIG_FILES([includes/sys/sdt-config.h po/Makefile.in])
 
 if test $build_elfutils = yes -a $enable_translator = yes; then
+  here=`pwd`
   case "$with_elfutils" in
   /*) elfutils_srcdir="$with_elfutils" ;;
-  *) elfutils_srcdir="../$with_elfutils" ;;
+  *) elfutils_srcdir="${here}/$with_elfutils" ;;
   esac
+
+  if ! test -f ${elfutils_srcdir}/configure; then
+    AC_MSG_ERROR([No ${elfutils_srcdir}/configure, forgot to run autoreconf -i?])
+  fi
   AC_MSG_NOTICE([running ${elfutils_srcdir}/configure])
 
   save_CFLAGS="$CFLAGS"
@@ -582,7 +628,6 @@ if test $build_elfutils = yes -a $enable_translator = yes; then
   # Note that $libdir might be using a quoted use of $exec_prefix or $prefix.
   # So we must make sure to pass those settings to elfutils configure.
   elfutils_rpath="-Wl,--enable-new-dtags,-rpath,${libdir}/${PACKAGE_NAME}"
-  here=`pwd`
   # Check whether this is a source release, or a source checkout.
   # We need --enable-maintainer-mode if it isn't a source release.
   # elfutils.spec is only distributed in source releases.
@@ -626,6 +671,12 @@ AS_IF([test "x$with_selinux" != "xno"], [
 
 AM_CONDITIONAL([HAVE_SELINUX], [test "${have_selinux}" = "yes"])
 
+dnl Used in monitor mode. Only available on kernel versions >= 2.6.35
+AC_CHECK_DECL([F_SETPIPE_SZ],
+              [AC_DEFINE(HAVE_F_SETPIPE_SZ,[1], Define to 1 if F_SETPIPE_SZ is available.)],
+              [],
+              [#include <fcntl.h>])
+
 dnl Handle java+byteman support
 AC_CHECK_PROG(have_javac, javac, yes, no)
 AC_CHECK_PROG(have_jar, jar, yes, no)
@@ -637,7 +688,10 @@ AC_ARG_WITH([java],
      [Specify JDK directory to compile libHelperSDT.so against (default is /usr/lib/jvm/java)])],
   [],
   [with_java=/usr/lib/jvm/java])
-AC_CHECK_FILE([$with_java],[],[with_java=no])
+dnl don't use AC_CHECK_FILE here, as that blocks cross-compiling
+if test ! -d "$with_java"; then
+   with_java=no
+fi
 AC_SUBST(JAVADIR, "${with_java}") # always needed to compile
 
 if test "$with_java" != "no"; then
@@ -665,6 +719,12 @@ AS_IF([test "x$with_extra_version" != "xno"], [
 AC_DEFINE_UNQUOTED(STAP_EXTRA_VERSION, "$stap_extra_version", [extra stap version code])
 AC_SUBST(STAP_EXTRA_VERSION, "$stap_extra_version")
 
+dnl The stap translator stringtable benefits performance-wise from c++11 constructs.
+AX_CHECK_COMPILE_FLAG([-std=c++11],[cxx11="-std=c++11"],[cxx11=""])
+AS_IF([test "x$cxx11" != "x"],[
+        AC_MSG_NOTICE([Compiling parts of systemtap with -std=c++11])])
+AC_SUBST(cxx11)
+
 dnl This is here mainly to make sure that configure --prefix=... changes
 dnl the config.h files so files depending on it are recompiled
 dnl prefix is passed through indirectly in the Makefile.am AM_CPPFLAGS.
@@ -677,11 +737,13 @@ AC_DEFINE_UNQUOTED(STAP_PREFIX, "$stap_prefix", [configure prefix location])
 AC_SUBST(STAP_PREFIX, "$stap_prefix")
 
 AC_CONFIG_HEADERS([config.h:config.in])
-AC_CONFIG_FILES([Makefile doc/Makefile man/Makefile \
+AC_CONFIG_FILES([Makefile doc/Makefile man/Makefile man/cs/Makefile \
 doc/beginners/Makefile doc/SystemTap_Tapset_Reference/Makefile \
-man/stappaths.7 \
+man/stap.1 man/stappaths.7 man/systemtap.8 \
+man/cs/stap.1 man/cs/stappaths.7 man/cs/systemtap.8 \
 initscript/config.systemtap initscript/config.stap-server \
-initscript/systemtap initscript/stap-server ])
+initscript/systemtap initscript/stap-server \
+initscript/99stap/module-setup.sh ])
 AC_CONFIG_SUBDIRS(testsuite)
 if test $enable_translator == "yes"; then
 	AC_CONFIG_FILES([run-stap], [chmod +x run-stap])
@@ -696,11 +758,10 @@ AC_CONFIG_FILES([staprun/guest/stapshd], [chmod +x staprun/guest/stapshd])
 AC_CONFIG_FILES([staprun/guest/stapsh-daemon], [chmod +x staprun/guest/stapsh-daemon])
 AC_CONFIG_FILES([staprun/guest/stapsh@.service])
 
-# Setup "shadow" directory doc/beginners that has everything setup for
-# publican in one directory (through directory links if necessary).
+# Setup "shadow" directory doc/beginners that has the basic directories  setup for
+# xmlto in one directory (through directory links if necessary).
 # It would be nice to use AC_CONFIG_LINKS, but automake complains when
 # the src is a directory and not a file.
-AC_CONFIG_FILES([doc/beginners/publican.cfg:doc/SystemTap_Beginners_Guide/publican.cfg.in])
 AC_CONFIG_COMMANDS([doc/beginners],
                    [rm -f $ac_abs_top_builddir/doc/beginners/en-US $ac_abs_top_builddir/doc/beginners/build/en-US/testsuite && mkdir -p $ac_abs_top_builddir/doc/beginners/build/en-US && ln -s $ac_abs_top_srcdir/doc/SystemTap_Beginners_Guide/en-US $ac_abs_top_builddir/doc/beginners/en-US && ln -s $ac_abs_top_srcdir/testsuite $ac_abs_top_builddir/doc/beginners/build/en-US/testsuite])
 

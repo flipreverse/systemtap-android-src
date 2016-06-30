@@ -4,6 +4,11 @@
 # The .meta files contain information categorizing the script.  The
 # .meta files are composed of lines of tags. Each tag is followed by a
 # value.
+#
+# To restrict scripts to test, set the CHECK_ONLY environment variable.
+# For example, to only test the badname and fntimes scripts, run:
+#
+#    make installcheck RUNTESTFLAGS="check.exp" CHECK_ONLY="badname fntimes"
 
 #open the file and read in all the lines of data in FILE
 #return a string with the data
@@ -33,6 +38,10 @@ proc extract_tag { META_DATA TAG } {
 proc run_command { test action command } {
     #FIXME tcl says that single quotes not dealt with
     if { $command != "" } then {
+	# use stress instead of sleep if time >= 1
+	if {[file executable /usr/bin/stress]} {
+	    regsub {sleep ([1-9])} $command {mkdir /tmp/$$; cd /tmp/$$; timeout --kill=1 30 stress -c 4 -i 4 -m 4 --vm-bytes 32M -d 4 --hdd-bytes 32M -t \1} command
+	}
 	verbose -log "attempting command $command"
 	set res [catch {exec sh -c $command 2>@1} value]
 	verbose -log "OUT $value"
@@ -52,7 +61,16 @@ proc run_command { test action command } {
 
 
 set src_examples [fullpath $srcdir/systemtap.examples]
-set meta_files [lsort [exec find  $src_examples -path "*.meta"]]
+
+if {[info exists env(CHECK_ONLY)]} {
+    set name_match "-false"
+    foreach file $env(CHECK_ONLY) {
+      set name_match "$name_match -o -name $file.meta"
+    }
+    set meta_files [lsort [eval exec find $src_examples -path "*.meta" $name_match]]
+} else {
+    set meta_files [lsort [exec find $src_examples -path "*.meta"]]
+}
 
 set curdir [pwd]
 verbose -log "SAVED PWD=$curdir"
@@ -111,6 +129,13 @@ foreach file $meta_files {
              untested "$test run" 
          }
     }
+
+    # NB: Don't try to clean up; too dangerous & can error-out
+    # set output_type [extract_tag "$meta_data" "output"]
+    # if {$output_type == "file"} {
+    #   regexp {\-o\s+([A-Za-z0-9_\-\.]+)} $command match outfile
+    #   eval exec /bin/rm -f $dir/[glob -nocomplain $outfile*]
+    # }
 }
 
 # get back to starting point

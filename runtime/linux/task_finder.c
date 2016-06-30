@@ -437,18 +437,9 @@ __stp_task_finder_cleanup(void)
 static char *
 __stp_get_mm_path(struct mm_struct *mm, char *buf, int buflen)
 {
-	struct file *vm_file;
+	struct file *vm_file = stap_find_exe_file(mm);
 	char *rc = NULL;
 
-	// The down_read() function can sleep, so we'll call
-	// down_read_trylock() instead, which can fail.  If if fails,
-	// we'll just pretend this task didn't have a path.
-	if (!mm || ! down_read_trylock(&mm->mmap_sem)) {
-		*buf = '\0';
-		return ERR_PTR(-ENOENT);
-	}
-
-	vm_file = stap_find_exe_file(mm);
 	if (vm_file) {
 #ifdef STAPCONF_DPATH_PATH
 		rc = d_path(&(vm_file->f_path), buf, buflen);
@@ -456,12 +447,12 @@ __stp_get_mm_path(struct mm_struct *mm, char *buf, int buflen)
 		rc = d_path(vm_file->f_dentry, vm_file->f_vfsmnt,
 			    buf, buflen);
 #endif
+		fput(vm_file);
 	}
 	else {
 		*buf = '\0';
 		rc = ERR_PTR(-ENOENT);
 	}
-	up_read(&mm->mmap_sem);
 	return rc;
 }
 
@@ -731,7 +722,11 @@ __stp_call_mmap_callbacks_with_addr(struct stap_task_finder_target *tgt,
 		length = vma->vm_end - vma->vm_start;
 		offset = (vma->vm_pgoff << PAGE_SHIFT);
 		vm_flags = vma->vm_flags;
+#ifdef STAPCONF_DPATH_PATH
+		dentry = vma->vm_file->f_path.dentry;
+#else
 		dentry = vma->vm_file->f_dentry;
+#endif
 
 		// Allocate space for a path
 		mmpath_buf = _stp_kmalloc(PATH_MAX);
@@ -846,7 +841,7 @@ __stp_utrace_attach_match_filename(struct task_struct *tsk,
 #ifdef STAPCONF_TASK_UID
 	tsk_euid = tsk->euid;
 #else
-#ifdef CONFIG_UIDGID_STRICT_TYPE_CHECKS
+#if defined(CONFIG_USER_NS) || (LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0))
 	tsk_euid = from_kuid_munged(current_user_ns(), task_euid(tsk));
 #else
 	tsk_euid = task_euid(tsk);
@@ -1245,6 +1240,7 @@ __stp_call_mmap_callbacks_for_task(struct stap_task_finder_target *tgt,
 			    // get deleted from out under us.
 			    vma_cache_p->f_path = &(vma->vm_file->f_path);
 			    path_get(vma_cache_p->f_path);
+			    vma_cache_p->dentry = vma->vm_file->f_path.dentry;
 #else
 			    // Notice we're increasing the reference
 			    // count for 'dentry' and 'f_vfsmnt'.
@@ -1254,8 +1250,8 @@ __stp_call_mmap_callbacks_for_task(struct stap_task_finder_target *tgt,
 			    dget(vma_cache_p->dentry);
 			    vma_cache_p->f_vfsmnt = vma->vm_file->f_vfsmnt;
 			    mntget(vma_cache_p->f_vfsmnt);
-#endif
 			    vma_cache_p->dentry = vma->vm_file->f_dentry;
+#endif
 			    vma_cache_p->addr = vma->vm_start;
 			    vma_cache_p->length = vma->vm_end - vma->vm_start;
 			    vma_cache_p->offset = (vma->vm_pgoff << PAGE_SHIFT);
@@ -1436,7 +1432,7 @@ __stp_utrace_task_finder_target_syscall_entry(enum utrace_resume_action action,
 	// results.
 	//
 	// FIXME: do we need to handle mremap()?
-	syscall_no = syscall_get_nr(tsk, regs);
+	syscall_no = _stp_syscall_get_nr(tsk, regs);
 	is_mmap_or_mmap2 = (syscall_no == MMAP_SYSCALL_NO(tsk)
 			    || syscall_no == MMAP2_SYSCALL_NO(tsk) ? 1 : 0);
 	if (!is_mmap_or_mmap2) {
@@ -1646,7 +1642,7 @@ stap_start_task_finder(void)
 #ifdef STAPCONF_TASK_UID
 		tsk_euid = tsk->euid;
 #else
-#ifdef CONFIG_UIDGID_STRICT_TYPE_CHECKS
+#if defined(CONFIG_USER_NS) || (LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0))
 		tsk_euid = from_kuid_munged(current_user_ns(), task_euid(tsk));
 #else
 		tsk_euid = task_euid(tsk);

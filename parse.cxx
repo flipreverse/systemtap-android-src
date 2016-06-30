@@ -1,7 +1,8 @@
 // recursive descent parser for systemtap scripts
-// Copyright (C) 2005-2013 Red Hat Inc.
+// Copyright (C) 2005-2015 Red Hat Inc.
 // Copyright (C) 2006 Intel Corporation.
 // Copyright (C) 2007 Bull S.A.S
+// Copyright (C) 2014 Peter Kjellstrom <cap@nsc.liu.se>
 //
 // This file is part of systemtap, and is free software.  You can
 // redistribute it and/or modify it under the terms of the GNU General
@@ -13,6 +14,8 @@
 #include "parse.h"
 #include "session.h"
 #include "util.h"
+#include "stringtable.h"
+#include "unordered.h"
 
 #include <iostream>
 
@@ -40,20 +43,23 @@ public:
   bool ate_comment; // current token follows a comment
   bool ate_whitespace; // the most recent token followed whitespace
   bool saw_tokens; // the lexer found tokens (before preprocessing occurred)
+  bool check_compatible; // whether to gate features on session.compatible
 
   token* scan ();
-  lexer (istream&, const string&, systemtap_session&);
+  lexer (istream&, const string&, systemtap_session&, bool);
   void set_current_file (stapfile* f);
+  void set_current_token_chain (const token* tok);
+  inline bool has_version (const char* v) const;
 
-  static set<string> keywords;
-  static set<string> atwords;
+  unordered_set<interned_string> keywords;
+  static unordered_set<string> atwords;
 private:
   inline int input_get ();
   inline int input_peek (unsigned n=0);
   void input_put (const string&, const token*);
   string input_name;
-  string input_contents;
-  const char *input_pointer; // index into input_contents
+  string input_contents; // NB: being a temporary, no need to interned_string optimize this object
+  const char *input_pointer; // index into input_contents; NB: recompute if input_contents changed!
   const char *input_end;
   unsigned cursor_suspend_count;
   unsigned cursor_suspend_line;
@@ -62,17 +68,19 @@ private:
   unsigned cursor_column;
   systemtap_session& session;
   stapfile* current_file;
+  const token* current_token_chain;
 };
 
 
 class parser
 {
 public:
-  parser (systemtap_session& s, const string& n, istream& i, bool p);
+  parser (systemtap_session& s, const string& n, istream& i, unsigned flags=0);
   ~parser ();
 
-  stapfile* parse (bool errs_as_warnings);
-  stapfile* parse_library_macros (bool errs_as_warnings);
+  stapfile* parse ();
+  probe* parse_synthetic_probe (const token* chain);
+  stapfile* parse_library_macros ();
 
 private:
   typedef enum {
@@ -94,7 +102,9 @@ private:
   systemtap_session& session;
   string input_name;
   lexer input;
+  bool errs_as_warnings;
   bool privileged;
+  bool user_file;
   parse_context context;
 
   // preprocessing subordinate, first pass (macros)
@@ -105,15 +115,15 @@ private:
 
     macrodecl* curr_macro;
 
-    pp1_activation (const token tok, macrodecl* curr_macro)
-      : tok(new token(tok)), cursor(0), curr_macro(curr_macro) { }
+    pp1_activation (const token* tok, macrodecl* curr_macro)
+      : tok(tok), cursor(0), curr_macro(curr_macro) { }
     ~pp1_activation ();
   };
 
   map<string, macrodecl*> pp1_namespace;
   vector<pp1_activation*> pp1_state;
   const token* next_pp1 ();
-  const token* scan_pp1 ();
+  const token* scan_pp1 (bool ignore_macros);
   const token* slurp_pp1_param (vector<const token*>& param);
   const token* slurp_pp1_body (vector<const token*>& body);
 
@@ -135,14 +145,14 @@ private:
 
   // expectations, these swallow the token
   void expect_known (token_type tt, string const & expected);
-  void expect_unknown (token_type tt, string & target);
-  void expect_unknown2 (token_type tt1, token_type tt2, string & target);
+  void expect_unknown (token_type tt, interned_string & target);
+  void expect_unknown2 (token_type tt1, token_type tt2, interned_string & target);
 
   // convenience forms, these also swallow the token
   void expect_op (string const & expected);
   void expect_kw (string const & expected);
   void expect_number (int64_t & expected);
-  void expect_ident_or_keyword (string & target);
+  void expect_ident_or_keyword (interned_string & target);
 
   // convenience forms, which return true or false, these don't swallow token
   bool peek_op (string const & op);
@@ -150,17 +160,26 @@ private:
 
   // convenience forms, which return the token
   const token* expect_kw_token (string const & expected);
-  const token* expect_ident_or_atword (string & target);
+  const token* expect_ident_or_atword (interned_string & target);
 
   void print_error (const parse_error& pe, bool errs_as_warnings = false);
   unsigned num_errors;
 
 private: // nonterminals
   void parse_probe (vector<probe*>&, vector<probe_alias*>&);
-  void parse_global (vector<vardecl*>&, vector<probe*>&);
-  void parse_functiondecl (vector<functiondecl*>&);
+  void parse_private (vector<vardecl*>&, vector<probe*>&,
+                      string const&, vector<functiondecl*>&);
+  void parse_global (vector<vardecl*>&, vector<probe*>&,
+                     string const&);
+  void do_parse_global (vector<vardecl*>&, vector<probe*>&,
+                        string const&, const token*, bool);
+  void parse_functiondecl (vector<functiondecl*>&, string const&);
+  void do_parse_functiondecl (vector<functiondecl*>&, const token*,
+                              string const&, bool);
   embeddedcode* parse_embeddedcode ();
-  probe_point* parse_probe_point ();
+  vector<probe_point*> parse_probe_points ();
+  vector<probe_point*> parse_components ();
+  vector<probe_point*> parse_component ();
   literal_string* consume_string_literals (const token*);
   literal_string* parse_literal_string ();
   literal* parse_literal ();
@@ -178,8 +197,10 @@ private: // nonterminals
   break_statement* parse_break_statement ();
   continue_statement* parse_continue_statement ();
   indexable* parse_indexable ();
-  const token *parse_hist_op_or_bare_name (hist_op *&hop, string &name);
-  target_symbol *parse_target_symbol (const token* t);
+  const token *parse_hist_op_or_bare_name (hist_op *&hop, interned_string &name);
+  target_symbol *parse_target_symbol ();
+  cast_op *parse_cast_op ();
+  atvar_op *parse_atvar_op ();
   expression* parse_entry_op (const token* t);
   expression* parse_defined_op (const token* t);
   expression* parse_perf_op (const token* t);
@@ -199,9 +220,11 @@ private: // nonterminals
   expression* parse_multiplicative ();
   expression* parse_unary ();
   expression* parse_crement ();
+  expression* parse_dwarf_value ();
   expression* parse_value ();
   expression* parse_symbol ();
 
+  bool peek_target_symbol_components ();
   void parse_target_symbol_components (target_symbol* e);
 };
 
@@ -209,15 +232,14 @@ private: // nonterminals
 // ------------------------------------------------------------------------
 
 stapfile*
-parse (systemtap_session& s, istream& i, bool pr, bool errs_as_warnings)
+parse (systemtap_session& s, const string& n, istream& i, unsigned flags)
 {
-  parser p (s, "<input>", i, pr);
-  return p.parse (errs_as_warnings);
+  parser p (s, n, i, flags);
+  return p.parse ();
 }
 
-
 stapfile*
-parse (systemtap_session& s, const string& name, bool pr, bool errs_as_warnings)
+parse (systemtap_session& s, const string& name, unsigned flags)
 {
   ifstream i(name.c_str(), ios::in);
   if (i.fail())
@@ -229,12 +251,12 @@ parse (systemtap_session& s, const string& name, bool pr, bool errs_as_warnings)
       return 0;
     }
 
-  parser p (s, name, i, pr);
-  return p.parse (errs_as_warnings);
+  parser p (s, name, i, flags);
+  return p.parse ();
 }
 
 stapfile*
-parse_library_macros (systemtap_session& s, const string& name, bool errs_as_warnings)
+parse_library_macros (systemtap_session& s, const string& name)
 {
   ifstream i(name.c_str(), ios::in);
   if (i.fail())
@@ -246,16 +268,24 @@ parse_library_macros (systemtap_session& s, const string& name, bool errs_as_war
       return 0;
     }
 
-  parser p (s, name, i, false); // TODOXX pr is ...? should path be full??
-  return p.parse_library_macros (errs_as_warnings);
+  parser p (s, name, i);
+  return p.parse_library_macros ();
+}
+
+probe*
+parse_synthetic_probe (systemtap_session &s, istream& i, const token* tok)
+{
+  parser p (s, tok ? tok->location.file->name : "<synthetic>", i);
+  return p.parse_synthetic_probe (tok);
 }
 
 // ------------------------------------------------------------------------
 
-
-parser::parser (systemtap_session& s, const string &n, istream& i, bool p):
-  session (s), input_name (n), input (i, input_name, s), privileged (p),
-  context(con_unknown), systemtap_v_seen(0), last_t (0), next_t (0), num_errors (0)
+parser::parser (systemtap_session& s, const string &n, istream& i, unsigned flags):
+  session (s), input_name (n), input (i, input_name, s, !(flags & pf_no_compatible)),
+  errs_as_warnings(flags & pf_squash_errors), privileged (flags & pf_guru),
+  user_file (flags & pf_user_file), context(con_unknown), systemtap_v_seen(0),
+  last_t (0), next_t (0), num_errors (0)
 {
 }
 
@@ -406,7 +436,7 @@ parser::next_pp1 ()
 }
 
 const token*
-parser::scan_pp1 ()
+parser::scan_pp1 (bool ignore_macros = false)
 {
   while (true)
     {
@@ -423,7 +453,8 @@ parser::scan_pp1 ()
         }
 
       // macro definition
-      if (t->type == tok_operator && t->content == "@define")
+      // PR18462 don't catalog preprocessor-disabled macros
+      if (t->type == tok_operator && t->content == "@define" && !ignore_macros)
         {
           if (!pp1_state.empty())
             throw PARSE_ERROR (_("'@define' forbidden inside macro body"), t);
@@ -459,7 +490,7 @@ parser::scan_pp1 ()
           // macros.....)
           if (name == "define")
             throw PARSE_ERROR (_("attempt to redefine '@define'"), t);
-          if (input.atwords.count("@" + name))
+          if (input.atwords.count(name))
             session.print_warning (_F("macro redefines built-in operator '@%s'", name.c_str()), t);
 
           macrodecl* decl = (pp1_namespace[name] = new macrodecl);
@@ -522,7 +553,7 @@ parser::scan_pp1 ()
       // (potential) macro invocation
       if (t->type == tok_operator && t->content[0] == '@')
         {
-          string name = t->content.substr(1); // strip initial '@'
+          const string& name = t->content.substr(1); // strip initial '@'
 
           // check if name refers to a real parameter or macro
           macrodecl* decl;
@@ -538,8 +569,8 @@ parser::scan_pp1 ()
           else // this is an ordinary @operator
             return t;
 
-          // handle macro invocation
-          pp1_activation *new_act = new pp1_activation(*t, decl);
+          // handle macro invocation, taking ownership of t
+          pp1_activation *new_act = new pp1_activation(t, decl);
           unsigned num_params = decl->formal_args.size();
 
           // (1a) restore parameter invocation closure
@@ -638,7 +669,7 @@ parser::scan_pp1 ()
     }
 }
 
-// Consume a single macro invocation's parameters, heeding nested ( )
+// Consume a single macro invocation's parameters, heeding nesting
 // brackets and stopping on an unbalanced ')' or an unbracketed ','
 // (and returning the final separator token).
 const token*
@@ -652,9 +683,10 @@ parser::slurp_pp1_param (vector<const token*>& param)
 
       if (!t)
         break;
-      if (t->type == tok_operator && t->content == "(")
+      // [ needed in case macro paramater is used as prefix for array-deref operation
+      if (t->type == tok_operator && (t->content == "(" || t->content == "["))
         ++nesting;
-      else if (nesting && t->type == tok_operator && t->content == ")")
+      else if (nesting && t->type == tok_operator && (t->content == ")" || t->content == "]"))
         --nesting;
       else if (!nesting && t->type == tok_operator
                && (t->content == ")" || t->content == ","))
@@ -692,14 +724,14 @@ parser::slurp_pp1_body (vector<const token*>& body)
 
 // Used for parsing .stpm files.
 stapfile*
-parser::parse_library_macros (bool errs_as_warnings)
+parser::parse_library_macros ()
 {
   stapfile* f = new stapfile;
   input.set_current_file (f);
 
   try
     {
-      const token* t = scan_pp1 ();
+      const token* t = scan_pp ();
 
       // Currently we only take objection to macro invocations if they
       // produce a non-whitespace token after being expanded.
@@ -707,7 +739,7 @@ parser::parse_library_macros (bool errs_as_warnings)
       // XXX should we prevent macro invocations even if they expand to empty??
 
       if (t != 0)
-        throw PARSE_ERROR (_F("library macro file '%s' contains non-@define construct", input_name.c_str()), t);
+        throw PARSE_ERROR (_F("unexpected token in library macro file '%s'", input_name.c_str()), t);
 
       // We need to first check whether *any* of the macros are duplicates,
       // then commit to including the entire file in the global namespace
@@ -835,7 +867,6 @@ bool eval_pp_conditional (systemtap_session& s,
   else if (l->type == tok_identifier && l->content == "systemtap_privilege")
     {
       string target_privilege =
-	/* XXX perhaps include a "guru" state */
 	pr_contains(s.privilege, pr_stapdev) ? "stapdev"
 	: pr_contains(s.privilege, pr_stapsys) ? "stapsys"
 	: pr_contains(s.privilege, pr_stapusr) ? "stapusr"
@@ -858,6 +889,20 @@ bool eval_pp_conditional (systemtap_session& s,
       /* XXX perhaps allow <= >= and similar comparisons */
 
       return result;
+    }
+  else if (l->type == tok_identifier && l->content == "guru_mode")
+    {
+      if (! (r->type == tok_number))
+        throw PARSE_ERROR (_("expected number"), r);
+      int64_t lhs = (int64_t) s.guru_mode;
+      int64_t rhs = lex_cast<int64_t>(r->content);
+      if (!((rhs == 0)||(rhs == 1)))
+        throw PARSE_ERROR (_("expected 0 or 1"), op);
+      if (!((op->type == tok_operator && op->content == "==") ||
+	    (op->type == tok_operator && op->content == "!=")))
+        throw PARSE_ERROR (_("expected '==' or '!='"), op);
+
+      return eval_comparison (lhs, op, rhs);
     }
   else if (l->type == tok_identifier && l->content == "arch")
     {
@@ -904,7 +949,7 @@ bool eval_pp_conditional (systemtap_session& s,
 
       return result;
     }
-  else if (l->type == tok_identifier && startswith(l->content, "CONFIG_"))
+  else if (l->type == tok_identifier && l->content.starts_with("CONFIG_"))
     {
       if (r->type == tok_string)
 	{
@@ -925,7 +970,8 @@ bool eval_pp_conditional (systemtap_session& s,
 	}
       else if (r->type == tok_number)
 	{
-          const char* startp = s.kernel_config[l->content].c_str ();
+          const string& lhs_string = s.kernel_config[l->content];
+          const char* startp = lhs_string.c_str ();
           char* endp = (char*) startp;
           errno = 0;
           int64_t lhs = (int64_t) strtoll (startp, & endp, 0);
@@ -936,18 +982,20 @@ bool eval_pp_conditional (systemtap_session& s,
 	  return eval_comparison (lhs, op, rhs);
 	}
       else if (r->type == tok_identifier
-	       && startswith(r->content, "CONFIG_"))
+	       && r->content.starts_with( "CONFIG_"))
 	{
 	  // First try to convert both to numbers,
 	  // otherwise threat both as strings.
-          const char* startp = s.kernel_config[l->content].c_str ();
+          const string& lhs_string = s.kernel_config[l->content];
+          const string& rhs_string = s.kernel_config[r->content];
+          const char* startp = lhs_string.c_str ();
           char* endp = (char*) startp;
           errno = 0;
           int64_t val = (int64_t) strtoll (startp, & endp, 0);
           if (errno != ERANGE && errno != EINVAL && *endp == '\0')
 	    {
 	      int64_t lhs = val;
-	      startp = s.kernel_config[r->content].c_str ();
+              startp = rhs_string.c_str ();
 	      endp = (char*) startp;
 	      errno = 0;
 	      int64_t rhs = (int64_t) strtoll (startp, & endp, 0);
@@ -955,9 +1003,7 @@ bool eval_pp_conditional (systemtap_session& s,
 		return eval_comparison (lhs, op, rhs);
 	    }
 
-	  string lhs = s.kernel_config[l->content];
-	  string rhs = s.kernel_config[r->content];
-	  return eval_comparison (lhs, op, rhs);
+	  return eval_comparison (lhs_string, op, rhs_string);
 	}
       else
 	throw PARSE_ERROR (_("expected string, number literal or other CONFIG_... as right side operand"), r);
@@ -1117,7 +1163,7 @@ parser::skip_pp ()
     {
       try
         {
-          t = scan_pp1 ();
+          t = scan_pp1 (true);
         }
       catch (const parse_error &e)
         {
@@ -1195,7 +1241,7 @@ parser::expect_known (token_type tt, string const & expected)
 
 
 void
-parser::expect_unknown (token_type tt, string & target)
+parser::expect_unknown (token_type tt, interned_string & target)
 {
   const token *t = next();
   if (!(t && t->type == tt))
@@ -1206,7 +1252,7 @@ parser::expect_unknown (token_type tt, string & target)
 
 
 void
-parser::expect_unknown2 (token_type tt1, token_type tt2, string & target)
+parser::expect_unknown2 (token_type tt1, token_type tt2, interned_string & target)
 {
   const token *t = next();
   if (!(t && (t->type == tt1 || t->type == tt2)))
@@ -1217,20 +1263,20 @@ parser::expect_unknown2 (token_type tt1, token_type tt2, string & target)
 
 
 void
-parser::expect_op (std::string const & expected)
+parser::expect_op (string const & expected)
 {
   expect_known (tok_operator, expected);
 }
 
 
 void
-parser::expect_kw (std::string const & expected)
+parser::expect_kw (string const & expected)
 {
   expect_known (tok_keyword, expected);
 }
 
 const token*
-parser::expect_kw_token (std::string const & expected)
+parser::expect_kw_token (string const & expected)
 {
   const token *t = next();
   if (! (t && t->type == tok_keyword && t->content == expected))
@@ -1252,7 +1298,8 @@ parser::expect_number (int64_t & value)
   if (!(t && t->type == tok_number))
     throw PARSE_ERROR (_("expected number"));
 
-  const char* startp = t->content.c_str ();
+  const string& s = t->content;
+  const char* startp = s.c_str ();
   char* endp = (char*) startp;
 
   // NB: we allow controlled overflow from LLONG_MIN .. ULLONG_MAX
@@ -1275,7 +1322,7 @@ parser::expect_number (int64_t & value)
 
 
 const token*
-parser::expect_ident_or_atword (std::string & target)
+parser::expect_ident_or_atword (interned_string & target)
 {
   const token *t = next();
 
@@ -1292,32 +1339,32 @@ parser::expect_ident_or_atword (std::string & target)
 
 
 void
-parser::expect_ident_or_keyword (std::string & target)
+parser::expect_ident_or_keyword (interned_string & target)
 {
   expect_unknown2 (tok_identifier, tok_keyword, target);
 }
 
 
 bool
-parser::peek_op (std::string const & op)
+parser::peek_op (string const & op)
 {
   return tok_is (peek(), tok_operator, op);
 }
 
 
 bool
-parser::peek_kw (std::string const & kw)
+parser::peek_kw (string const & kw)
 {
   return tok_is (peek(), tok_identifier, kw);
 }
 
 
 
-lexer::lexer (istream& input, const string& in, systemtap_session& s):
-  ate_comment(false), ate_whitespace(false), saw_tokens(false),
+lexer::lexer (istream& input, const string& in, systemtap_session& s, bool cc):
+  ate_comment(false), ate_whitespace(false), saw_tokens(false), check_compatible(cc),
   input_name (in), input_pointer (0), input_end (0), cursor_suspend_count(0),
   cursor_suspend_line (1), cursor_suspend_column (1), cursor_line (1),
-  cursor_column (1), session(s), current_file (0)
+  cursor_column (1), session(s), current_file (0), current_token_chain (0)
 {
   getline(input, input_contents, '\0');
 
@@ -1332,6 +1379,8 @@ lexer::lexer (istream& input, const string& in, systemtap_session& s):
       // and broadly advertised.
       keywords.insert("probe");
       keywords.insert("global");
+      if (has_version("3.0"))
+        keywords.insert("private");
       keywords.insert("function");
       keywords.insert("if");
       keywords.insert("else");
@@ -1357,22 +1406,25 @@ lexer::lexer (istream& input, const string& in, systemtap_session& s):
       // scripts that define macros with the same name, but not
       // really. The user will merely receive a warning that they are
       // redefining an existing operator.
-      atwords.insert("@cast");
-      atwords.insert("@defined");
-      atwords.insert("@entry");
-      atwords.insert("@var");
-      atwords.insert("@avg");
-      atwords.insert("@count");
-      atwords.insert("@sum");
-      atwords.insert("@min");
-      atwords.insert("@max");
-      atwords.insert("@hist_linear");
-      atwords.insert("@hist_log");
+
+      // These are inserted without the actual '@', so we can directly check
+      // proposed macro names without building a string with that prefix.
+      atwords.insert("cast");
+      atwords.insert("defined");
+      atwords.insert("entry");
+      atwords.insert("perf");
+      atwords.insert("var");
+      atwords.insert("avg");
+      atwords.insert("count");
+      atwords.insert("sum");
+      atwords.insert("min");
+      atwords.insert("max");
+      atwords.insert("hist_linear");
+      atwords.insert("hist_log");
     }
 }
 
-set<string> lexer::keywords;
-set<string> lexer::atwords;
+unordered_set<string> lexer::atwords;
 
 void
 lexer::set_current_file (stapfile* f)
@@ -1385,6 +1437,12 @@ lexer::set_current_file (stapfile* f)
     }
 }
 
+void
+lexer::set_current_token_chain (const token* tok)
+{
+  current_token_chain = tok;
+}
+
 int
 lexer::input_peek (unsigned n)
 {
@@ -1393,6 +1451,14 @@ lexer::input_peek (unsigned n)
   return (unsigned char)*(input_pointer + n);
 }
 
+
+bool
+lexer::has_version (const char* v) const
+{
+  return check_compatible
+    ? strverscmp(session.compatible.c_str(), v) >= 0
+    : true;
+}
 
 int
 lexer::input_get ()
@@ -1456,8 +1522,9 @@ lexer::scan ()
   saw_tokens = true;
 
   token* n = new token;
+  string token_str; // accumulate here instead of by incremental interning
   n->location.file = current_file;
-  n->chain = NULL; // important safety dance
+  n->chain = current_token_chain;
 
 skip:
   bool suspended = (cursor_suspend_count > 0);
@@ -1488,66 +1555,68 @@ skip:
   // raw or quoted.
   if ((c == '$' || c == '@') && (c2 == '#'))
     {
-      n->content.push_back (c);
-      n->content.push_back (c2);
+      token_str.push_back (c);
+      token_str.push_back (c2);
       input_get(); // swallow '#'
+
       if (suspended)
         {
-          n->make_junk(_("invalid nested substitution of command line arguments"));
+          n->make_junk(tok_junk_nested_arg);
           return n;
         }
       size_t num_args = session.args.size ();
       input_put ((c == '$') ? lex_cast (num_args) : lex_cast_qstring (num_args), n);
-      n->content.clear();
+      token_str.clear();
       goto skip;
     }
   else if ((c == '$' || c == '@') && (isdigit (c2)))
     {
-      n->content.push_back (c);
       unsigned idx = 0;
+      token_str.push_back (c);
       do
         {
           input_get ();
+          token_str.push_back (c2);
           idx = (idx * 10) + (c2 - '0');
-          n->content.push_back (c2);
           c2 = input_peek ();
         } while (c2 > 0 &&
                  isdigit (c2) &&
                  idx <= session.args.size()); // prevent overflow
       if (suspended) 
         {
-          n->make_junk(_("invalid nested substitution of command line arguments"));
+          n->make_junk(tok_junk_nested_arg);
           return n;
         }
       if (idx == 0 ||
           idx-1 >= session.args.size())
         {
-          n->make_junk(_F("command line argument index %lu out of range [1-%lu]",
-                          (unsigned long) idx, (unsigned long) session.args.size()));
+          n->make_junk(tok_junk_invalid_arg);
           return n;
         }
       const string& arg = session.args[idx-1];
       input_put ((c == '$') ? arg : lex_cast_qstring (arg), n);
-      n->content.clear();
+      token_str.clear();
       goto skip;
     }
 
   else if (isalpha (c) || c == '$' || c == '@' || c == '_')
     {
-      n->type = tok_identifier;
-      n->content = (char) c;
+      token_str = (char) c;
       while (isalnum (c2) || c2 == '_' || c2 == '$')
 	{
           input_get ();
-          n->content.push_back (c2);
+          token_str.push_back (c2);
           c2 = input_peek ();
         }
+      n->content = token_str;
 
-      if (keywords.count(n->content))
-        n->type = tok_keyword;
-      else if (n->content[0] == '@')
+      if (n->content[0] == '@')
         // makes it easier to detect illegal use of @words:
         n->type = tok_operator;
+      else if (keywords.count(n->content))
+        n->type = tok_keyword;
+      else
+        n->type = tok_identifier;
 
       return n;
     }
@@ -1555,7 +1624,7 @@ skip:
   else if (isdigit (c)) // positive literal
     {
       n->type = tok_number;
-      n->content = (char) c;
+      token_str = (char) c;
 
       while (isalnum (c2))
 	{
@@ -1564,9 +1633,11 @@ skip:
           // is correctly formatted and in range.
 
           input_get ();
-          n->content.push_back (c2);
+          token_str.push_back (c2);
           c2 = input_peek ();
 	}
+
+      n->content = token_str;
       return n;
     }
 
@@ -1579,19 +1650,20 @@ skip:
 
 	  if (c < 0 || c == '\n')
 	    {
-              n->make_junk(_("Could not find matching closing quote"));
+              n->make_junk(tok_junk_unclosed_quote);
               return n;
 	    }
 	  if (c == '\"') // closing double-quotes
 	    break;
 	  else if (c == '\\') // see also input_put
 	    {
-	      c = input_get ();
+	      c = input_get();
 	      switch (c)
 		{
                 case 'x':
-                  if (strverscmp(session.compatible.c_str(), "2.3") < 0)
+                  if (!has_version("2.3"))
                     goto the_default;
+                  /* FALLTHROUGH */
 		case 'a':
 		case 'b':
 		case 't':
@@ -1605,17 +1677,18 @@ skip:
 		  // being parsed; it will be emitted into a C literal.
                   // XXX: PR13371: perhaps we should evaluate them here
                   // (and re-quote them during translate.cxx emission).
-		  n->content.push_back('\\');
+                  token_str.push_back ('\\');
 
                   // fall through
 		default: the_default:
-                    n->content.push_back(c);
-                    break;
+                  token_str.push_back (c);
+                  break;
 		}
 	    }
 	  else
-	    n->content.push_back(c);
+            token_str.push_back (c);
 	}
+      n->content = token_str;
       return n;
     }
 
@@ -1671,31 +1744,35 @@ skip:
           while (c2 >= 0)
             {
               if (c == '%' && c2 == '}')
-                return n;
+                {
+                  n->content = token_str;
+                  return n;
+                }
               if (c == '}' && c2 == '%') // possible typo
                 session.print_warning (_("possible erroneous closing '}%', use '%}'?"), n);
-              n->content += c;
+              token_str.push_back (c);
               c = c2;
-              c2 = input_get ();
+              c2 = input_get();
             }
 
-          n->make_junk(_("Could not find matching '%}' to close embedded function block"));
-          return n;
+            n->make_junk(tok_junk_unclosed_embedded);
+            return n;
         }
 
       // We're committed to recognizing at least the first character
       // as an operator.
       n->type = tok_operator;
-      n->content = c;
+      token_str = (char) c;
 
       // match all valid operators, in decreasing size order
       if ((c == '<' && c2 == '<' && c3 == '<') ||
           (c == '<' && c2 == '<' && c3 == '=') ||
           (c == '>' && c2 == '>' && c3 == '='))
         {
-          n->content += c2;
-          n->content += c3;
-          input_get (); input_get (); // swallow other two characters
+          token_str.push_back (c2);
+          token_str.push_back (c3);
+          input_get (); // c2
+          input_get (); // c3
         }
       else if ((c == '=' && c2 == '=') ||
                (c == '!' && c2 == '=') ||
@@ -1725,10 +1802,11 @@ skip:
                (c == '%' && c2 == ':') ||
                (c == '%' && c2 == ')'))
         {
-          n->content += c2;
+          token_str.push_back (c2);
           input_get (); // swallow other character
         }
 
+      n->content = token_str;
       return n;
     }
 
@@ -1738,7 +1816,8 @@ skip:
       ostringstream s;
       s << "\\x" << hex << setw(2) << setfill('0') << c;
       n->content = s.str();
-      n->msg = ""; // signal parser to emit "expected X, found junk" type error
+      // signal parser to emit "expected X, found junk" type error
+      n->make_junk(tok_junk_unknown);
       return n;
     }
 }
@@ -1746,16 +1825,41 @@ skip:
 // ------------------------------------------------------------------------
 
 void
-token::make_junk (const string new_msg)
+token::make_junk (token_junk_type junk)
 {
   type = tok_junk;
-  msg = new_msg;
+  junk_type = junk;
+}
+
+// ------------------------------------------------------------------------
+
+string
+token::junk_message(systemtap_session& session) const
+{
+  switch (junk_type)
+    {
+    case tok_junk_nested_arg:
+      return _("invalid nested substitution of command line arguments");
+
+    case tok_junk_invalid_arg:
+      return _F("command line argument out of range [1-%lu]",
+                (unsigned long) session.args.size());
+
+    case tok_junk_unclosed_quote:
+      return _("Could not find matching closing quote");
+
+    case tok_junk_unclosed_embedded:
+      return _("Could not find matching '%}' to close embedded function block");
+
+    default:
+      return _("unknown junk token");
+    }
 }
 
 // ------------------------------------------------------------------------
 
 stapfile*
-parser::parse (bool errs_as_warnings)
+parser::parse ()
 {
   stapfile* f = new stapfile;
   input.set_current_file (f);
@@ -1777,15 +1881,20 @@ parser::parse (bool errs_as_warnings)
 	      context = con_probe;
 	      parse_probe (f->probes, f->aliases);
 	    }
+	  else if (t->type == tok_keyword && t->content == "private")
+	    {
+	      context = con_unknown;
+	      parse_private (f->globals, f->probes, f->name, f->functions);
+	    }
 	  else if (t->type == tok_keyword && t->content == "global")
 	    {
 	      context = con_global;
-	      parse_global (f->globals, f->probes);
+	      parse_global (f->globals, f->probes, f->name);
 	    }
 	  else if (t->type == tok_keyword && t->content == "function")
 	    {
 	      context = con_function;
-	      parse_functiondecl (f->functions);
+	      parse_functiondecl (f->functions, f->name);
 	    }
           else if (t->type == tok_embedded)
 	    {
@@ -1795,7 +1904,7 @@ parser::parse (bool errs_as_warnings)
 	  else
 	    {
 	      context = con_unknown;
-	      throw PARSE_ERROR (_("expected 'probe', 'global', 'function', or '%{'"));
+	      throw PARSE_ERROR (_("expected 'probe', 'global', 'private', 'function', or '%{'"));
 	    }
 	}
       catch (parse_error& pe)
@@ -1813,6 +1922,7 @@ parser::parse (bool errs_as_warnings)
                     if (! t)
                       break;
                     if (t->type == tok_keyword && t->content == "probe") break;
+                    else if (t->type == tok_keyword && t->content == "private") break;
                     else if (t->type == tok_keyword && t->content == "global") break;
                     else if (t->type == tok_keyword && t->content == "function") break;
                     else if (t->type == tok_embedded) break;
@@ -1849,9 +1959,40 @@ parser::parse (bool errs_as_warnings)
 }
 
 
+probe*
+parser::parse_synthetic_probe (const token* chain)
+{
+  probe* p = NULL;
+  stapfile* f = new stapfile;
+  f->synthetic = true;
+  input.set_current_file (f);
+  input.set_current_token_chain (chain);
+
+  try
+    {
+      context = con_probe;
+      parse_probe (f->probes, f->aliases);
+
+      if (f->probes.size() != 1 || !f->aliases.empty())
+        throw PARSE_ERROR (_("expected a single synthetic probe"));
+      p = f->probes[0];
+    }
+  catch (parse_error& pe)
+    {
+      print_error (pe, errs_as_warnings);
+    }
+
+  // TODO check for unparsed tokens?
+
+  input.set_current_file(0);
+  input.set_current_token_chain(0);
+  return p;
+}
+
+
 void
-parser::parse_probe (std::vector<probe *> & probe_ret,
-		     std::vector<probe_alias *> & alias_ret)
+parser::parse_probe (vector<probe *> & probe_ret,
+		     vector<probe_alias *> & alias_ret)
 {
   const token* t0 = next ();
   if (! (t0->type == tok_keyword && t0->content == "probe"))
@@ -1860,44 +2001,35 @@ parser::parse_probe (std::vector<probe *> & probe_ret,
   vector<probe_point *> aliases;
   vector<probe_point *> locations;
 
-  bool equals_ok = true;
-
   int epilogue_alias = 0;
 
   while (1)
     {
-      probe_point * pp = parse_probe_point ();
+      vector<probe_point*> pps = parse_probe_points();
 
       const token* t = peek ();
-      if (equals_ok && t
+      if (pps.size() == 1 && t
           && t->type == tok_operator && t->content == "=")
         {
-          if (pp->optional || pp->sufficient)
-            throw PARSE_ERROR (_("probe point alias name cannot be optional nor sufficient"), pp->components.front()->tok);
-          aliases.push_back(pp);
+          if (pps[0]->optional || pps[0]->sufficient)
+            throw PARSE_ERROR (_("probe point alias name cannot be optional nor sufficient"), pps[0]->components.front()->tok);
+          aliases.push_back(pps[0]);
           swallow ();
           continue;
         }
-      else if (equals_ok && t
+      else if (pps.size() == 1 && t
           && t->type == tok_operator && t->content == "+=")
         {
-          if (pp->optional || pp->sufficient)
-            throw PARSE_ERROR (_("probe point alias name cannot be optional nor sufficient"), pp->components.front()->tok);
-          aliases.push_back(pp);
+          if (pps[0]->optional || pps[0]->sufficient)
+            throw PARSE_ERROR (_("probe point alias name cannot be optional nor sufficient"), pps[0]->components.front()->tok);
+          aliases.push_back(pps[0]);
           epilogue_alias = 1;
-          swallow ();
-          continue;
-        }
-      else if (t && t->type == tok_operator && t->content == ",")
-        {
-          locations.push_back(pp);
-          equals_ok = false;
           swallow ();
           continue;
         }
       else if (t && t->type == tok_operator && t->content == "{")
         {
-          locations.push_back(pp);
+          locations.insert(locations.end(), pps.begin(), pps.end());
           break;
         }
       else
@@ -2058,27 +2190,80 @@ parser::parse_statement ()
   return ret;
 }
 
+void
+parser::parse_private (vector <vardecl*>& globals, vector<probe*>& probes,
+                       string const & fname, vector<functiondecl*>& functions)
+{
+  const token* t = next ();
+  if (! (t->type == tok_keyword && t->content == "private"))
+    throw PARSE_ERROR (_("expected 'private'"));
+  swallow ();
+  t = next ();
+  if (t->type == tok_keyword && t->content == "function")
+  {
+    swallow ();
+    context = con_function;
+    do_parse_functiondecl(functions, t, fname, true);
+  }
+  else if (t->type == tok_keyword && t->content == "global")
+  {
+    swallow ();
+    context = con_global;
+    t = next ();
+    if (! (t->type == tok_identifier))
+      throw PARSE_ERROR (_("expected identifier"));
+    do_parse_global(globals, probes, fname, t, true);
+  }
+  // The `private <identifier>` is an acceptable shorthand
+  // for `private global <identifier>` per above.
+  else if (t->type == tok_identifier)
+  {
+    context = con_global;
+    do_parse_global(globals, probes, fname, t, true);
+  }
+  else
+    throw PARSE_ERROR (_("expected 'function' or identifier"));
+}
 
 void
-parser::parse_global (vector <vardecl*>& globals, vector<probe*>&)
+parser::parse_global (vector <vardecl*>& globals, vector<probe*>& probes,
+                      string const & fname)
 {
   const token* t0 = next ();
   if (! (t0->type == tok_keyword && t0->content == "global"))
-    throw PARSE_ERROR (_("expected 'global'"));
+    throw PARSE_ERROR (_("expected 'global' or 'private'"));
   swallow ();
+  do_parse_global(globals, probes, fname, 0, false);
+}
 
+void
+parser::do_parse_global (vector <vardecl*>& globals, vector<probe*>&,
+                         string const & fname, const token* t0, bool priv)
+{
+  bool iter0 = true;
+  const token* t;
   while (1)
     {
-      const token* t = next ();
+      t = (iter0 && priv) ? t0 : next ();
+      iter0 = false;
       if (! (t->type == tok_identifier))
         throw PARSE_ERROR (_("expected identifier"));
 
+      string gname = "__global_" + string(t->content);
+      string pname = "__private_" + detox_path(fname) + string(t->content);
+      string name = priv ? pname : gname;
+
       for (unsigned i=0; i<globals.size(); i++)
-	if (globals[i]->name == t->content)
+      {
+	if (globals[i]->name == name)
 	  throw PARSE_ERROR (_("duplicate global name"));
+        if ((globals[i]->name == gname) || (globals[i]->name == pname))
+          throw PARSE_ERROR (_("global versus private variable declaration conflict"));
+      }
 
       vardecl* d = new vardecl;
-      d->name = t->content;
+      d->unmangled_name = t->content;
+      d->name = name;
       d->tok = t;
       d->systemtap_v_conditional = systemtap_v_seen;
       globals.push_back (d);
@@ -2131,27 +2316,35 @@ parser::parse_global (vector <vardecl*>& globals, vector<probe*>&)
     }
 }
 
-
 void
-parser::parse_functiondecl (std::vector<functiondecl*>& functions)
+parser::parse_functiondecl (vector<functiondecl*>& functions,
+                            string const & fname)
 {
   const token* t = next ();
   if (! (t->type == tok_keyword && t->content == "function"))
     throw PARSE_ERROR (_("expected 'function'"));
   swallow ();
+  do_parse_functiondecl(functions, t, fname, false);
+}
 
+void
+parser::do_parse_functiondecl (vector<functiondecl*>& functions, const token* t,
+                               string const & fname, bool priv)
+{
   t = next ();
   if (! (t->type == tok_identifier)
       && ! (t->type == tok_keyword
 	    && (t->content == "string" || t->content == "long")))
     throw PARSE_ERROR (_("expected identifier"));
 
-  for (unsigned i=0; i<functions.size(); i++)
-    if (functions[i]->name == t->content)
-      throw PARSE_ERROR (_("duplicate function name"));
+  string gname = "__global_" + string(t->content);
+  string pname = "__private_" + detox_path(fname) + string(t->content);
+  string name = priv ? pname : gname;
+  name += "__overload_" + lex_cast(session.overload_count[t->content]++);
 
   functiondecl *fd = new functiondecl ();
-  fd->name = t->content;
+  fd->unmangled_name = t->content;
+  fd->name = name;
   fd->tok = t;
 
   t = next ();
@@ -2186,7 +2379,7 @@ parser::parse_functiondecl (std::vector<functiondecl*>& functions)
       else if (! (t->type == tok_identifier))
 	throw PARSE_ERROR (_("expected identifier"));
       vardecl* vd = new vardecl;
-      vd->name = t->content;
+      vd->unmangled_name = vd->name = t->content;
       vd->tok = t;
       fd->formal_args.push_back (vd);
       fd->systemtap_v_conditional = systemtap_v_seen;
@@ -2218,6 +2411,24 @@ parser::parse_functiondecl (std::vector<functiondecl*>& functions)
 	throw PARSE_ERROR (_("expected ',' or ')'"));
     }
 
+  t = peek();
+  if (t->type == tok_operator && t->content == ":")
+    {
+      swallow();
+      literal* literal = parse_literal();
+      fd->priority = dynamic_cast<literal_number*>(literal)->value;
+      // reserve priority 0 for user script implementation
+      if (fd->priority < 1)
+        throw PARSE_ERROR (_("specified priority must be > 0"));
+      delete literal;
+    }
+  else if (user_file)
+    {
+      // allow script file implementation override automatically when
+      // priority not specified
+      fd->priority = 0;
+    }
+
   t = peek ();
   if (t && t->type == tok_embedded)
     fd->body = parse_embeddedcode ();
@@ -2227,24 +2438,149 @@ parser::parse_functiondecl (std::vector<functiondecl*>& functions)
   functions.push_back (fd);
 }
 
-
-probe_point*
-parser::parse_probe_point ()
+vector<probe_point*>
+parser::parse_probe_points()
 {
-  probe_point* pl = new probe_point;
-
+  vector<probe_point*> pps;
   while (1)
     {
-      const token* t = next ();
-      if (! (t->type == tok_identifier
-	     // we must allow ".return" and ".function", which are keywords
-	     || t->type == tok_keyword
-             // we must allow "*", due to being an operator
-             || (t->type == tok_operator && t->content == "*")))
-        throw PARSE_ERROR (_("expected identifier or '*'"));
+      vector<probe_point*> tail = parse_components();
+      pps.insert(pps.end(), tail.begin(), tail.end());
 
+      const token* t = peek();
+      if (t && t->type == tok_operator && t->content == ",")
+        {
+          swallow();
+          continue;
+        }
+
+      if (t && t->type == tok_operator
+          && (t->content == "{" || t->content == "=" ||
+              t->content == "+="|| t->content == "}"))
+        break;
+
+      throw PARSE_ERROR (_("expected one of ', { } = +='"));
+    }
+  return pps;
+}
+
+vector<probe_point*>
+parser::parse_components()
+{
+  vector<probe_point*> pps;
+  while (1)
+    {
+      vector<probe_point*> suffix = parse_component();
+
+      // Cartesian product of components
+      if (pps.empty())
+        pps = suffix;
+      else
+        {
+          assert(!suffix.empty());
+          vector<probe_point*> product;
+          for (unsigned i = 0; i < pps.size(); i++)
+            {
+              if (pps[i]->optional || pps[i]->sufficient || pps[i]->condition)
+                throw PARSE_ERROR (_("'?', '!' or condition must only be specified in suffix"),
+                                   pps[i]->components[0]->tok);
+              for (unsigned j = 0; j < suffix.size(); j++)
+                {
+                  probe_point* pp = new probe_point;
+                  pp->components.insert(pp->components.end(),
+                                        pps[i]->components.begin(), pps[i]->components.end());
+                  pp->components.insert(pp->components.end(),
+                                        suffix[j]->components.begin(), suffix[j]->components.end());
+                  pp->optional = suffix[j]->optional;
+                  pp->sufficient = suffix[j]->sufficient;
+                  pp->condition = suffix[j]->condition;
+                  product.push_back(pp);
+                }
+            }
+          for (unsigned i = 0; i < pps.size(); i++) delete pps[i];
+          for (unsigned i = 0; i < suffix.size(); i++) delete suffix[i];
+          pps = product;
+        }
+
+      const token* t = peek();
+      if (t && t->type == tok_operator && t->content == ".")
+        {
+          swallow ();
+          continue;
+        }
+
+      // We only fall through here at the end of 	a probe point (past
+      // all the dotted/parametrized components).
+
+      if (t && t->type == tok_operator &&
+          (t->content == "?" || t->content == "!"))
+        {
+          for (unsigned i = 0; i < pps.size(); i++)
+            {
+              if (pps[i]->optional || pps[i]->sufficient)
+                throw PARSE_ERROR (_("'?' or '!' respecified"));
+              pps[i]->optional = true;
+              if (t->content == "!") pps[i]->sufficient = true;
+            }
+          // NB: sufficient implies optional
+          swallow ();
+          t = peek ();
+          // fall through
+        }
+
+      if (t && t->type == tok_keyword && t->content == "if")
+        {
+          swallow ();
+          t = peek ();
+          if (!(t && t->type == tok_operator && t->content == "("))
+            throw PARSE_ERROR (_("expected '('"));
+          swallow ();
+
+          expression* e = parse_expression();
+          for (unsigned i = 0; i < pps.size(); i++)
+            {
+              if (pps[i]->condition != 0)
+                throw PARSE_ERROR (_("condition respecified"));
+              pps[i]->condition = e;
+            }
+
+          t = peek ();
+          if (!(t && t->type == tok_operator && t->content == ")"))
+            throw PARSE_ERROR (_("expected ')'"));
+          swallow ();
+        }
+
+      break;
+    }
+  return pps;
+}
+
+vector<probe_point*>
+parser::parse_component()
+{
+  const token* t = next ();
+  if (! (t->type == tok_identifier
+         // we must allow ".return" and ".function", which are keywords
+         || t->type == tok_keyword
+         // we must allow "*", due to being an operator
+         || (t->type == tok_operator && (t->content == "*" || t->content == "{"))))
+    throw PARSE_ERROR (_("expected identifier or '*' or '{'"));
+
+  if (t && t->type == tok_operator && t->content == "{")
+    {
+      swallow();
+      vector<probe_point*> pps = parse_probe_points();
+      t = peek();
+      if (!(t && t->type == tok_operator && t->content == "}"))
+        throw PARSE_ERROR (_("expected '}'"));
+      swallow();
+      return pps;
+    }
+  else
+    {
       // loop which reconstitutes an identifier with wildcards
       string content = t->content;
+      bool changed_p = false;
       while (1)
         {
           const token* u = peek();
@@ -2262,20 +2598,28 @@ parser::parse_probe_point ()
             break;
 
           // append u to t
-          content = content + u->content;
-          
+          content = content + (string)u->content;
+          changed_p = true;
+
           // consume u
           swallow ();
         }
-      // get around const-ness of t:
-      token* new_t = new token(*t);
-      new_t->content = content;
-      delete t; t = new_t;
+
+      if (changed_p)
+        {
+          // We've already swallowed the first token and we're not
+          // putting it back; no one else has a copy; so we can
+          // safely overwrite its content and reuse it.
+          const_cast<token*>(t)->content = content;
+        }
 
       probe_point::component* c = new probe_point::component;
       c->functor = t->content;
       c->tok = t;
-      pl->components.push_back (c);
+      vector<probe_point*> pps;
+      probe_point* pp = new probe_point;
+      pp->components.push_back(c);
+      pps.push_back(pp);
       // NB we may add c->arg soon
 
       t = peek ();
@@ -2290,59 +2634,10 @@ parser::parse_probe_point ()
           if (! (t->type == tok_operator && t->content == ")"))
             throw PARSE_ERROR (_("expected ')'"));
           swallow ();
-
-          t = peek ();
         }
-
-      if (t && t->type == tok_operator && t->content == ".")
-        {
-          swallow ();
-          continue;
-        }
-
-      // We only fall through here at the end of 	a probe point (past
-      // all the dotted/parametrized components).
-
-      if (t && t->type == tok_operator &&
-          (t->content == "?" || t->content == "!"))
-        {
-          pl->optional = true;
-          if (t->content == "!") pl->sufficient = true;
-          // NB: sufficient implies optional
-          swallow ();
-          t = peek ();
-          // fall through
-        }
-
-      if (t && t->type == tok_keyword && t->content == "if")
-        {
-          swallow ();
-          t = peek ();
-          if (!(t && t->type == tok_operator && t->content == "("))
-            throw PARSE_ERROR (_("expected '('"));
-          swallow ();
-
-          pl->condition = parse_expression ();
-
-          t = peek ();
-          if (!(t && t->type == tok_operator && t->content == ")"))
-            throw PARSE_ERROR (_("expected ')'"));
-          swallow ();
-          t = peek ();
-          // fall through
-        }
-
-      if (t && t->type == tok_operator
-          && (t->content == "{" || t->content == "," ||
-              t->content == "=" || t->content == "+=" ))
-        break;
-
-      throw PARSE_ERROR (_("expected one of '. , ( ? ! { = +='"));
+      return pps;
     }
-
-  return pl;
 }
-
 
 literal_string*
 parser::consume_string_literals(const token *t)
@@ -2354,14 +2649,23 @@ parser::consume_string_literals(const token *t)
   // need to skip intermediate whitespace.
   //
   // NB for versions prior to 2.0: but don't skip over intervening comments
+  string concat;
+  bool p_concat = false;
   const token *n = peek();
   while (n != NULL && n->type == tok_string
-         && ! (strverscmp(session.compatible.c_str(), "2.0") < 0
-               && input.ate_comment))
+         && ! (!input.has_version("2.0") && input.ate_comment))
     {
-      ls->value.append(next()->content); // consume and append the token
+      if (!p_concat)
+        {
+          concat = t->content;
+          p_concat = true;
+        }
+      concat.append(n->content.data(), n->content.size());
+      next(); // consume the token
       n = peek();
     }
+  if (p_concat)
+    ls->value = concat;
   return ls;
 }
 
@@ -2403,7 +2707,8 @@ parser::parse_literal ()
 
       if (t->type == tok_number)
 	{
-	  const char* startp = t->content.c_str ();
+          const string& s = t->content;
+	  const char* startp = s.c_str ();
 	  char* endp = (char*) startp;
 
 	  // NB: we allow controlled overflow from LLONG_MIN .. ULLONG_MAX
@@ -2516,8 +2821,6 @@ parser::parse_next_statement ()
   const token* t = next ();
   if (! (t->type == tok_keyword && t->content == "next"))
     throw PARSE_ERROR (_("expected 'next'"));
-  if (context != con_probe)
-    throw PARSE_ERROR (_("found 'next' not in probe context"));
   next_statement* s = new next_statement;
   s->tok = t;
   return s;
@@ -2770,6 +3073,39 @@ parser::parse_foreach_loop ()
 
   s->base = parse_indexable();
 
+  // check if there was an array slice that was specified
+  t = peek();
+  if (t && t->type == tok_operator && t->content == "[")
+    {
+      swallow();
+      while (1)
+        {
+          t = peek();
+          if (t && t->type == tok_operator && t->content == "*")
+            {
+              swallow();
+              s->array_slice.push_back (NULL);
+            }
+          else
+            s->array_slice.push_back (parse_expression());
+
+          t = peek ();
+          if (t && t->type == tok_operator && t->content == ",")
+            {
+              swallow ();
+              continue;
+            }
+          else if (t && t->type == tok_operator && t->content == "]")
+            {
+              swallow ();
+              break;
+            }
+          else
+            throw PARSE_ERROR (_("expected ',' or ']'"));
+        }
+    }
+
+
   // check for atword, see also expect_ident_or_atword,
   t = peek ();
   if (t && t->type == tok_operator && t->content[0] == '@')
@@ -3013,8 +3349,17 @@ parser::parse_array_in ()
 
   while (1)
     {
-      expression* op1 = parse_comparison_or_regex_query ();
-      indexes.push_back (op1);
+      t = peek();
+      if (t && t->type == tok_operator && t->content == "*" && parenthesized)
+        {
+          swallow();
+          indexes.push_back(NULL);
+        }
+      else
+        {
+          expression* op1 = parse_comparison_or_regex_query ();
+          indexes.push_back (op1);
+        }
 
       if (parenthesized)
         {
@@ -3232,12 +3577,12 @@ parser::parse_crement () // as in "increment" / "decrement"
       e->op = t->content;
       e->tok = t;
       next ();
-      e->operand = parse_value ();
+      e->operand = parse_dwarf_value ();
       return e;
     }
 
   // post-crement or non-crement
-  expression *op1 = parse_value ();
+  expression *op1 = parse_dwarf_value ();
 
   t = peek ();
   if (t && t->type == tok_operator
@@ -3252,6 +3597,53 @@ parser::parse_crement () // as in "increment" / "decrement"
     }
   else
     return op1;
+}
+
+
+expression*
+parser::parse_dwarf_value ()
+{
+  expression* expr = NULL;
+  target_symbol* tsym = NULL;
+
+  // With '&' we'll definitely be making a target symbol of some sort
+  const token* addrtok = peek_op ("&") ? next () : NULL;
+  bool addressof = (addrtok != NULL);
+
+  // First try target_symbol types: $var, @cast, and @var.
+  const token* t = peek ();
+  if (t && t->type == tok_identifier && t->content[0] == '$')
+    expr = tsym = parse_target_symbol ();
+  else if (tok_is (t, tok_operator, "@cast"))
+    expr = tsym = parse_cast_op ();
+  else if (tok_is (t, tok_operator, "@var"))
+    expr = tsym = parse_atvar_op ();
+  else if (addressof && !input.has_version("2.6"))
+    // '&' on old version only allowed specific target_symbol types
+    throw PARSE_ERROR (_("expected @cast, @var or $var"));
+  else
+    // Otherwise just get a plain value of any sort.
+    expr = parse_value ();
+
+  // If we had '&' or see any target suffixes, that forces a target_symbol.
+  // For compatibility, we only do this starting with 2.6.
+  if (!tsym && (addressof || peek_target_symbol_components ())
+      && input.has_version("2.6"))
+    {
+      autocast_op *cop = new autocast_op;
+      cop->tok = addrtok ?: peek ();
+      cop->operand = expr;
+      expr = tsym = cop;
+    }
+
+  if (tsym)
+    {
+      // Parse the rest of any kind of target symbol
+      tsym->addressof = addressof;
+      parse_target_symbol_components (tsym);
+    }
+
+  return expr;
 }
 
 
@@ -3284,11 +3676,6 @@ parser::parse_value ()
       swallow ();
       return e;
     }
-  else if (t->type == tok_operator && t->content == "&")
-    {
-      next (); // Cannot swallow, passing token on...
-      return parse_target_symbol (t);
-    }
   else if (t->type == tok_identifier
            || (t->type == tok_operator && t->content[0] == '@'))
     return parse_symbol ();
@@ -3298,7 +3685,7 @@ parser::parse_value ()
 
 
 const token *
-parser::parse_hist_op_or_bare_name (hist_op *&hop, string &name)
+parser::parse_hist_op_or_bare_name (hist_op *&hop, interned_string &name)
 {
   hop = NULL;
   const token* t = expect_ident_or_atword (name);
@@ -3332,7 +3719,7 @@ indexable*
 parser::parse_indexable ()
 {
   hist_op *hop = NULL;
-  string name;
+  interned_string name;
   const token *tok = parse_hist_op_or_bare_name(hop, name);
   if (hop)
     return hop;
@@ -3346,25 +3733,20 @@ parser::parse_indexable ()
 }
 
 
-// var, indexable[index], func(parms), printf("...", ...), $var,r
-// @cast, @defined, @entry, @var, $var->member, @stat_op(stat)
+// var, indexable[index], func(parms), printf("...", ...),
+// @defined, @entry, @stat_op(stat)
 expression* parser::parse_symbol ()
 {
   hist_op *hop = NULL;
   symbol *sym = NULL;
-  string name;
+  interned_string name;
   const token *t = parse_hist_op_or_bare_name(hop, name);
 
   if (!hop)
     {
       // If we didn't get a hist_op, then we did get an identifier. We can
       // now scrutinize this identifier for the various magic forms of identifier
-      // (printf, @stat_op, and $var...)
-
-      if (name == "@cast"
-	  || name == "@var"
-	  || (name.size() > 0 && name[0] == '$'))
-        return parse_target_symbol (t);
+      // (printf, @stat_op...)
 
       // NB: PR11343: @defined() is not incompatible with earlier versions
       // of stap, so no need to check session.compatible for 1.2
@@ -3391,7 +3773,8 @@ expression* parser::parse_symbol ()
 	  else if (name == "@max")
 	    sop->ctype = sc_max;
 	  else
-	    throw PARSE_ERROR(_("unknown operator ") + name);
+	    throw PARSE_ERROR(_F("unknown operator %s",
+                                 name.to_string().c_str()));
 	  expect_op("(");
 	  sop->tok = t;
 	  sop->stat = parse_expression ();
@@ -3452,38 +3835,44 @@ expression* parser::parse_symbol ()
 	  else
 	    {
 	      int min_args = 0;
+	      bool consumed_arg = false;
 	      if (fmt->print_with_format)
 		{
 		  // Consume and convert a format string. Agreement between the
 		  // format string and the arguments is postponed to the
 		  // typechecking phase.
-		  string tmp;
-		  expect_unknown (tok_string, tmp);
-		  fmt->raw_components = tmp;
-		  fmt->components = print_format::string_to_components (tmp);
+                  literal_string* ls = parse_literal_string();
+		  fmt->raw_components = ls->value;
+                  delete ls;
+                  fmt->components = print_format::string_to_components (fmt->raw_components);
+		  consumed_arg = true;
 		}
 	      else if (fmt->print_with_delim)
 		{
 		  // Consume a delimiter to separate arguments.
-		  fmt->delimiter.clear();
-		  fmt->delimiter.type = print_format::conv_literal;
-		  expect_unknown (tok_string, fmt->delimiter.literal_string);
-		  min_args = 2;
+                  literal_string* ls = parse_literal_string();
+		  fmt->delimiter = ls->value;
+                  delete ls;
+		  consumed_arg = true;
+		  min_args = 2; // so that the delim is used at least once
 		}
-	      else
+	      else if (!fmt->print_with_newline)
 		{
-		  // If we are not printing with a format string, we must have
-		  // at least one argument (of any type).
-		  expression *e = parse_expression ();
-		  fmt->args.push_back(e);
+		  // If we are not printing with a format string, nor with a
+		  // delim, nor with a newline, then it's either print() or
+		  // sprint(), both of which require at least one argument (of
+		  // any type).
+		  min_args = 1;
 		}
 
 	      // Consume any subsequent arguments.
 	      while (min_args || !peek_op (")"))
 		{
-		  expect_op(",");
+		  if (consumed_arg)
+		    expect_op(",");
 		  expression *e = parse_expression ();
 		  fmt->args.push_back(e);
+		  consumed_arg = true;
 		  if (min_args)
 		    --min_args;
 		}
@@ -3551,7 +3940,13 @@ expression* parser::parse_symbol ()
 
       while (1)
         {
-          ai->indexes.push_back (parse_expression ());
+          if (peek_op("*"))
+            {
+              swallow();
+              ai->indexes.push_back (NULL);
+            }
+          else
+            ai->indexes.push_back (parse_expression ());
           if (peek_op ("]"))
             {
 	      swallow ();
@@ -3565,6 +3960,7 @@ expression* parser::parse_symbol ()
           else
             throw PARSE_ERROR (_("expected ',' or ']'"));
         }
+
       return ai;
     }
 
@@ -3578,20 +3974,27 @@ expression* parser::parse_symbol ()
   return sym;
 }
 
-// Parse a @cast or $var.  Given head token has already been consumed.
-target_symbol* parser::parse_target_symbol (const token* t)
+// Parse a $var.
+target_symbol* parser::parse_target_symbol ()
 {
-  bool addressof = false;
-  if (t->type == tok_operator && t->content == "&")
+  const token* t = next ();
+  if (t->type == tok_identifier && t->content[0]=='$')
     {
-      addressof = true;
-      // Don't delete t before trying next token.
-      // We might need it in the error message when there is no next token.
-      const token *next_t = next ();
-      delete t;
-      t = next_t;
+      // target_symbol time
+      target_symbol *tsym = new target_symbol;
+      tsym->tok = t;
+      tsym->name = t->content;
+      return tsym;
     }
 
+  throw PARSE_ERROR (_("expected $var"));
+}
+
+
+// Parse a @cast.
+cast_op* parser::parse_cast_op ()
+{
+  const token* t = next ();
   if (t->type == tok_operator && t->content == "@cast")
     {
       cast_op *cop = new cast_op;
@@ -3601,28 +4004,25 @@ target_symbol* parser::parse_target_symbol (const token* t)
       cop->operand = parse_expression ();
       expect_op(",");
       expect_unknown(tok_string, cop->type_name);
+      if (cop->type_name.empty())
+        throw PARSE_ERROR (_("expected non-empty string"));
       if (peek_op (","))
         {
           swallow ();
           expect_unknown(tok_string, cop->module);
         }
       expect_op(")");
-      parse_target_symbol_components(cop);
-      cop->addressof = addressof;
       return cop;
     }
 
-  if (t->type == tok_identifier && t->content[0]=='$')
-    {
-      // target_symbol time
-      target_symbol *tsym = new target_symbol;
-      tsym->tok = t;
-      tsym->name = t->content;
-      parse_target_symbol_components(tsym);
-      tsym->addressof = addressof;
-      return tsym;
-    }
+  throw PARSE_ERROR (_("expected @cast"));
+}
 
+
+// Parse a @var.
+atvar_op* parser::parse_atvar_op ()
+{
+  const token* t = next ();
   if (t->type == tok_operator && t->content == "@var")
     {
       atvar_op *aop = new atvar_op;
@@ -3643,12 +4043,10 @@ target_symbol* parser::parse_target_symbol (const token* t)
       else
         aop->module = "";
       expect_op(")");
-      parse_target_symbol_components(aop);
-      aop->addressof = addressof;
       return aop;
     }
 
-  throw PARSE_ERROR (_("expected @cast, @var or $var"));
+  throw PARSE_ERROR (_("expected @var"));
 }
 
 
@@ -3658,9 +4056,7 @@ expression* parser::parse_defined_op (const token* t)
   defined_op* dop = new defined_op;
   dop->tok = t;
   expect_op("(");
-  // no need for parse_hist_op... etc., as @defined takes only target_symbols as its operand.
-  const token* tt = next ();
-  dop->operand = parse_target_symbol (tt);
+  dop->operand = parse_expression ();
   expect_op(")");
   return dop;
 }
@@ -3682,10 +4078,6 @@ expression* parser::parse_entry_op (const token* t)
 expression* parser::parse_perf_op (const token* t)
 {
   perf_op* pop = new perf_op;
-
-  if (strverscmp(session.compatible.c_str(), "2.1") < 0)
-    throw PARSE_ERROR (_("expected @cast, @var or $var"));
-
   pop->tok = t;
   expect_op("(");
   pop->operand = parse_literal_string ();
@@ -3696,6 +4088,15 @@ expression* parser::parse_perf_op (const token* t)
 }
 
 
+bool
+parser::peek_target_symbol_components ()
+{
+  const token * t = peek ();
+  return t &&
+    ((t->type == tok_operator && (t->content == "->" || t->content == "["))
+     || (t->type == tok_identifier &&
+         t->content.find_first_not_of('$') == string::npos));
+}
 
 void
 parser::parse_target_symbol_components (target_symbol* e)
@@ -3703,12 +4104,13 @@ parser::parse_target_symbol_components (target_symbol* e)
   bool pprint = false;
 
   // check for pretty-print in the form $foo$
-  string &base = e->name;
+  string base = e->name;
   size_t pprint_pos = base.find_last_not_of('$');
   if (0 < pprint_pos && pprint_pos < base.length() - 1)
     {
       string pprint_val = base.substr(pprint_pos + 1);
       base.erase(pprint_pos + 1);
+      e->name = base;
       e->components.push_back (target_symbol::component(e->tok, pprint_val, true));
       pprint = true;
     }
@@ -3718,16 +4120,16 @@ parser::parse_target_symbol_components (target_symbol* e)
       if (peek_op ("->"))
         {
           const token* t = next();
-          string member;
+          interned_string member;
           expect_ident_or_keyword (member);
 
           // check for pretty-print in the form $foo->$ or $foo->bar$
           pprint_pos = member.find_last_not_of('$');
-          string pprint_val;
+          interned_string pprint_val;
           if (pprint_pos == string::npos || pprint_pos < member.length() - 1)
             {
               pprint_val = member.substr(pprint_pos + 1);
-              member.erase(pprint_pos + 1);
+              member = member.substr(0, pprint_pos + 1);
               pprint = true;
             }
 

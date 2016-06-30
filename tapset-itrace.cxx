@@ -35,12 +35,12 @@ static const string TOK_BLOCK("block");
 struct itrace_derived_probe: public derived_probe
 {
   bool has_path;
-  string path;
+  interned_string path;
   int64_t pid;
   int single_step;
 
   itrace_derived_probe (systemtap_session &s, probe* p, probe_point* l,
-                        bool hp, string &pn, int64_t pd, int ss
+                        bool hp, interned_string pn, int64_t pd, int ss
 			);
   void join_group (systemtap_session& s);
 };
@@ -69,7 +69,7 @@ public:
 
 itrace_derived_probe::itrace_derived_probe (systemtap_session &s,
                                             probe* p, probe_point* l,
-                                            bool hp, string &pn, int64_t pd,
+                                            bool hp, interned_string pn, int64_t pd,
 					    int ss
 					    ):
   derived_probe(p, l), has_path(hp), path(pn), pid(pd), single_step(ss)
@@ -86,6 +86,7 @@ itrace_derived_probe::join_group (systemtap_session& s)
     s.itrace_derived_probes = new itrace_derived_probe_group ();
 
   s.itrace_derived_probes->enroll (this);
+  this->group = s.itrace_derived_probes;
 
   enable_task_finder(s);
 }
@@ -96,10 +97,10 @@ struct itrace_builder: public derived_probe_builder
   virtual void build(systemtap_session & sess,
 		     probe * base,
 		     probe_point * location,
-		     std::map<std::string, literal *> const & parameters,
+		     literal_map_t const & parameters,
 		     vector<derived_probe *> & finished_results)
   {
-    string path, path_tgt;
+    interned_string path, path_tgt;
     int64_t pid = 0;
     int single_step;
 
@@ -116,6 +117,12 @@ struct itrace_builder: public derived_probe_builder
         path = find_executable (path, sess.sysroot, sess.sysenv);
         sess.unwindsym_modules.insert (path);
         path_tgt = path_remove_sysroot(sess, path);
+      }
+    else // (has_pid)
+      {
+	string pid_err_msg;
+	if (!is_valid_pid(pid, pid_err_msg))
+	  throw SEMANTIC_ERROR(pid_err_msg);
       }
 
     finished_results.push_back(new itrace_derived_probe(sess, base, location,
@@ -197,7 +204,7 @@ itrace_derived_probe_group::emit_module_decls (systemtap_session& s)
 
   // call probe function
   s.op->newline() << "(*p->probe->ph) (c);";
-  common_probe_entryfn_epilogue (s, true);
+  common_probe_entryfn_epilogue (s, true, otf_safe_context(s));
 
   s.op->newline() << "return;";
   s.op->newline(-1) << "}";

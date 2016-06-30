@@ -53,7 +53,7 @@ if {! [uprobes_p]} then {
 	}
 	-re {^.*\r\n} { exp_continue }
 	timeout { 
-	    exec kill -INT -- -[exp_pid]
+	    kill -INT -[exp_pid] 2
 	}
     }
     catch {close}; catch {wait}
@@ -123,7 +123,7 @@ if {$dontTest == 1} {
     untested "$test $subtest"
 } else {
     set subtest "server reacts to avahi-daemon restart"
-    if {![as_root "service avahi-daemon restart"]} {
+    if {[as_root "service avahi-daemon restart 2>&1"]} {
 	# Could not restart the avahi daemon
 	set dontTest 1
     } else {
@@ -147,7 +147,7 @@ set subtest "server re-established avahi-daemon connection"
 if {$dontTest == 1} {
     untested "$test $subtest"
 } else {
-    set rc [catch {exec grep -c {Adding Avahi service .Systemtap Compile Server, pid=.*} $server_log} result]
+    set rc [catch {exec grep -c {Adding Avahi service .Systemtap Compile Server.*} $server_log} result]
     # Make sure the target line was found more than once.
     if {$rc != 0 || $result < 2} {
 	fail "$test $subtest"

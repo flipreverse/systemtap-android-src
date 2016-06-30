@@ -1,5 +1,6 @@
+void foo ();
 #ifndef ONLY_MAIN
-foo ()
+void foo ()
 {
   int x = 1;
  label: 
@@ -7,7 +8,7 @@ foo ()
 }
 #endif
 #ifndef NO_MAIN
-main ()
+int main ()
 {
   foo();
 }

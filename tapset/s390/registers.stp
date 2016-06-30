@@ -1,6 +1,6 @@
 /* Dwarfless register access for s390x */
 
-global _reg_offsets, _stp_regs_registered
+@__private30 global _reg_offsets[22]
 
 %{
 #include <asm/ptrace.h>
@@ -75,7 +75,7 @@ deref_fault: /* branched to from kread() */
 	}
 %}
 
-function _stp_register_regs() {
+probe init {
 	/* Same order as pt_regs */
 	_reg_offsets["args"] = 0
 	_reg_offsets["psw.mask"] = 8
@@ -107,7 +107,6 @@ function _stp_register_regs() {
 	 * reg32_offset = _reg_offsets["reg"]/2
 	 * or somesuch
 	 */
-	_stp_regs_registered = 1
 }
 
 
@@ -115,7 +114,7 @@ function _stp_register_regs() {
  * Though the flag says 31bit, asm-s390/thread_info.h comment
  * says "32bit process"
  */
-function probing_32bit_app() %{ /* pure */
+function probing_32bit_app:long() %{ /* pure */
 	if (CONTEXT->user_mode_p && _stp_is_compat_task())
 		STAP_RETVALUE = 1;
 	else
@@ -124,6 +123,15 @@ function probing_32bit_app() %{ /* pure */
 
 function _stp_probing_kernel: long () {
 	return !user_mode();
+}
+
+function arch_bytes:long() %{ /* pure */
+  STAP_RETVALUE = sizeof(long);
+%}
+
+function uarch_bytes:long() {
+  assert(user_mode(), "requires user mode")
+  return probing_32bit_app() ? 4 : 8
 }
 
 function _stp_get_register_by_offset:long (offset:long) %{ /* pure */
@@ -162,17 +170,9 @@ function _stp_sign_extend32:long (value:long) {
 }
 
 function _stp_register:long (name:string, sign_extend:long) {
-	if (!registers_valid()) {
-		error("cannot access CPU registers in this context")
-		return 0
-	}
-	if (!_stp_regs_registered)
-		_stp_register_regs()
+  assert(registers_valid(), "cannot access CPU registers in this context")
 	offset = _reg_offsets[name]
-	if (offset == 0 && !(name in _reg_offsets)) {
-		error("Unknown register: " . name)
-		return 0
-	}
+  assert(offset != 0 || (name in _reg_offsets), "Unknown register: " . name)
 	value = _stp_get_register_by_offset(offset)
 	if (probing_32bit_app()) {
 		if (sign_extend)
@@ -201,18 +201,17 @@ function u_register:long (name:string) {
  * If truncate=1, mask off the top 32 bits.
  * If sign_extend=1 and (truncate=1 or the probepoint we've hit is in a
  * 32-bit app), sign-extend the 32-bit value.
+ * If force64=1, return a 64-bit value even if we're in a 32-bit app.
  */
 function _stp_arg:long (argnum:long, sign_extend:long, truncate:long)
 {
+	return _stp_arg2(argnum, sign_extend, truncate, 0)
+}
+function _stp_arg2:long (argnum:long, sign_extend:long, truncate:long,
+			 force64:long)
+{
 	val = 0
-	if (argnum < 1 || argnum > 8) {
-		error(sprintf("Cannot acces arg(%d)", argnum))
-		return 0
-	}
-	if (%{ CONTEXT->user_mode_p %}) {
-		error("Cannot access function args in user context");
-		return 0;
-	}
+  assert(!(argnum < 1 || argnum > 8), sprintf("Cannot access arg(%d)", argnum))
 
 	/*
 	 * Why not use syscall_get_arguments() here? On the s390x,
@@ -240,7 +239,7 @@ function _stp_arg:long (argnum:long, sign_extend:long, truncate:long)
 	else if (argnum >= 6)
 		val = _stp_get_kernel_stack_param(argnum - 6)
 
-	if (truncate || %{ _stp_is_compat_task() %}) {
+	if ((truncate || @__compat_task) && !force64) {
 		/* High bits may be garbage. */
 		val = (val & 0xffffffff)
 		if (sign_extend)
@@ -251,30 +250,29 @@ function _stp_arg:long (argnum:long, sign_extend:long, truncate:long)
 
 /* Return the value of function arg #argnum (1=first arg) as a signed int. */
 function int_arg:long (argnum:long) {
-	return _stp_arg(argnum, 1, 1)
+	return _stp_arg2(argnum, 1, 1, 0)
 }
 
 /* Return the value of function arg #argnum (1=first arg) as an unsigned int. */
 function uint_arg:long (argnum:long) {
-	return _stp_arg(argnum, 0, 1)
+	return _stp_arg2(argnum, 0, 1, 0)
 }
 
 function long_arg:long (argnum:long) {
-	return _stp_arg(argnum, 1, 0)
+	return _stp_arg2(argnum, 1, 0, 0)
 }
 
 function ulong_arg:long (argnum:long) {
-	return _stp_arg(argnum, 0, 0)
+	return _stp_arg2(argnum, 0, 0, 0)
 }
 
 function longlong_arg:long (argnum:long) {
 	if (probing_32bit_app()) {
-		/* TODO verify if this is correct for 31bit apps */
-		highbits = _stp_arg(argnum, 0, 1)
-		lowbits = _stp_arg(argnum+1, 0, 1)
+		highbits = _stp_arg2(argnum, 0, 1, 0)
+		lowbits = _stp_arg2(argnum+1, 0, 1, 0)
 		return ((highbits << 32) | lowbits)
 	} else
-		return _stp_arg(argnum, 0, 0)
+		return _stp_arg2(argnum, 0, 0, 1)
 }
 
 function ulonglong_arg:long (argnum:long) {
@@ -282,7 +280,7 @@ function ulonglong_arg:long (argnum:long) {
 }
 
 function pointer_arg:long (argnum:long) {
-	return _stp_arg(argnum, 0, 0)
+	return _stp_arg2(argnum, 0, 0, 0)
 }
 
 function s32_arg:long (argnum:long) {
