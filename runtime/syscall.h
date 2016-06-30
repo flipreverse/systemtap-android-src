@@ -7,7 +7,6 @@
  * Public License (GPL); either version 2, or (at your option) any
  * later version.
  */
-
 #ifndef _SYSCALL_H_ /* -*- linux-c -*- */
 #define _SYSCALL_H_
 
@@ -110,7 +109,14 @@
 #ifdef STAPCONF_ASM_SYSCALL_H
 
 /* If the system has asm/syscall.h, use defines from it. */
+#include <linux/version.h>
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(3,0,100) && LINUX_VERSION_CODE >= KERNEL_VERSION(3,0,0)
+#include <asm/unistd.h>
+#include <linux/sched.h>
+#include <asm-generic/syscall.h>
+#else
 #include <asm/syscall.h>
+#endif
 
 #if defined(__arm__)
 /* The syscall_get_nr() function on 3.17.1-302.fc21.armv7hl always

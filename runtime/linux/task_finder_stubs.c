@@ -1,6 +1,7 @@
 #ifndef TASK_FINDER_STUBS_C
 #define TASK_FINDER_STUBS_C
 
+#include "syscall.h"
 /* Stubs of last resort for when utrace type functionality is not
    available. Nothing should actually work, but things compile
    properly, and silently return dummy data or noisily fail as
