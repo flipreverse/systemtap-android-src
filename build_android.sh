@@ -15,6 +15,11 @@ fi
 
 make 
 
+if [ $? -ne 0 ]; then
+	echo "Error building stap{run,io}"
+	exit 1
+fi
+
 if [ -e $STAPRUN_BIN ] &&  [ -e $STAPIO_RUN ]; then
 	if [ ! -d $OUTPUT_DIR ]; then
 		mkdir $OUTPUT_DIR
@@ -22,6 +27,8 @@ if [ -e $STAPRUN_BIN ] &&  [ -e $STAPIO_RUN ]; then
 	cp $STAPRUN_BIN $OUTPUT_DIR
 	cp $STAPIO_BIN $OUTPUT_DIR
 else
+	rm ${OUTPUT_DIR}/${STAPRUN_BIN}
+	rm ${OUTPUT_DIR}/${STAPIO_BIN}
 	echo "Some binaries were not created."
 	exit 1
 fi
