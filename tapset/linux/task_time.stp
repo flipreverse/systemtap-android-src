@@ -27,7 +27,7 @@
  * Yet note some kernels (RHEL6) may already have both...  */
 #if defined(cputime_to_usecs)
 #if !defined(cputime_to_msecs)
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(3,0,100) && LINUX_VERSION_CODE >= KERNEL_VERSION(3,0,0)
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(3,0,200) && LINUX_VERSION_CODE >= KERNEL_VERSION(3,0,0)
 #define cputime_to_msecs(__ct)		_stp_div64(NULL, ({cputime_to_usecs(__ct)}), 1000ULL)
 #else
 #define cputime_to_msecs(__ct)		_stp_div64(NULL, cputime_to_usecs(__ct), 1000ULL)
