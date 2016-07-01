@@ -20,7 +20,7 @@
 
 #define WORKAROUND_BZ467568 1  /* PR 6964; XXX: autoconf when able */
 
-#ifdef ANDROID
+#ifdef HAVE_ANDROID
 #define SYSTEM_SHELL "/system/bin/sh"
 #else
 #define SYSTEM_SHELL "sh"

@@ -670,6 +670,8 @@ stap_LIBS
 elfutils_abs_srcdir
 BUILD_ELFUTILS_FALSE
 BUILD_ELFUTILS_TRUE
+HAVE_ANDROID_FALSE
+HAVE_ANDROID_TRUE
 python
 HAVE_LIBREADLINE_FALSE
 HAVE_LIBREADLINE_TRUE
@@ -821,6 +823,7 @@ infodir
 docdir
 oldincludedir
 includedir
+runstatedir
 localstatedir
 sharedstatedir
 sysconfdir
@@ -868,6 +871,7 @@ enable_server
 with_avahi
 with_rpm
 with_python3
+with_android
 with_elfutils
 with_dyninst
 enable_virt
@@ -943,6 +947,7 @@ datadir='${datarootdir}'
 sysconfdir='${prefix}/etc'
 sharedstatedir='${prefix}/com'
 localstatedir='${prefix}/var'
+runstatedir='${localstatedir}/run'
 includedir='${prefix}/include'
 oldincludedir='/usr/include'
 docdir='${datarootdir}/doc/${PACKAGE_TARNAME}'
@@ -1195,6 +1200,15 @@ do
   | -silent | --silent | --silen | --sile | --sil)
     silent=yes ;;
 
+  -runstatedir | --runstatedir | --runstatedi | --runstated \
+  | --runstate | --runstat | --runsta | --runst | --runs \
+  | --run | --ru | --r)
+    ac_prev=runstatedir ;;
+  -runstatedir=* | --runstatedir=* | --runstatedi=* | --runstated=* \
+  | --runstate=* | --runstat=* | --runsta=* | --runst=* | --runs=* \
+  | --run=* | --ru=* | --r=*)
+    runstatedir=$ac_optarg ;;
+
   -sbindir | --sbindir | --sbindi | --sbind | --sbin | --sbi | --sb)
     ac_prev=sbindir ;;
   -sbindir=* | --sbindir=* | --sbindi=* | --sbind=* | --sbin=* \
@@ -1332,7 +1346,7 @@ fi
 for ac_var in	exec_prefix prefix bindir sbindir libexecdir datarootdir \
 		datadir sysconfdir sharedstatedir localstatedir includedir \
 		oldincludedir docdir infodir htmldir dvidir pdfdir psdir \
-		libdir localedir mandir
+		libdir localedir mandir runstatedir
 do
   eval ac_val=\$$ac_var
   # Remove trailing slashes.
@@ -1485,6 +1499,7 @@ Fine tuning of the installation directories:
   --sysconfdir=DIR        read-only single-machine data [PREFIX/etc]
   --sharedstatedir=DIR    modifiable architecture-independent data [PREFIX/com]
   --localstatedir=DIR     modifiable single-machine data [PREFIX/var]
+  --runstatedir=DIR       modifiable per-process data [LOCALSTATEDIR/run]
   --libdir=DIR            object code libraries [EPREFIX/lib]
   --includedir=DIR        C header files [PREFIX/include]
   --oldincludedir=DIR     C header files for non-gcc [/usr/include]
@@ -1570,6 +1585,7 @@ Optional Packages:
   --without-avahi         Do not use Avahi even if present
   --with-rpm              query rpm database for missing debuginfos
   --with-python3          prefer /usr/bin/python3
+  --with-android
   --with-elfutils=DIRECTORY
                           find elfutils source code in DIRECTORY
   --with-dyninst=DIRECTORY
@@ -7044,7 +7060,7 @@ else
     We can't simply define LARGE_OFF_T to be 9223372036854775807,
     since some C++ compilers masquerading as C compilers
     incorrectly reject 9223372036854775807.  */
-#define LARGE_OFF_T (((off_t) 1 << 62) - 1 + ((off_t) 1 << 62))
+#define LARGE_OFF_T ((((off_t) 1 << 31) << 31) - 1 + (((off_t) 1 << 31) << 31))
   int off_t_is_large[(LARGE_OFF_T % 2147483629 == 721
 		       && LARGE_OFF_T % 2147483647 == 1)
 		      ? 1 : -1];
@@ -7090,7 +7106,7 @@ else
     We can't simply define LARGE_OFF_T to be 9223372036854775807,
     since some C++ compilers masquerading as C compilers
     incorrectly reject 9223372036854775807.  */
-#define LARGE_OFF_T (((off_t) 1 << 62) - 1 + ((off_t) 1 << 62))
+#define LARGE_OFF_T ((((off_t) 1 << 31) << 31) - 1 + (((off_t) 1 << 31) << 31))
   int off_t_is_large[(LARGE_OFF_T % 2147483629 == 721
 		       && LARGE_OFF_T % 2147483647 == 1)
 		      ? 1 : -1];
@@ -7114,7 +7130,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
     We can't simply define LARGE_OFF_T to be 9223372036854775807,
     since some C++ compilers masquerading as C compilers
     incorrectly reject 9223372036854775807.  */
-#define LARGE_OFF_T (((off_t) 1 << 62) - 1 + ((off_t) 1 << 62))
+#define LARGE_OFF_T ((((off_t) 1 << 31) << 31) - 1 + (((off_t) 1 << 31) << 31))
   int off_t_is_large[(LARGE_OFF_T % 2147483629 == 721
 		       && LARGE_OFF_T % 2147483647 == 1)
 		      ? 1 : -1];
@@ -7159,7 +7175,7 @@ else
     We can't simply define LARGE_OFF_T to be 9223372036854775807,
     since some C++ compilers masquerading as C compilers
     incorrectly reject 9223372036854775807.  */
-#define LARGE_OFF_T (((off_t) 1 << 62) - 1 + ((off_t) 1 << 62))
+#define LARGE_OFF_T ((((off_t) 1 << 31) << 31) - 1 + (((off_t) 1 << 31) << 31))
   int off_t_is_large[(LARGE_OFF_T % 2147483629 == 721
 		       && LARGE_OFF_T % 2147483647 == 1)
 		      ? 1 : -1];
@@ -7183,7 +7199,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
     We can't simply define LARGE_OFF_T to be 9223372036854775807,
     since some C++ compilers masquerading as C compilers
     incorrectly reject 9223372036854775807.  */
-#define LARGE_OFF_T (((off_t) 1 << 62) - 1 + ((off_t) 1 << 62))
+#define LARGE_OFF_T ((((off_t) 1 << 31) << 31) - 1 + (((off_t) 1 << 31) << 31))
   int off_t_is_large[(LARGE_OFF_T % 2147483629 == 721
 		       && LARGE_OFF_T % 2147483647 == 1)
 		      ? 1 : -1];
@@ -10527,6 +10543,29 @@ else
 
 fi
 
+
+# Check whether --with-android was given.
+if test "${with_android+set}" = set; then :
+  withval=$with_android;
+fi
+
+if test "x$with_android" = "xyes"; then :
+  have_android=yes
+
+$as_echo "#define HAVE_ANDROID 1" >>confdefs.h
+
+else
+  have_android=no
+fi
+ if test "${have_android}" == "yes"; then
+  HAVE_ANDROID_TRUE=
+  HAVE_ANDROID_FALSE='#'
+else
+  HAVE_ANDROID_TRUE='#'
+  HAVE_ANDROID_FALSE=
+fi
+
+
 build_elfutils=no
 
 # Check whether --with-elfutils was given.
@@ -10715,7 +10754,8 @@ $as_echo "$as_me: stap will link $stap_LIBS" >&6;}
 # staprun has more modest libelf needs
 if test $build_elfutils = no; then
   save_LIBS="$LIBS"
-    { $as_echo "$as_me:${as_lineno-$LINENO}: checking for elf_getshdrstrndx in -lelf" >&5
+    if test "${have_android}" == "yes"; then
+	 { $as_echo "$as_me:${as_lineno-$LINENO}: checking for elf_getshdrstrndx in -lelf" >&5
 $as_echo_n "checking for elf_getshdrstrndx in -lelf... " >&6; }
 if ${ac_cv_lib_elf_elf_getshdrstrndx+:} false; then :
   $as_echo_n "(cached) " >&6
@@ -10758,16 +10798,57 @@ _ACEOF
 
   LIBS="-lelf $LIBS"
 
-else
+fi
 
-    { { $as_echo "$as_me:${as_lineno-$LINENO}: error: in \`$ac_pwd':" >&5
+
+  else
+	  { $as_echo "$as_me:${as_lineno-$LINENO}: checking for elf_getshdrstrndx in -lelf" >&5
+$as_echo_n "checking for elf_getshdrstrndx in -lelf... " >&6; }
+if ${ac_cv_lib_elf_elf_getshdrstrndx+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+  ac_check_lib_save_LIBS=$LIBS
+LIBS="-lelf  $LIBS"
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+/* Override any GCC internal prototype to avoid an error.
+   Use char because int might match the return type of a GCC
+   builtin and then its argument prototype would still apply.  */
+#ifdef __cplusplus
+extern "C"
+#endif
+char elf_getshdrstrndx ();
+int
+main ()
+{
+return elf_getshdrstrndx ();
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_link "$LINENO"; then :
+  ac_cv_lib_elf_elf_getshdrstrndx=yes
+else
+  ac_cv_lib_elf_elf_getshdrstrndx=no
+fi
+rm -f core conftest.err conftest.$ac_objext \
+    conftest$ac_exeext conftest.$ac_ext
+LIBS=$ac_check_lib_save_LIBS
+fi
+{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_elf_elf_getshdrstrndx" >&5
+$as_echo "$ac_cv_lib_elf_elf_getshdrstrndx" >&6; }
+if test "x$ac_cv_lib_elf_elf_getshdrstrndx" = xyes; then :
+  staprun_LIBS="$staprun_LIBS -lelf"
+	     LIBS="$save_LIBS"
+else
+  { { $as_echo "$as_me:${as_lineno-$LINENO}: error: in \`$ac_pwd':" >&5
 $as_echo "$as_me: error: in \`$ac_pwd':" >&2;}
 as_fn_error $? "libelf too old, need 0.142+
 See \`config.log' for more details" "$LINENO" 5; }
 fi
 
-  staprun_LIBS="$staprun_LIBS -lelf"
-  LIBS="$save_LIBS"
+  fi
 else
   # We built our own and staprun_LDFLAGS points at the install.
   staprun_LIBS="$staprun_LIBS -lelf"
@@ -11507,6 +11588,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 				--exec-prefix="$exec_prefix" \
 				--prefix="$prefix" \
 				--enable-dwz \
+				--host=${host_alias} \
 				${need_maintainer_option} \
 				CFLAGS="${CFLAGS/-Wall/} $gnu89_inline_flag -fexceptions" \
 				LDFLAGS="$LDFLAGS $elfutils_rpath" &&
@@ -12065,6 +12147,10 @@ Usually this means the macro was only invoked conditionally." "$LINENO" 5
 fi
 if test -z "${HAVE_LIBREADLINE_TRUE}" && test -z "${HAVE_LIBREADLINE_FALSE}"; then
   as_fn_error $? "conditional \"HAVE_LIBREADLINE\" was never defined.
+Usually this means the macro was only invoked conditionally." "$LINENO" 5
+fi
+if test -z "${HAVE_ANDROID_TRUE}" && test -z "${HAVE_ANDROID_FALSE}"; then
+  as_fn_error $? "conditional \"HAVE_ANDROID\" was never defined.
 Usually this means the macro was only invoked conditionally." "$LINENO" 5
 fi
 if test -z "${BUILD_ELFUTILS_TRUE}" && test -z "${BUILD_ELFUTILS_FALSE}"; then

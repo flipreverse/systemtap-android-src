@@ -94,15 +94,18 @@ host_triplet = @host@
 target_triplet = @target@
 bin_PROGRAMS = staprun$(EXEEXT) stap-merge$(EXEEXT) stapsh$(EXEEXT)
 pkglibexec_PROGRAMS = stapio$(EXEEXT)
-@BUILD_ELFUTILS_TRUE@am__append_1 = -I../include-elfutils
-@BUILD_ELFUTILS_TRUE@am__append_2 = -L../lib-elfutils -Wl,-rpath-link,lib-elfutils \
+@HAVE_ANDROID_TRUE@am__append_1 = -static
+@BUILD_ELFUTILS_TRUE@am__append_2 = -I../include-elfutils
+@BUILD_ELFUTILS_TRUE@am__append_3 = -L../lib-elfutils -Wl,-rpath-link,lib-elfutils \
 @BUILD_ELFUTILS_TRUE@		-Wl,--enable-new-dtags,-rpath,$(pkglibdir)
 
-@HAVE_NSS_TRUE@am__append_3 = modverify.c ../nsscommon.cxx
-@HAVE_NSS_TRUE@am__append_4 = $(nss_CFLAGS)
+@HAVE_NSS_TRUE@am__append_4 = modverify.c ../nsscommon.cxx
 @HAVE_NSS_TRUE@am__append_5 = $(nss_CFLAGS)
-@HAVE_NSS_TRUE@am__append_6 = $(nss_LIBS)
-@HAVE_MONITOR_LIBS_TRUE@am__append_7 = $(jsonc_LIBS) $(ncurses_LIBS)
+@HAVE_NSS_TRUE@am__append_6 = $(nss_CFLAGS)
+@HAVE_NSS_TRUE@am__append_7 = $(nss_LIBS)
+@HAVE_MONITOR_LIBS_TRUE@am__append_8 = $(jsonc_LIBS) $(ncurses_LIBS)
+@HAVE_ANDROID_TRUE@am__append_9 = -static
+@HAVE_ANDROID_TRUE@am__append_10 = -static
 subdir = staprun
 ACLOCAL_M4 = $(top_srcdir)/aclocal.m4
 am__aclocal_m4_deps = $(top_srcdir)/m4/ax_check_compile_flag.m4 \
@@ -142,6 +145,8 @@ am_stapio_OBJECTS = stapio.$(OBJEXT) mainloop.$(OBJEXT) \
 	relay_old.$(OBJEXT) monitor.$(OBJEXT)
 stapio_OBJECTS = $(am_stapio_OBJECTS)
 stapio_DEPENDENCIES = libstrfloctime.a
+stapio_LINK = $(CCLD) $(AM_CFLAGS) $(CFLAGS) $(stapio_LDFLAGS) \
+	$(LDFLAGS) -o $@
 am__dirstamp = $(am__leading_dot)dirstamp
 @HAVE_NSS_TRUE@am__objects_1 = staprun-modverify.$(OBJEXT) \
 @HAVE_NSS_TRUE@	../staprun-nsscommon.$(OBJEXT)
@@ -413,6 +418,7 @@ prefix = @prefix@
 program_transform_name = @program_transform_name@
 psdir = @psdir@
 python = @python@
+runstatedir = @runstatedir@
 sbindir = @sbindir@
 selinux_CFLAGS = @selinux_CFLAGS@
 selinux_LIBS = @selinux_LIBS@
@@ -435,7 +441,7 @@ top_builddir = @top_builddir@
 top_srcdir = @top_srcdir@
 AUTOMAKE_OPTIONS = subdir-objects
 AM_CFLAGS = -Wall -Wextra -Werror -Wunused -W -Wformat=2 @PIECFLAGS@ \
-	$(am__append_7)
+	$(am__append_8)
 AM_CXXFLAGS = -Wall -Wextra -Werror -Wunused -W -Wformat=2 \
 	@PIECXXFLAGS@ $(am__empty)
 AM_CPPFLAGS = -D_GNU_SOURCE -I$(srcdir)/../includes \
@@ -451,22 +457,23 @@ noinst_LIBRARIES = libstrfloctime.a
 libstrfloctime_a_SOURCES = strfloctime.c
 libstrfloctime_a_CFLAGS = $(AM_CFLAGS) -Wno-format-nonliteral
 staprun_SOURCES = staprun.c staprun_funcs.c ctl.c common.c \
-	../privilege.cxx ../util.cxx $(am__append_3)
-staprun_CFLAGS = $(AM_CFLAGS) -DSINGLE_THREADED $(am__append_4)
-staprun_CXXFLAGS = $(AM_CXXFLAGS) -DSINGLE_THREADED $(am__append_5)
-staprun_CPPFLAGS = $(AM_CPPFLAGS) $(am__append_1)
-staprun_LDADD = libstrfloctime.a $(staprun_LIBS) $(am__append_6)
-staprun_LDFLAGS = $(AM_LDFLAGS) $(am__append_2)
+	../privilege.cxx ../util.cxx $(am__append_4)
+staprun_CFLAGS = $(AM_CFLAGS) -DSINGLE_THREADED $(am__append_5)
+staprun_CXXFLAGS = $(AM_CXXFLAGS) -DSINGLE_THREADED $(am__append_6)
+staprun_CPPFLAGS = $(AM_CPPFLAGS) $(am__append_2)
+staprun_LDADD = libstrfloctime.a $(staprun_LIBS) $(am__append_7)
+staprun_LDFLAGS = $(AM_LDFLAGS) $(am__append_1) $(am__append_3)
 stapio_SOURCES = stapio.c mainloop.c common.c ctl.c relay.c relay_old.c monitor.c
+@HAVE_ANDROID_TRUE@stapio_LDFLAGS = -static
 stapio_LDADD = libstrfloctime.a -lpthread
 man_MANS = staprun.8
 stap_merge_SOURCES = stap_merge.c
 stap_merge_CFLAGS = $(AM_CFLAGS)
-stap_merge_LDFLAGS = $(AM_LDFLAGS)
+stap_merge_LDFLAGS = $(AM_LDFLAGS) $(am__append_9)
 stap_merge_LDADD = 
 stapsh_SOURCES = stapsh.c
 stapsh_CFLAGS = $(AM_CFLAGS)
-stapsh_LDFLAGS = $(AM_LDFLAGS)
+stapsh_LDFLAGS = $(AM_LDFLAGS) $(am__append_10)
 stapsh_LDADD = 
 
 # Arrange for the top-level git_version.h to be regenerated at every "make".
@@ -607,7 +614,7 @@ stap-merge$(EXEEXT): $(stap_merge_OBJECTS) $(stap_merge_DEPENDENCIES) $(EXTRA_st
 
 stapio$(EXEEXT): $(stapio_OBJECTS) $(stapio_DEPENDENCIES) $(EXTRA_stapio_DEPENDENCIES) 
 	@rm -f stapio$(EXEEXT)
-	$(AM_V_CCLD)$(LINK) $(stapio_OBJECTS) $(stapio_LDADD) $(LIBS)
+	$(AM_V_CCLD)$(stapio_LINK) $(stapio_OBJECTS) $(stapio_LDADD) $(LIBS)
 ../$(am__dirstamp):
 	@$(MKDIR_P) ..
 	@: > ../$(am__dirstamp)

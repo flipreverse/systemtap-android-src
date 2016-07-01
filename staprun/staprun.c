@@ -350,8 +350,10 @@ int init_staprun(void)
                 disable_kprobes_optimization();
 
 		if (insert_stap_module(& user_credentials) < 0) {
+#ifdef HAVE_ANDROID
 			if(!rename_mod && errno == EEXIST)
 				err("Rerun with staprun option '-R' to rename this module.\n");
+#endif
 			return -1;
 		}
 		rc = init_ctl_channel (modname, 0);
