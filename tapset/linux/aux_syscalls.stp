@@ -4599,12 +4599,14 @@ static const _stp_val_array const _stp_prctl_mm_option_list[] = {
 	V(PR_SET_MM_START_STACK),
 	V(PR_SET_MM_START_BRK),
 	V(PR_SET_MM_BRK),
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,4,200) && LINUX_VERSION_CODE <= KERNEL_VERSION(3,4,0)
 	V(PR_SET_MM_ARG_START),
 	V(PR_SET_MM_ARG_END),
 	V(PR_SET_MM_ENV_START),
 	V(PR_SET_MM_ENV_END),
 	V(PR_SET_MM_AUXV),
 	V(PR_SET_MM_EXE_FILE),
+#endif
 #ifdef PR_SET_MM_MAP
 	V(PR_SET_MM_MAP),
 #endif
