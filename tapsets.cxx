@@ -11478,6 +11478,19 @@ tracepoint_builder::init_dw(systemtap_session& s)
           s.kernel_source_tree = source_tree;
         }
     }
+  // find kernel_source_tree from a source link,when different from build
+  if (s.kernel_source_tree == "")
+    {
+      string source_tree = s.kernel_build_tree;
+      source_tree.append("/source");
+      if (file_exists(source_tree) &&
+          resolve_path(source_tree) != resolve_path(s.kernel_build_tree))
+        {
+          if (s.verbose > 2)
+              clog << _F("Located kernel source tree at '%s'", source_tree.c_str()) << endl;
+          s.kernel_source_tree = source_tree;
+        }
+    }
 
   // prefixes
   vector<string> glob_prefixes;
