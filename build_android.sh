@@ -4,7 +4,7 @@ BUILD_PREFIX="/data/data/com.systemtap.android/stap/"
 OUTPUT_DIR="android_binaries"
 STAPIO_BIN="staprun/stapio"
 STAPRUN_BIN="staprun/staprun"
-COMPILER_PREFIX_LIST=("arm-none-linux-gnueabi" "arm-unknown-linux-gnueabi")
+COMPILER_PREFIX_LIST=("aarch64-linux-gnu" "arm-none-linux-gnueabi" "arm-unknown-linux-gnueabi")
 
 
 function checkCompiler()
