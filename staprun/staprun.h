@@ -47,6 +47,7 @@
 #include <locale.h>
 #endif
 
+#define WRITE_OUTPUT_RETRIES 3
 
 /* define gettext options if NLS is set */
 #if ENABLE_NLS

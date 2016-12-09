@@ -235,7 +235,7 @@ static int switch_oldoutfile(int cpu, struct switchfile_ctrl_block *scb)
 static int process_subbufs(struct _stp_buf_info *info,
 			   struct switchfile_ctrl_block *scb)
 {
-	unsigned subbufs_ready, start_subbuf, end_subbuf, subbuf_idx, i;
+	unsigned subbufs_ready, start_subbuf, end_subbuf, subbuf_idx, i, j = 0;
 	int len, cpu = info->cpu;
 	char *subbuf_ptr;
 	int subbufs_consumed = 0;
@@ -260,9 +260,20 @@ static int process_subbufs(struct _stp_buf_info *info,
 			scb->wsize = len;
 		}
 		if (len) {
-			if (fwrite_unlocked (subbuf_ptr, len, 1, percpu_tmpfile[cpu]) != 1) {
-				if (errno != EPIPE)
-					_perr("Couldn't write to output file for cpu %d, exiting:", cpu);
+			for (j = 0; j < WRITE_OUTPUT_RETRIES; j++) {
+				if (fwrite_unlocked (subbuf_ptr, len, 1, percpu_tmpfile[cpu]) != 1) {
+					if (errno == EINTR) {
+						continue;
+					} else if (errno != EPIPE) {
+						_perr("Couldn't write to output file for cpu %d, exiting:", cpu);
+						return -1;
+					}
+				} else {
+					break;
+				}
+			}
+			if (j >= WRITE_OUTPUT_RETRIES) {
+				_perr("Couldn't write to output file after %d retries for cpu %d, exiting:", WRITE_OUTPUT_RETRIES, cpu);
 				return -1;
 			}
 		}

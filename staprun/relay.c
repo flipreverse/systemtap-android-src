@@ -126,7 +126,7 @@ static int switch_outfile(int cpu, int *fnum)
 static void *reader_thread(void *data)
 {
         char buf[131072];
-        int rc, cpu = (int)(long)data;
+        int rc, cpu = (int)(long)data, j = 0;
         struct pollfd pollfd;
 	struct timespec tim = {.tv_sec=0, .tv_nsec=200000000}, *timeout = &tim;
 	sigset_t sigs;
@@ -212,12 +212,24 @@ static void *reader_thread(void *data)
                         /* Copy loop.  Must repeat write(2) in case of a pipe overflow
                            or other transient fullness. */
                         while (wbytes > 0) {
-                                rc = write(out_fd[cpu], wbuf, wbytes);
-                                if (rc <= 0) {
-					perr("Couldn't write to output %d for cpu %d, exiting.",
-                                             out_fd[cpu], cpu);
-                                        goto error_out;
-                                }
+				for (j = 0; j < WRITE_OUTPUT_RETRIES; j++) {
+	                                rc = write(out_fd[cpu], wbuf, wbytes);
+        	                        if (rc <= 0) {
+						if (errno == EINTR) {
+							continue;
+						} else {
+							perr("Couldn't write to output %d for cpu %d, exiting.",
+        	                	                     out_fd[cpu], cpu);
+                	                	        goto error_out;
+						}
+	                                } else {
+						break;
+					}
+				}
+				if (j >= WRITE_OUTPUT_RETRIES) {
+					_perr("Couldn't write to output file after %d retries for cpu %d, exiting:", WRITE_OUTPUT_RETRIES, cpu);
+					goto error_out;
+				}
                                 wbytes -= rc;
                                 wbuf += rc;
                         }
