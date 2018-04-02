@@ -29,6 +29,9 @@ staprun_CXXFLAGS = $(AM_CXXFLAGS) -DSINGLE_THREADED
 staprun_CPPFLAGS = $(AM_CPPFLAGS)
 staprun_LDADD = libstrfloctime.a $(staprun_LIBS)
 staprun_LDFLAGS =  $(AM_LDFLAGS)
+if HAVE_ANDROID
+staprun_LDFLAGS += -static
+endif
 if BUILD_ELFUTILS
 staprun_CPPFLAGS += -I../include-elfutils
 staprun_LDFLAGS += -L../lib-elfutils -Wl,-rpath-link,lib-elfutils \
@@ -43,6 +46,9 @@ staprun_LDADD += $(nss_LIBS)
 endif
 
 stapio_SOURCES = stapio.c mainloop.c common.c ctl.c relay.c relay_old.c monitor.c
+if HAVE_ANDROID
+stapio_LDFLAGS = -static
+endif
 stapio_LDADD = libstrfloctime.a -lpthread
 
 if HAVE_MONITOR_LIBS
@@ -54,11 +60,17 @@ man_MANS = staprun.8
 stap_merge_SOURCES = stap_merge.c
 stap_merge_CFLAGS = $(AM_CFLAGS)
 stap_merge_LDFLAGS = $(AM_LDFLAGS)
+if HAVE_ANDROID
+stap_merge_LDFLAGS += -static
+endif
 stap_merge_LDADD =
 
 stapsh_SOURCES = stapsh.c
 stapsh_CFLAGS = $(AM_CFLAGS)
 stapsh_LDFLAGS = $(AM_LDFLAGS)
+if HAVE_ANDROID
+stapsh_LDFLAGS += -static
+endif
 stapsh_LDADD =
 
 BUILT_SOURCES =

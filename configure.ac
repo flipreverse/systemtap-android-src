@@ -531,7 +531,14 @@ AS_IF([test "x$with_python3" = "xyes"],
       [AS_IF([test "x$PYTHON" = "x:"],
              [AC_MSG_ERROR([python version 2 is required])],
 	     [AC_SUBST(preferred_python,[$PYTHON])])])
-      
+
+AC_ARG_WITH([android],
+  AS_HELP_STRING([--with-android],[]))
+AS_IF([test "x$with_android" = "xyes"],
+     [have_android=yes AC_DEFINE([HAVE_ANDROID], [1], [Define to 1 if you compile for Android.])],
+     [have_android=no])
+AM_CONDITIONAL([HAVE_ANDROID], [test "${have_android}" == "yes"])
+
 dnl Handle elfutils.  If '--with-elfutils=DIR' wasn't specified, used
 dnl the system's elfutils.
 build_elfutils=no
@@ -580,10 +587,12 @@ AC_MSG_NOTICE([stap will link $stap_LIBS])
 if test $build_elfutils = no; then
   save_LIBS="$LIBS"
   dnl this will only succeed with elfutils 0.142+
-  AC_CHECK_LIB(elf,elf_getshdrstrndx,[],[
-    AC_MSG_FAILURE([libelf too old, need 0.142+])])
-  staprun_LIBS="$staprun_LIBS -lelf"
-  stapbpf_LIBS="$stapbpf_LIBS -lelf"
+  if test "${have_android}" == "bo"; then
+	AC_CHECK_LIB(elf,elf_getshdrstrndx,[],[
+	  AC_MSG_FAILURE([libelf too old, need 0.142+])])
+	staprun_LIBS="$staprun_LIBS -lelf"
+	stapbpf_LIBS="$stapbpf_LIBS -lelf"
+  fi
   LIBS="$save_LIBS"
 else
   # We built our own and staprun_LDFLAGS points at the install.
